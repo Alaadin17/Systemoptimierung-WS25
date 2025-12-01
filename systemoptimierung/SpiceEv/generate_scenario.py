@@ -34,7 +34,7 @@ def generate_scenario_statistics(mode=None, scenario_name=None, use_config=False
     if use_config:
         # Use config file
         if config_path is None:
-            config_path = "examples/configs/generate.cfg"
+            config_path = "systemoptimierung/SpiceEv/generate.cfg"
         
         # Convert config_path to absolute path relative to project root
         config_full_path = project_root / config_path
