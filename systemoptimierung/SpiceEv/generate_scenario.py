@@ -36,8 +36,11 @@ def generate_scenario_statistics(mode=None, scenario_name=None, use_config=False
         if config_path is None:
             config_path = "examples/configs/generate.cfg"
         
-        cmd = ["python", "generate.py", "--config", config_path]
-        print(f"Running with config file: {config_path}")
+        # Convert config_path to absolute path relative to project root
+        config_full_path = project_root / config_path
+        
+        cmd = ["python", "generate.py", "--config", str(config_full_path)]
+        print(f"Running with config file: {config_full_path}")
     else:
         # Use command line arguments
         cmd = ["python", "generate.py", mode, "-o", str(output_file)]
@@ -68,4 +71,4 @@ def generate_scenario_statistics(mode=None, scenario_name=None, use_config=False
 
 if __name__ == "__main__":
     generate_scenario_statistics(mode="statistics", scenario_name="scenario_statistics_1")
-    generate_scenario_statistics(mode="statistics", scenario_name="scenario_statistics_2", use_config=True, config_path="generate.cfg")
+    generate_scenario_statistics(use_config=True, config_path="systemoptimierung\\SpiceEv\\generate.cfg")
