@@ -27,12 +27,9 @@ def generate_scenario_statistics(mode=None, scenario_name=None, use_config=False
     # Create the scenarios directory if it doesn't exist
     output_dir.mkdir(exist_ok=True)
     
-    # Define output file path
-    output_file = output_dir / f"{scenario_name}.json"
-    
     # Build command based on whether config file is used
     if use_config:
-        # Use config file
+        # Use config file (output path is defined in the config file)
         if config_path is None:
             config_path = "systemoptimierung/SpiceEv/generate.cfg"
         
@@ -41,8 +38,11 @@ def generate_scenario_statistics(mode=None, scenario_name=None, use_config=False
         
         cmd = ["python", "generate.py", "--config", str(config_full_path)]
         print(f"Running with config file: {config_full_path}")
+        output_file = None  # Output is defined in config file
     else:
         # Use command line arguments
+        # Define output file path
+        output_file = output_dir / f"{scenario_name}.json"
         cmd = ["python", "generate.py", mode, "-o", str(output_file)]
     
     # Change to project root directory and run the command
@@ -62,7 +62,10 @@ def generate_scenario_statistics(mode=None, scenario_name=None, use_config=False
     print(f"Return code: {result.returncode}")
     
     if result.returncode == 0:
-        print(f"Scenario successfully generated at: {output_file}")
+        if output_file:
+            print(f"Scenario successfully generated at: {output_file}")
+        else:
+            print("Scenario successfully generated (output path defined in config file)")
     else:
         print("Command failed!")
     
