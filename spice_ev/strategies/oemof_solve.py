@@ -684,3 +684,48 @@ class OemofSolve(Strategy):
         self._schedule = self.commands_from_oemof(results)
         self._solved = True
         self._oemof_step = 0
+
+    def step(self):
+        """Wendet den oemof-optimierten Ladeplan für den aktuellen Zeitschritt an."""
+        # Beim ersten Aufruf einmalig die Ganzhorizont-Optimierung lösen
+        if not self._solved and self.events is not None:
+            self._ensure_solved()
+
+        idx = self._oemof_step
+        commands: Dict[str, Any] = {}
+
+        for vid, vehicle in self.world_state.vehicles.items():
+            cs_id = vehicle.connected_charging_station
+            if cs_id is None:
+                continue  # Fahrzeug nicht angeschlossen -> kein Ladebefehl
+            cs = self.world_state.charging_stations.get(cs_id)
+            if cs is None:
+                continue
+            gc = self.world_state.grid_connectors[cs.parent]
+
+            plan = self._schedule.get(vid)
+            if plan is None or idx >= len(plan):
+                continue
+            charge_kw, discharge_kw = plan[idx]
+            net = charge_kw - discharge_kw  # AC am bus_home: + = laden, - = V2H
+
+            if net > self.EPS:
+                # Laden
+                power = clamp_power(net, vehicle, cs)
+                avg_power = vehicle.battery.load(
+                    self.interval, max_power=power)["avg_power"]
+                commands[cs_id] = gc.add_load(cs_id, avg_power)
+                cs.current_power += avg_power
+            elif net < -self.EPS and vehicle.vehicle_type.v2g:
+                # V2H entladen
+                discharge_power = -net
+                target_soc = max(vehicle.desired_soc, vehicle.vehicle_type.discharge_limit)
+                avg_power = vehicle.battery.unload(
+                    self.interval, max_power=discharge_power, target_soc=target_soc)["avg_power"]
+                commands[cs_id] = gc.add_load(cs_id, -avg_power)
+                cs.current_power -= avg_power
+
+        self._oemof_step += 1
+        return {"current_time": self.current_time, "commands": commands}
+
+
