@@ -1,13 +1,13 @@
 '''
 ----------------- OemofSolve strategies structure -----------------------
  
- Ziel: Optimierung der Ladestrategie mittels Oemof um die Simulationslaufzeit zu reduzieren.
+ Goal: Optimize the charging strategy via Oemof to reduce the simulation runtime.
 
 
- Eingaben:
- - self.events (Events-Objekt)
+ Inputs:
+ - self.events (Events object)
  - self.world_state (Vehicles, Charging Stations, Grid Connectors)
- - self.cfg (Konfiguration fuer spaetere Oemof-Anbindung)
+ - self.cfg (configuration for the later Oemof integration)
 
 '''
 
@@ -35,7 +35,7 @@ class OemofSolve(Strategy):
         # Inputs from kwargs
         self.events = kwargs.get("events")
         self.cfg = kwargs.get("cfg")
-        # Flaches Dict mit oemof_*-Parametern (aus simulate.cfg, Präfix entfernt)
+        # Flat dict with oemof_* parameters (from simulate.cfg, prefix removed)
         self.oemof_config = kwargs.get("oemof_config", {}) or {}
         self.vehicles = self.world_state.vehicles
         self.interval = kwargs.get("interval")
@@ -47,15 +47,15 @@ class OemofSolve(Strategy):
         self.input_frames = {}
         self._prepared = False
 
-        # Closed-loop-Zustand: einmalige Optimierung + gecachter Fahrplan
+        # Closed-loop state: solve the optimization once + cached schedule
         self._solved = False
         self._model = None
-        self._schedule: Dict[str, list] = {}  # vehicle_id -> Liste (charge_kW, discharge_kW)
+        self._schedule: Dict[str, list] = {}  # vehicle_id -> list of (charge_kW, discharge_kW)
         self._oemof_step = 0
 
 
 ###########################################################################
-########## 1) Preprocessing: Rohdaten -> strukturierte DataFrames #########
+########## 1) Preprocessing: raw data -> structured DataFrames #########
 ############################################################################
 
     def prepare_inputs(self) -> Dict[str, Any]:
@@ -74,21 +74,21 @@ class OemofSolve(Strategy):
         vehicle_events = self.events.vehicle_events
         vehicles = self.world_state.vehicles
 
-        # 1) Stammdaten / Roh-Events als DataFrames
+        # 1) Master data / raw events as DataFrames
         df_vehicle_events = self._build_vehicle_events_df(vehicle_events)
         df_vehicles = self._build_world_state_vehicles_df(vehicles)
 
-        # 2) Trips (departure/arrival-Paare) je Fahrzeug
+        # 2) Trips (departure/arrival pairs) per vehicle
         trip_df = self._build_trip_df(vehicle_events, vehicles)
         trip_df_by_vehicle = self._group_trips_by_vehicle(trip_df)
 
-        # 3) State-Segmente (parked/driving) + Energie aus Trips
+        # 3) State segments (parked/driving) + energy from trips
         state_segments_df = self._build_state_segments(
             vehicle_events, self.start_time, self.stop_time)
         state_segments_df = self._map_trips_to_state_segments(
             trip_df_by_vehicle, state_segments_df)
 
-        # 4) Zeitraster + Mapping auf Zeitreihen
+        # 4) Time grid + mapping onto timeseries
         self.time_index = self._build_time_index(
             self.start_time, self.stop_time, self.interval)
         per_vehicle_ts, long_ts = self._map_segments_to_timeseries(
@@ -143,14 +143,14 @@ class OemofSolve(Strategy):
 
 
     def _build_world_state_vehicles_df(self, world_state_vehicles) -> pd.DataFrame:
-        '''Erstellt einen DataFrame aus einer Liste von WorldStateVehicles.
+        '''Build a DataFrame from a collection of WorldStateVehicles.
     
         args:
-            world_state_vehicles (Dict[str, WorldStateVehicle]): Dictionary mit WorldStateVehicle-Objekten.
+            world_state_vehicles (Dict[str, WorldStateVehicle]): Dictionary of WorldStateVehicle objects.
 
         returns:
-            pd.DataFrame: DataFrame mit den Daten der WorldStateVehicles.
-                DataFrame mit Spalten: 
+            pd.DataFrame: DataFrame with the WorldStateVehicle data.
+                DataFrame with columns: 
                                         - vehicle_id, 
                                         - vehicle_type, 
                                         - capacity_kwh, 
@@ -301,10 +301,10 @@ class OemofSolve(Strategy):
 
         """Build a time index from start_time to stop_time with given interval.
 
-        Das Raster startet bei ``start_time`` (nicht start+interval), damit
-        Zeile ``k`` exakt dem spice_ev-Schritt ``k`` (current_time =
-        start+k*interval) entspricht. Andernfalls wären die zurückgespeisten
-        Ladebefehle um einen Zeitschritt verschoben.
+        The grid starts at ``start_time`` (not start+interval), so that
+        row ``k`` corresponds exactly to spice_ev step ``k`` (current_time =
+        start+k*interval). Otherwise the charging commands fed back into
+        spice_ev would be shifted by one time step.
 
         Args:
             start_time: Scenario start time (datetime).
@@ -320,15 +320,15 @@ class OemofSolve(Strategy):
     def _map_trips_to_state_segments(self, trip_df_by_vehicle: Dict[str, pd.DataFrame], state_segments_df: pd.DataFrame) -> pd.DataFrame:
          
         '''
-            Mappt Trips zu State-Segmente.
-            Für jedes Segment in state_segments_df wird geprüft, ob es einen überlappenden Trip in trip_df_by_vehicle gibt.
-            Wenn ja, wird die Energie des Trips in kWh in die Spalte "energy_kwh" des Segments eingetragen. Ansonsten bleibt "energy_kwh" None.
+            Map trips to state segments.
+            For each segment in state_segments_df, check whether there is an overlapping trip in trip_df_by_vehicle.
+            If so, the trip energy in kWh is written into the segment's "energy_kwh" column. Otherwise "energy_kwh" stays None.
 
             Args:
-                trip_df_by_vehicle: Dict[vehicle_id, DataFrame] mit Trips pro Fahrzeug (Spalten: departure_time, arrival_time, energy_kwh)
-                state_segments_df: DataFrame mit Spalten [vehicle_id, start_time, end_time, state]
+                trip_df_by_vehicle: Dict[vehicle_id, DataFrame] with trips per vehicle (columns: departure_time, arrival_time, energy_kwh)
+                state_segments_df: DataFrame with columns [vehicle_id, start_time, end_time, state]
             Returns:
-                DataFrame mit Spalten: 
+                DataFrame with columns: 
                                         -vehicle_id, 
                                         -start_time, 
                                         -end_time, 
@@ -401,7 +401,7 @@ class OemofSolve(Strategy):
             # Process each vehicle separately to create a per-vehicle timeseries.
             # vid: vehicle_id, segs: all segments for this vehicle
             # segs: DataFrame with columns [start_time, end_time, state, energy_kwh] for this vehicle
-            # Iterator aus Paaren (key=der wert der spalte vehicle_id, group_df=die zeilen mit diesem vehicle_id)
+            # Iterator over pairs (key = value of the vehicle_id column, group_df = the rows with that vehicle_id)
             for vid, segs in state_segments_df.groupby("vehicle_id"):
                 print(f"Mapping segments to timeseries for vehicle {vid} with {len(segs)} segments.")
                 # Initialize per-vehicle dataframe with default values.
@@ -454,18 +454,18 @@ class OemofSolve(Strategy):
         
 
     # ------------------------------------------------------------------
-    # Brücke spice_ev -> oemof
+    # Bridge spice_ev -> oemof
     # ------------------------------------------------------------------
     def _sample_event_list(self, ev_list, time_index: pd.DatetimeIndex) -> pd.Series:
-        """Tastet eine EnergyValuesList (Step-Funktion) auf das Zeitraster ab.
-        Args:            
-                ev_list: EnergyValuesList mit Werten und step_duration_s.
-                time_index: Ziel-Zeitindex für die Ausgabe (DatetimeIndex).
-        
-        Returns:
-                pd.Series mit index=time_index, Werten aus ev_list (stepweise konstant) und 0 außerhalb der ev_list-Zeiten.
+        """Sample an EnergyValuesList (step function) onto the time grid.
+        Args:
+                ev_list: EnergyValuesList with values and step_duration_s.
+                time_index: target time index for the output (DatetimeIndex).
 
-        We need it when there are in the Szenario PV or Load (include_local_generation_csv / include_fixed_load_csv in der generate.cfg). 
+        Returns:
+                pd.Series with index=time_index, values from ev_list (piecewise constant) and 0 outside the ev_list times.
+
+        We need it when the scenario contains PV or Load (include_local_generation_csv / include_fixed_load_csv in the generate.cfg).
         """
         values = list(getattr(ev_list, "values", []) or [])
         if not values:
@@ -476,7 +476,7 @@ class OemofSolve(Strategy):
         factor = getattr(ev_list, "factor", 1) or 1
         raw = pd.Series(np.asarray(values, dtype=float) * factor, index=raw_index)
 
-        # Zeitzonen vereinheitlichen (tz-naiv), damit reindex funktioniert
+        # Unify time zones (tz-naive) so that reindex works
         if raw.index.tz is not None:
             raw.index = raw.index.tz_localize(None)
         target = time_index
@@ -488,27 +488,27 @@ class OemofSolve(Strategy):
         return aligned
 
     def _aggregate_event_lists(self, event_lists, time_index: pd.DatetimeIndex) -> pd.Series:
-        """Summiert mehrere EnergyValuesLists (z.B. mehrere PV-Anlagen) auf das Raster."""
+        """Sum several EnergyValuesLists (e.g. multiple PV plants) onto the grid."""
         total = pd.Series(0.0, index=time_index)
         for ev_list in (event_lists or {}).values():
             total = total.add(self._sample_event_list(ev_list, time_index), fill_value=0.0)
         return total
 
     def _vehicle_cs_map(self) -> Dict[str, str]:
-        """Ordnet jedem Fahrzeug seine Ladestation zu (aus Events / Initialzustand).
+        """Map each vehicle to its charging station (from events / initial state).
         Args:
-            vehicle_events: List[VehicleEvent] mit möglichen "connected_charging_station"-Updates.
-            world_state.vehicles: Dict[vehicle_id, Vehicle] mit initial verbundenen Ladestationen.
+            vehicle_events: List[VehicleEvent] with possible "connected_charging_station" updates.
+            world_state.vehicles: Dict[vehicle_id, Vehicle] with initially connected charging stations.
 
         Returns:
-            Dict[vehicle_id, charging_station_id] mit der zugeordneten Ladestation je Fahrzeug.
+            Dict[vehicle_id, charging_station_id] with the assigned charging station per vehicle.
         """
         mapping: Dict[str, str] = {}
         for ev in getattr(self.events, "vehicle_events", []):
             cs = ev.update.get("connected_charging_station")
             if cs:
                 mapping.setdefault(ev.vehicle_id, cs)
-        # Fallback: initial verbundene CS aus dem world_state
+        # Fallback: initially connected CS from the world_state
         for vid, v in self.world_state.vehicles.items():
             if vid not in mapping and getattr(v, "connected_charging_station", None):
                 mapping[vid] = v.connected_charging_station
@@ -516,33 +516,33 @@ class OemofSolve(Strategy):
 
     def _grid_power(self) -> Optional[float]:
         """
-        Summe der Netzanschlussleistungen (max_power) der Grid-Connectors.
+        Sum of the grid connection powers (max_power) of the grid connectors.
         Args:
-                world_state.grid_connectors: Dict[connector_id, GridConnector] mit möglichen max_power-Attributen.
+                world_state.grid_connectors: Dict[connector_id, GridConnector] with possible max_power attributes.
         Returns:
-                - Float: mit der Summe der max_power aller Grid-Connectors, 
-                - None: wenn keine max_power definiert ist.
+                - Float: the sum of max_power across all grid connectors, 
+                - None: if no max_power is defined.
         """
         powers = [gc.max_power for gc in self.world_state.grid_connectors.values()
                   if getattr(gc, "max_power", None)]
         return float(sum(powers)) if powers else None
 
     def _battery_params(self, config) -> Dict[str, Dict[str, Any]]:
-        """Liest ALLE stationären Batterien aus dem Szenario.
+        """Read ALL stationary batteries from the scenario.
 
         Args:
-            config: SystemConfig mit Fallback-Werten (Leistung/SOC/Effizienz).
+            config: SystemConfig with fallback values (power/SOC/efficiency).
 
         Returns:
-            Dict[battery_id, infos] – leeres Dict, wenn keine (valide) Batterie da ist.
-            infos je Batterie:
-              capacity_kWh, power_kW (laden), discharge_power_kW (entladen),
+            Dict[battery_id, infos] – empty dict if there is no (valid) battery.
+            infos per battery:
+              capacity_kWh, power_kW (charging), discharge_power_kW (discharging),
               initial_soc, efficiency, min_power_kW, loss_rate (dict), parent (GC).
         """
         result: Dict[str, Dict[str, Any]] = {}
         for bid, bat in getattr(self.world_state, "batteries", {}).items():
             capacity = float(getattr(bat, "capacity", 0) or 0)
-            # <=0 oder unbegrenzt (StationaryBattery setzt 2**64) -> ueberspringen
+            # <=0 or unlimited (StationaryBattery sets 2**64) -> skip
             if capacity <= 0 or capacity > 1e9:
                 continue
             try:
@@ -552,7 +552,7 @@ class OemofSolve(Strategy):
             try:
                 discharge_power = float(bat.unloading_curve.max_power)
             except Exception:
-                discharge_power = power  # keine eigene Entladekurve -> wie Laden
+                discharge_power = power  # no dedicated discharge curve -> same as charging
             result[bid] = {
                 "capacity_kWh": capacity,
                 "power_kW": power,
@@ -569,7 +569,7 @@ class OemofSolve(Strategy):
 
 
     def build_oemof_inputs(self) -> Dict[str, Any]:
-        """Baut die oemof-Eingaben (config, Zeitreihe, Fahrzeugparameter)."""
+        """Build the oemof inputs (config, timeseries, vehicle parameters)."""
         if not self._prepared:
             raise ValueError("Inputs must be prepared before building Oemof inputs")
 
@@ -577,7 +577,7 @@ class OemofSolve(Strategy):
 
         config = SystemConfig.from_options(self.oemof_config)
 
-        # Globale PV/Last aus den Events auf das Zeitraster bringen
+        # Bring global PV/load from the events onto the time grid
         pv = self._aggregate_event_lists(
             getattr(self.events, "local_generation_lists", {}), self.time_index)
         load = self._aggregate_event_lists(
@@ -585,11 +585,11 @@ class OemofSolve(Strategy):
         timeseries_df = pd.DataFrame(
             {"PV_kW": pv.to_numpy(), "Load_kW": load.to_numpy()}, index=self.time_index)
 
-        # Fahrzeug-Stammdaten (Kapazität/SOC/v2g) je Fahrzeug
+        # Vehicle master data (capacity/SOC/v2g) per vehicle
         vehicles_df = self.input_frames["vehicles"].set_index("vehicle_id")
         per_vehicle_ts = self.input_frames["per_vehicle_ts"]
 
-        # Fahrzeug -> Ladestation, um die Wallbox-Leistung aus dem Szenario zu ziehen
+        # Vehicle -> charging station, to pull the wallbox power from the scenario
         cs_map = self._vehicle_cs_map()
         charging_stations = self.world_state.charging_stations
 
@@ -611,18 +611,18 @@ class OemofSolve(Strategy):
                 v2g = config.enable_v2h
                 desired_soc = config.bev_max_soc
 
-            # desired_soc in den zulässigen Bereich klemmen
+            # Clamp desired_soc into the allowed range
             desired_soc = min(max(desired_soc, config.bev_min_soc), config.bev_max_soc)
 
-            # Wallbox-Leistung aus der zugeordneten Ladestation (Fallback: config)
+            # Wallbox power from the assigned charging station (fallback: config)
             cs = charging_stations.get(cs_map.get(vid))
             wallbox_power = (float(cs.max_power) if cs is not None
                              else config.wallbox_power_kW)
 
-            # Zeitabhängiger Mindest-SOC: vor jeder Abfahrt (letzter Zuhause-Schritt
-            # vor einer Fahrt) muss der BEV auf desired_soc geladen sein. So bleibt
-            # genug Puffer, damit spice_ev (nichtlineares Batteriemodell) nicht
-            # unter 0 / desired fällt.
+            # Time-dependent minimum SOC: before each departure (the last at-home
+            # step before a trip) the BEV must be charged to desired_soc. This keeps
+            # enough buffer so that spice_ev (nonlinear battery model) does not
+            # drop below 0 / desired.
             min_soc_series = np.full(len(at_home), config.bev_min_soc, dtype=float)
             for i in range(len(at_home) - 1):
                 if at_home[i] >= 0.5 and at_home[i + 1] < 0.5:
@@ -650,7 +650,7 @@ class OemofSolve(Strategy):
         }
 
     def run_oemof_model(self, oemof_inputs: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
-        """Erstellt das oemof-Modell, löst es (Ganzhorizont) und liefert den Fahrplan."""
+        """Build the oemof model, solve it (full horizon) and return the schedule."""
         from spice_ev.oemof import EnergySystemModel
 
         model = EnergySystemModel(
@@ -666,7 +666,7 @@ class OemofSolve(Strategy):
         return model.get_wallbox_schedule()
 
     def commands_from_oemof(self, oemof_results: Dict[str, pd.DataFrame]) -> Dict[str, list]:
-        """Wandelt die per-Fahrzeug-Fahrpläne in positionsindizierte Befehlslisten."""
+        """Convert the per-vehicle schedules into position-indexed command lists."""
         schedule: Dict[str, list] = {}
         for vid, df in (oemof_results or {}).items():
             charge = df["charge_kW"].to_numpy()
@@ -675,7 +675,7 @@ class OemofSolve(Strategy):
         return schedule
 
     def _ensure_solved(self) -> None:
-        """Löst die Optimierung genau einmal und cached den Ladeplan."""
+        """Solve the optimization exactly once and cache the charging plan."""
         if self._solved:
             return
         self.prepare_inputs()
@@ -686,8 +686,8 @@ class OemofSolve(Strategy):
         self._oemof_step = 0
 
     def step(self):
-        """Wendet den oemof-optimierten Ladeplan für den aktuellen Zeitschritt an."""
-        # Beim ersten Aufruf einmalig die Ganzhorizont-Optimierung lösen
+        """Apply the oemof-optimized charging plan for the current time step."""
+        # On the first call, solve the full-horizon optimization once
         if not self._solved and self.events is not None:
             self._ensure_solved()
 
@@ -697,7 +697,7 @@ class OemofSolve(Strategy):
         for vid, vehicle in self.world_state.vehicles.items():
             cs_id = vehicle.connected_charging_station
             if cs_id is None:
-                continue  # Fahrzeug nicht angeschlossen -> kein Ladebefehl
+                continue  # vehicle not connected -> no charging command
             cs = self.world_state.charging_stations.get(cs_id)
             if cs is None:
                 continue
@@ -707,17 +707,17 @@ class OemofSolve(Strategy):
             if plan is None or idx >= len(plan):
                 continue
             charge_kw, discharge_kw = plan[idx]
-            net = charge_kw - discharge_kw  # AC am bus_home: + = laden, - = V2H
+            net = charge_kw - discharge_kw  # AC at bus_home: + = charge, - = V2H
 
             if net > self.EPS:
-                # Laden
+                # Charge
                 power = clamp_power(net, vehicle, cs)
                 avg_power = vehicle.battery.load(
                     self.interval, max_power=power)["avg_power"]
                 commands[cs_id] = gc.add_load(cs_id, avg_power)
                 cs.current_power += avg_power
             elif net < -self.EPS and vehicle.vehicle_type.v2g:
-                # V2H entladen
+                # V2H discharge
                 discharge_power = -net
                 target_soc = max(vehicle.desired_soc, vehicle.vehicle_type.discharge_limit)
                 avg_power = vehicle.battery.unload(
