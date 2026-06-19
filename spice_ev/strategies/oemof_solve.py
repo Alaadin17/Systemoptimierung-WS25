@@ -564,3 +564,123 @@ class OemofSolve(Strategy):
                 "parent": getattr(bat, "parent", None),
             }
         return result
+
+
+
+
+    def build_oemof_inputs(self) -> Dict[str, Any]:
+        """Baut die oemof-Eingaben (config, Zeitreihe, Fahrzeugparameter)."""
+        if not self._prepared:
+            raise ValueError("Inputs must be prepared before building Oemof inputs")
+
+        from spice_ev.oemof import SystemConfig
+
+        config = SystemConfig.from_options(self.oemof_config)
+
+        # Globale PV/Last aus den Events auf das Zeitraster bringen
+        pv = self._aggregate_event_lists(
+            getattr(self.events, "local_generation_lists", {}), self.time_index)
+        load = self._aggregate_event_lists(
+            getattr(self.events, "fixed_load_lists", {}), self.time_index)
+        timeseries_df = pd.DataFrame(
+            {"PV_kW": pv.to_numpy(), "Load_kW": load.to_numpy()}, index=self.time_index)
+
+        # Fahrzeug-Stammdaten (Kapazität/SOC/v2g) je Fahrzeug
+        vehicles_df = self.input_frames["vehicles"].set_index("vehicle_id")
+        per_vehicle_ts = self.input_frames["per_vehicle_ts"]
+
+        # Fahrzeug -> Ladestation, um die Wallbox-Leistung aus dem Szenario zu ziehen
+        cs_map = self._vehicle_cs_map()
+        charging_stations = self.world_state.charging_stations
+
+        vehicle_params: Dict[str, Dict[str, Any]] = {}
+        for vid, ts in per_vehicle_ts.items():
+            at_home = ts["zuhause"].astype(float).to_numpy()
+            consumption = ts["energy_kwh"].fillna(0).astype(float).to_numpy()
+
+            if vid in vehicles_df.index:
+                row = vehicles_df.loc[vid]
+                capacity = float(row["capacity_kwh"])
+                init_soc = float(row["soc"])
+                v2g = bool(row["v2g"])
+                desired_soc = float(row["desired_soc"]) if not pd.isna(
+                    row.get("desired_soc")) else config.bev_max_soc
+            else:
+                capacity = config.bev_capacity_kWh
+                init_soc = config.bev_initial_soc
+                v2g = config.enable_v2h
+                desired_soc = config.bev_max_soc
+
+            # desired_soc in den zulässigen Bereich klemmen
+            desired_soc = min(max(desired_soc, config.bev_min_soc), config.bev_max_soc)
+
+            # Wallbox-Leistung aus der zugeordneten Ladestation (Fallback: config)
+            cs = charging_stations.get(cs_map.get(vid))
+            wallbox_power = (float(cs.max_power) if cs is not None
+                             else config.wallbox_power_kW)
+
+            # Zeitabhängiger Mindest-SOC: vor jeder Abfahrt (letzter Zuhause-Schritt
+            # vor einer Fahrt) muss der BEV auf desired_soc geladen sein. So bleibt
+            # genug Puffer, damit spice_ev (nichtlineares Batteriemodell) nicht
+            # unter 0 / desired fällt.
+            min_soc_series = np.full(len(at_home), config.bev_min_soc, dtype=float)
+            for i in range(len(at_home) - 1):
+                if at_home[i] >= 0.5 and at_home[i + 1] < 0.5:
+                    min_soc_series[i] = desired_soc
+
+            vehicle_params[vid] = {
+                "capacity_kWh": capacity,
+                "min_soc": config.bev_min_soc,
+                "max_soc": config.bev_max_soc,
+                "initial_soc": init_soc,
+                "v2g": v2g,
+                "at_home": at_home,
+                "consumption": consumption,
+                "min_soc_series": min_soc_series,
+                "wallbox_power_kW": wallbox_power,
+            }
+
+        return {
+            "config": config,
+            "timeseries_df": timeseries_df,
+            "time_index": self.time_index,
+            "vehicle_params": vehicle_params,
+            "grid_power": self._grid_power(),
+            "battery_params": self._battery_params(config),
+        }
+
+    def run_oemof_model(self, oemof_inputs: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
+        """Erstellt das oemof-Modell, löst es (Ganzhorizont) und liefert den Fahrplan."""
+        from spice_ev.oemof import EnergySystemModel
+
+        model = EnergySystemModel(
+            config=oemof_inputs["config"],
+            timeseries_df=oemof_inputs["timeseries_df"],
+            time_index=oemof_inputs["time_index"],
+            vehicle_params=oemof_inputs["vehicle_params"],
+            grid_power=oemof_inputs.get("grid_power"),
+            battery_params=oemof_inputs.get("battery_params"),
+        )
+        model.run()
+        self._model = model
+        return model.get_wallbox_schedule()
+
+    def commands_from_oemof(self, oemof_results: Dict[str, pd.DataFrame]) -> Dict[str, list]:
+        """Wandelt die per-Fahrzeug-Fahrpläne in positionsindizierte Befehlslisten."""
+        schedule: Dict[str, list] = {}
+        for vid, df in (oemof_results or {}).items():
+            charge = df["charge_kW"].to_numpy()
+            discharge = df["discharge_kW"].to_numpy()
+            schedule[vid] = list(zip(charge.tolist(), discharge.tolist()))
+        return schedule
+
+    def _ensure_solved(self) -> None:
+        """Löst die Optimierung genau einmal und cached den Ladeplan."""
+        if self._solved:
+            return
+        self.prepare_inputs()
+        oemof_inputs = self.build_oemof_inputs()
+        results = self.run_oemof_model(oemof_inputs)
+        self._schedule = self.commands_from_oemof(results)
+        self._solved = True
+        self._oemof_step = 0
