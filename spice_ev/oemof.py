@@ -192,3 +192,104 @@ class SystemConfig:
             setattr(config, name, _coerce_value(value, field_types[name]))
         return config
 
+
+###########################################################################
+# Helper functions
+###########################################################################
+
+def setup_logging(config: SystemConfig) -> None:
+    """
+    Configure the logging system
+
+    Parameters:
+    -----------
+    config : SystemConfig
+        Configuration object with logging parameters
+    """
+    logger.define_logging(
+        logfile=config.log_filename,
+        screen_level=config.log_screen_level,
+        file_level=config.log_file_level,
+    )
+
+
+def load_timeseries(config: SystemConfig,
+    input_file: Optional[Path] = None
+) -> Tuple[pd.DataFrame, Path]:
+    """
+    Load the timeseries data from CSV
+
+    Parameters:
+    -----------
+    input_file : Path, optional
+        Path to the input file. If None, the default path is used.
+
+    Returns:
+    --------
+    df_timeseries : pd.DataFrame
+        DataFrame with all timeseries
+    timeseries_path : Path
+        Path to the loaded file
+    """
+    if input_file is None:
+        script_dir = Path(__file__).resolve().parent
+        input_file = script_dir / "Input_timeseries" / "input_timeseries.csv"
+
+    if not input_file.exists():
+        raise FileNotFoundError(f"Timeseries file not found: {input_file}")
+
+    logging.info(f"Loading timeseries from: {input_file}")
+    df_timeseries = pd.read_csv(input_file, delimiter=",")
+
+    # Validate required columns
+    required_columns = config.required_columns
+    missing_cols = set(required_columns) - set(df_timeseries.columns)
+    if missing_cols:
+        raise ValueError(f"Missing columns in the timeseries file: {missing_cols}")
+
+    return df_timeseries, input_file
+
+
+def validate_and_clean_timeseries(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Validate and clean the timeseries data
+
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Raw data
+
+    Returns:
+    --------
+    df_clean : pd.DataFrame
+        Cleaned data
+    """
+    df_clean = df.copy()
+
+    # PV values must be >= 0 (negative values -> 0)
+    if "PV_kW" in df_clean:
+        df_clean["PV_kW"] = df_clean["PV_kW"].clip(lower=0)
+
+    # Check for NaN values (only existing columns)
+    known_cols = [c for c in ("PV_kW", "Load_kW", "BEV_at_home", "consumption")
+                  if c in df_clean]
+    nan_counts = df_clean[known_cols].isna().sum()
+    if nan_counts.any():
+        logging.warning(f"NaN values found:\n{nan_counts[nan_counts > 0]}")
+        df_clean = df_clean.fillna(0)
+
+    # Validate BEV_at_home (should be binary) – only if globally present
+    if "BEV_at_home" in df_clean and not df_clean["BEV_at_home"].isin([0, 1]).all():
+        logging.warning("BEV_at_home contains non-binary values. Rounding to 0/1.")
+        df_clean["BEV_at_home"] = df_clean["BEV_at_home"].round().astype(int)
+
+    logging.info(f"Timeseries validated: {len(df_clean)} time steps")
+    if "PV_kW" in df_clean:
+        logging.info(f"  PV: {df_clean['PV_kW'].min():.2f} - {df_clean['PV_kW'].max():.2f} kW")
+    if "Load_kW" in df_clean:
+        logging.info(f"  Load: {df_clean['Load_kW'].min():.2f} - {df_clean['Load_kW'].max():.2f} kW")
+    if "consumption" in df_clean:
+        logging.info(f"  BEV consumption: {df_clean['consumption'].sum():.2f} kWh total")
+
+    return df_clean
+
