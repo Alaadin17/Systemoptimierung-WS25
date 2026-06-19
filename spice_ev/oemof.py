@@ -812,3 +812,52 @@ class EnergySystemModel:
             logging.error(f"  ❌ Error while saving: {e}")
             raise
 
+
+###########################################################################
+# Main program (standalone smoke test with synthetic data)
+###########################################################################
+def main():
+    """Standalone demo: 2 vehicles, 1 day (96 x 15min), synthetic PV/load.
+
+    Serves as a smoke test of the model without spice_ev/CSV. In the production
+    path ``EnergySystemModel`` is called from the strategy ``OemofSolve`` with
+    ``timeseries_df``, ``time_index`` and ``vehicle_params``.
+    """
+    config = SystemConfig()
+    config.periods = 96
+    config.debug = False
+    config.should_dump_results = False
+    idx = pd.date_range(start=config.start_date, periods=config.periods, freq=config.freq)
+
+    hours = idx.hour + idx.minute / 60.0
+    pv = np.clip(np.sin((hours - 6.0) / 12.0 * np.pi), 0, None) * 8.0  # PV bell curve
+    load = np.full(config.periods, 0.5)  # constant base load
+    df = pd.DataFrame({"PV_kW": pv, "Load_kW": load}, index=idx)
+
+    # Vehicle 1: away during the day (~08:00–14:00), 10 kWh trip on arrival
+    at_home_1 = np.ones(config.periods)
+    at_home_1[32:56] = 0
+    cons_1 = np.zeros(config.periods)
+    cons_1[55] = 10.0
+    # Vehicle 2: at home continuously, no V2G
+    vehicle_params = {
+        "veh_1": {"capacity_kWh": 77.0, "min_soc": 0.2, "max_soc": 0.95,
+                  "initial_soc": 0.5, "v2g": True,
+                  "at_home": at_home_1, "consumption": cons_1},
+        "veh_2": {"capacity_kWh": 58.0, "min_soc": 0.2, "max_soc": 0.9,
+                  "initial_soc": 0.6, "v2g": False,
+                  "at_home": np.ones(config.periods),
+                  "consumption": np.zeros(config.periods)},
+    }
+
+    model = EnergySystemModel(
+        config=config, timeseries_df=df, time_index=idx, vehicle_params=vehicle_params
+    )
+    model.run()
+    for vid, sched in model.get_wallbox_schedule().items():
+        print(f"{vid}: total charging = {sched['charge_kW'].sum():.1f} kWh-eq, "
+              f"V2H total = {sched['discharge_kW'].sum():.1f} kWh-eq")
+
+
+if __name__ == "__main__":
+    main()
