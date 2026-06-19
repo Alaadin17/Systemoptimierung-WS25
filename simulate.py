@@ -39,6 +39,8 @@ def simulate(args):
         'testing': args.get("testing"),
         'timing': args.get("eta"),
         'visual': args.get("visual"),
+        # oemof-Parameter (oemof_*-Keys from cfg) are passed to the strategy
+        'oemof_config': args.get("oemof_options", {}),
     }
 
     # parse strategy options
@@ -71,18 +73,22 @@ def simulate(args):
                       if pv.parent == gcID])
             timeseries = vars(s).get(f"{gcID}_timeseries")
 
-            # original fixed load
-            power_fix_load_list = timeseries.get("fixed load [kW]", [0] * s.n_intervals)
+            # original fixed load (align lengths to actual timeseries)
+            power_grid_supply_list = timeseries.get("grid supply [kW]")
+            if power_grid_supply_list is None:
+                power_grid_supply_list = [0] * s.n_intervals
+            steps = len(power_grid_supply_list)
+            power_fix_load_list = timeseries.get("fixed load [kW]", [0] * steps)
             # calculate grid supply for fixed load: subtract support power (where negative)
             for ts_name in ["local generation [kW]", "battery power [kW]", "sum CS power [kW]"]:
                 support = timeseries.get(ts_name)
                 if support is None:
                     continue
-                assert len(support) == len(power_fix_load_list) == s.n_intervals
-                for i in range(s.n_intervals):
+                assert len(support) == len(power_fix_load_list) == steps
+                for i in range(steps):
                     power_fix_load_list[i] += min(support[i], 0)
             # grid supply for fixed loads can not be negative
-            for i in range(s.n_intervals):
+            for i in range(steps):
                 power_fix_load_list[i] = max(power_fix_load_list[i], 0)
 
             # Calculate costs
@@ -92,7 +98,7 @@ def simulate(args):
                 voltage_level=gc.voltage_level,
                 interval=s.interval,
                 timestamps_list=timeseries.get("time"),
-                power_grid_supply_list=timeseries.get("grid supply [kW]"),
+                power_grid_supply_list=power_grid_supply_list,
                 price_list=timeseries.get("price [EUR/kWh]"),
                 power_fix_load_list=power_fix_load_list,
                 power_generation_feed_in_list=timeseries.get("generation feed-in [kW]"),
