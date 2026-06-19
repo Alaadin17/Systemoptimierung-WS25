@@ -451,3 +451,116 @@ class OemofSolve(Strategy):
             print(f"Mapped segments to timeseries for {len(per_vehicle)} vehicles, resulting 1) dictionary with {len(per_vehicle)} vehicles with {len(per_vehicle)} dataframes with {len(per_vehicle[vid])} rows and 2) complete table with {len(long_df)} rows.")
             # Return both representations: per-vehicle dict and long-format table.
             return per_vehicle, long_df
+        
+
+    # ------------------------------------------------------------------
+    # Brücke spice_ev -> oemof
+    # ------------------------------------------------------------------
+    def _sample_event_list(self, ev_list, time_index: pd.DatetimeIndex) -> pd.Series:
+        """Tastet eine EnergyValuesList (Step-Funktion) auf das Zeitraster ab.
+        Args:            
+                ev_list: EnergyValuesList mit Werten und step_duration_s.
+                time_index: Ziel-Zeitindex für die Ausgabe (DatetimeIndex).
+        
+        Returns:
+                pd.Series mit index=time_index, Werten aus ev_list (stepweise konstant) und 0 außerhalb der ev_list-Zeiten.
+
+        We need it when there are in the Szenario PV or Load (include_local_generation_csv / include_fixed_load_csv in der generate.cfg). 
+        """
+        values = list(getattr(ev_list, "values", []) or [])
+        if not values:
+            return pd.Series(0.0, index=time_index)
+
+        delta = pd.Timedelta(seconds=ev_list.step_duration_s)
+        raw_index = pd.date_range(start=ev_list.start_time, periods=len(values), freq=delta)
+        factor = getattr(ev_list, "factor", 1) or 1
+        raw = pd.Series(np.asarray(values, dtype=float) * factor, index=raw_index)
+
+        # Zeitzonen vereinheitlichen (tz-naiv), damit reindex funktioniert
+        if raw.index.tz is not None:
+            raw.index = raw.index.tz_localize(None)
+        target = time_index
+        if target.tz is not None:
+            target = target.tz_localize(None)
+
+        aligned = raw.reindex(target, method="ffill").fillna(0.0)
+        aligned.index = time_index
+        return aligned
+
+    def _aggregate_event_lists(self, event_lists, time_index: pd.DatetimeIndex) -> pd.Series:
+        """Summiert mehrere EnergyValuesLists (z.B. mehrere PV-Anlagen) auf das Raster."""
+        total = pd.Series(0.0, index=time_index)
+        for ev_list in (event_lists or {}).values():
+            total = total.add(self._sample_event_list(ev_list, time_index), fill_value=0.0)
+        return total
+
+    def _vehicle_cs_map(self) -> Dict[str, str]:
+        """Ordnet jedem Fahrzeug seine Ladestation zu (aus Events / Initialzustand).
+        Args:
+            vehicle_events: List[VehicleEvent] mit möglichen "connected_charging_station"-Updates.
+            world_state.vehicles: Dict[vehicle_id, Vehicle] mit initial verbundenen Ladestationen.
+
+        Returns:
+            Dict[vehicle_id, charging_station_id] mit der zugeordneten Ladestation je Fahrzeug.
+        """
+        mapping: Dict[str, str] = {}
+        for ev in getattr(self.events, "vehicle_events", []):
+            cs = ev.update.get("connected_charging_station")
+            if cs:
+                mapping.setdefault(ev.vehicle_id, cs)
+        # Fallback: initial verbundene CS aus dem world_state
+        for vid, v in self.world_state.vehicles.items():
+            if vid not in mapping and getattr(v, "connected_charging_station", None):
+                mapping[vid] = v.connected_charging_station
+        return mapping
+
+    def _grid_power(self) -> Optional[float]:
+        """
+        Summe der Netzanschlussleistungen (max_power) der Grid-Connectors.
+        Args:
+                world_state.grid_connectors: Dict[connector_id, GridConnector] mit möglichen max_power-Attributen.
+        Returns:
+                - Float: mit der Summe der max_power aller Grid-Connectors, 
+                - None: wenn keine max_power definiert ist.
+        """
+        powers = [gc.max_power for gc in self.world_state.grid_connectors.values()
+                  if getattr(gc, "max_power", None)]
+        return float(sum(powers)) if powers else None
+
+    def _battery_params(self, config) -> Dict[str, Dict[str, Any]]:
+        """Liest ALLE stationären Batterien aus dem Szenario.
+
+        Args:
+            config: SystemConfig mit Fallback-Werten (Leistung/SOC/Effizienz).
+
+        Returns:
+            Dict[battery_id, infos] – leeres Dict, wenn keine (valide) Batterie da ist.
+            infos je Batterie:
+              capacity_kWh, power_kW (laden), discharge_power_kW (entladen),
+              initial_soc, efficiency, min_power_kW, loss_rate (dict), parent (GC).
+        """
+        result: Dict[str, Dict[str, Any]] = {}
+        for bid, bat in getattr(self.world_state, "batteries", {}).items():
+            capacity = float(getattr(bat, "capacity", 0) or 0)
+            # <=0 oder unbegrenzt (StationaryBattery setzt 2**64) -> ueberspringen
+            if capacity <= 0 or capacity > 1e9:
+                continue
+            try:
+                power = float(bat.loading_curve.max_power)
+            except Exception:
+                power = config.battery_max_power_kW
+            try:
+                discharge_power = float(bat.unloading_curve.max_power)
+            except Exception:
+                discharge_power = power  # keine eigene Entladekurve -> wie Laden
+            result[bid] = {
+                "capacity_kWh": capacity,
+                "power_kW": power,
+                "discharge_power_kW": discharge_power,
+                "initial_soc": float(getattr(bat, "soc", config.battery_initial_soc)),
+                "efficiency": float(getattr(bat, "efficiency", config.battery_efficiency)),
+                "min_power_kW": float(getattr(bat, "min_charging_power", 0.0) or 0.0),
+                "loss_rate": dict(getattr(bat, "loss_rate", {}) or {}),
+                "parent": getattr(bat, "parent", None),
+            }
+        return result
