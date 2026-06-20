@@ -31,10 +31,37 @@ Properties
 - The BEV can NOT feed into the grid (excess only at bus_pv, BEV at bus_mobility).
 - Grid and PV can charge the BEV; the BEV can supply the home via V2H.
 
-Inputs (__init__): SystemConfig (efficiencies/costs/solver), timeseries_df
-(PV_kW/Load_kW), time_index, vehicle_params (per vehicle), grid_power,
-battery_params. In the production path fed by
-spice_ev.strategies.oemof_solve.OemofSolve.
+Inputs (__init__)
+-----------------
+In the production path all six are built by
+``OemofSolve.build_oemof_inputs`` (spice_ev.strategies.oemof_solve) from the
+spice_ev scenario (events + world_state); ``main`` uses synthetic ones instead.
+
+- config (SystemConfig)  efficiencies/costs/solver + default/fallback values;
+                         from SystemConfig.from_options(oemof_* keys of the cfg).
+
+- timeseries_df          columns PV_kW/Load_kW on time_index; sampled and summed
+                         from events.local_generation_lists / fixed_load_lists
+                         (the include_*_csv series). 0 where absent.
+
+- time_index             the shared grid = spice_ev steps (row k = step k); built
+                         as pd.date_range(start .. stop-interval, freq=interval).
+
+- vehicle_params         per vehicle a Dict with keys = vehicle_id and values = dict with keys:
+                            - capacity_kWh (from world_state or config)
+                            - min_soc (from config)
+                            - max_soc (from config)
+                            - initial_soc (from world_state or config)
+                            - v2g (from world_state or config)
+                            - at_home (from preprocessed events: 1/0 series)
+                            - consumption (from preprocessed events: kWh/step series)
+
+
+- grid_power             sum of world_state.grid_connectors max_power (kW);
+                         fallback config.grid_supply_power_kW.
+
+- battery_params         Dict per stationary home battery from world_state.batteries
+                         (capacity/power/soc/efficiency); empty -> no home battery.
 
 Result: get_wallbox_schedule() returns the AC wallbox power per vehicle and
 time step (charging/V2H) back to the spice_ev simulation.
