@@ -479,11 +479,48 @@ class OemofSolve(Strategy):
         # Unify time zones (tz-naive) so that reindex works
         if raw.index.tz is not None:
             raw.index = raw.index.tz_localize(None)
+
         target = time_index
         if target.tz is not None:
             target = target.tz_localize(None)
 
-        aligned = raw.reindex(target, method="ffill").fillna(0.0)
+        # Determine target step size
+        if len(target) >= 2:
+            target_delta = target[1] - target[0]
+        else:
+            target_delta = delta
+
+        raw_start = raw.index[0]
+        raw_end = raw.index[-1] + delta
+
+        # Case 1: coarse -> fine or same resolution
+        # Example: source 1h, target 15min
+        if delta >= target_delta:
+            aligned = raw.reindex(target, method="ffill").fillna(0.0)
+
+            # Set values outside the raw time range to 0
+            valid_mask = (target >= raw_start) & (target < raw_end)
+            aligned.loc[~valid_mask] = 0.0
+
+        # Case 2: fine -> coarse
+        # Example: source 15min, target 1h
+        else:
+            aligned_values = []
+
+            for t_start in target:
+                t_end = t_start + target_delta
+
+                # Select raw values whose time interval lies inside the target interval
+                mask = (raw.index >= t_start) & (raw.index < t_end)
+                interval_values = raw.loc[mask]
+
+                if not interval_values.empty:
+                    aligned_values.append(float(interval_values.mean()))
+                else:
+                    aligned_values.append(0.0)
+
+            aligned = pd.Series(aligned_values, index=target)
+
         aligned.index = time_index
         return aligned
 
