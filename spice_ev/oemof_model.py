@@ -248,16 +248,49 @@ class EnergySystemModel:
     # Stages (stubs — implemented in later steps)
     # ------------------------------------------------------------------
     def _load_data(self) -> None:
-        """Validate the provided timeseries DataFrame into ``self.df_timeseries``."""
-        raise NotImplementedError("Step 2: _load_data")
+        """Validate the provided timeseries DataFrame into ``self.df_timeseries``.
+
+        Requires a DataFrame (there is no CSV path). Clips PV to >= 0 and fills
+        NaN with 0 — a light safety net; the data should already be clean.
+        """
+        if self._timeseries_df_input is None:
+            raise ValueError("timeseries_df is required")
+        df = self._timeseries_df_input.copy()
+        if "PV_kW" in df.columns:
+            df["PV_kW"] = df["PV_kW"].clip(lower=0)
+        self.df_timeseries = df.fillna(0)
 
     def _create_time_index(self) -> None:
         """Set ``self.time_index``: adopt the provided one, else build from config."""
-        raise NotImplementedError("Step 2: _create_time_index")
+        if self._time_index_input is not None:
+            self.time_index = pd.DatetimeIndex(self._time_index_input)
+        else:
+            self.time_index = pd.date_range(
+                start=self.config.start_date,
+                periods=self.config.periods,
+                freq=self.config.freq,
+            )
+        self.config.periods = len(self.time_index)
 
     def _create_energy_system(self) -> None:
         """Create the oemof ``EnergySystem`` on ``self.time_index`` (the backbone)."""
-        raise NotImplementedError("Step 2: _create_energy_system")
+        self.es = EnergySystem(timeindex=self.time_index, infer_last_interval=True)
+
+    # --- existence helpers: decide what gets built ---
+    def _has_pv(self) -> bool:
+        """True if PV should be modelled: enabled in config AND PV_kW data present."""
+        if not self.config.enable_pv:
+            return False
+        df = self.df_timeseries
+        return df is not None and "PV_kW" in df.columns and float(df["PV_kW"].sum()) > 0.0
+
+    def _has_battery(self) -> bool:
+        """True if a stationary home battery should be modelled."""
+        return self.config.enable_battery and bool(self.battery_params)
+
+    def _has_vehicles(self) -> bool:
+        """True if vehicles should be modelled."""
+        return self.config.enable_vehicles and bool(self.vehicle_params)
 
     def _create_components(self) -> None:
         """Build buses + components conditionally (the orchestrator)."""
