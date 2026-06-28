@@ -645,7 +645,7 @@ class OemofSolve(Strategy):
         if not self._prepared:
             raise ValueError("Inputs must be prepared before building Oemof inputs")
 
-        from spice_ev.oemof import SystemConfig
+        from spice_ev.oemof_model import SystemConfig
 
         config = SystemConfig.from_options(self.oemof_config)
 
@@ -727,7 +727,7 @@ class OemofSolve(Strategy):
 
     def run_oemof_model(self, oemof_inputs: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
         """Build the oemof model, solve it (full horizon) and return the schedule."""
-        from spice_ev.oemof import EnergySystemModel
+        from spice_ev.oemof_model import EnergySystemModel
 
         model = EnergySystemModel(
             config=oemof_inputs["config"],
