@@ -27,6 +27,7 @@ DEFAULT_COST_CALCULATION = {
     "flex_window": "flex_window",
     "schedule": "schedule",
     "distributed": "fixed_wo_plw",  # should call cost calculation with specific cost type
+    "oemof_solve": "fixed_wo_plw",
 }
 
 
