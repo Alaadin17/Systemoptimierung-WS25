@@ -457,16 +457,40 @@ class OemofSolve(Strategy):
     # Bridge spice_ev -> oemof
     # ------------------------------------------------------------------
     def _sample_event_list(self, ev_list, time_index: pd.DatetimeIndex) -> pd.Series:
-        """Sample an EnergyValuesList (step function) onto the time grid.
+        """
+        Sample an EnergyValuesList (step function) onto the time grid.
+
         Args:
                 ev_list: EnergyValuesList with values and step_duration_s.
                 time_index: target time index for the output (DatetimeIndex).
 
         Returns:
-                pd.Series with index=time_index, values from ev_list (piecewise constant) and 0 outside the ev_list times.
+                pd.Series with index=time_index, values from ev_list (piecewise constant)
+                and 0 outside the ev_list times.
 
-        We need it when the scenario contains PV or Load (include_local_generation_csv / include_fixed_load_csv in the generate.cfg).
+        We need it when the scenario contains PV or Load
+        (include_local_generation_csv / include_fixed_load_csv in the generate.cfg).
+
+        Example:
+                If the PV plant has 15min steps, but the simulation runs with 1h steps,
+                we need to sample the PV values onto the 1h grid.
+
+        Important:
+                Direction matters.
+
+                Coarse -> fine, for example 1h -> 15min:
+                Forward fill is correct for power values because the value is held constant
+                over the smaller time steps.
+
+                Fine -> coarse, for example 15min -> 1h:
+                Forward fill is not sufficient because it would only pick one value.
+                Instead, the mean value over the target interval is used.
+
+                Example:
+                15min values [1, 2, 3, 4] sampled to 1h should become 2.5,
+                not 1.0.
         """
+
         values = list(getattr(ev_list, "values", []) or [])
         if not values:
             return pd.Series(0.0, index=time_index)
@@ -525,20 +549,34 @@ class OemofSolve(Strategy):
         return aligned
 
     def _aggregate_event_lists(self, event_lists, time_index: pd.DatetimeIndex) -> pd.Series:
-        """Sum several EnergyValuesLists (e.g. multiple PV plants) onto the grid."""
+        """
+        Sum several EnergyValuesLists (e.g. multiple PV plants) onto the grid.
+        
+        Args:
+            event_lists: Dict[plant_id, EnergyValuesList] with values and step_duration_s.
+            time_index: target time index for the output (DatetimeIndex).
+        
+        Returns:
+            pd.Series with index=time_index, values = sum of all event_lists (piecewise constant) and 0 outside the event_list times.
+
+        example: if the scenario contains multiple PV plants, we need to sum their outputs onto the simulation time grid.
+        """
         total = pd.Series(0.0, index=time_index)
         for ev_list in (event_lists or {}).values():
             total = total.add(self._sample_event_list(ev_list, time_index), fill_value=0.0)
         return total
 
     def _vehicle_cs_map(self) -> Dict[str, str]:
-        """Map each vehicle to its charging station (from events / initial state).
+        """
+        Map each vehicle to its charging station (from events / initial state).
         Args:
             vehicle_events: List[VehicleEvent] with possible "connected_charging_station" updates.
             world_state.vehicles: Dict[vehicle_id, Vehicle] with initially connected charging stations.
 
         Returns:
             Dict[vehicle_id, charging_station_id] with the assigned charging station per vehicle.
+
+        example: if a vehicle is connected to a charging station at the start of the simulation, we need to know which charging station it is connected to in order to pull the wallbox power from the scenario.
         """
         mapping: Dict[str, str] = {}
         for ev in getattr(self.events, "vehicle_events", []):
@@ -601,9 +639,6 @@ class OemofSolve(Strategy):
                 "parent": getattr(bat, "parent", None),
             }
         return result
-
-
-
 
     def build_oemof_inputs(self) -> Dict[str, Any]:
         """Build the oemof inputs (config, timeseries, vehicle parameters)."""
@@ -685,6 +720,10 @@ class OemofSolve(Strategy):
             "grid_power": self._grid_power(),
             "battery_params": self._battery_params(config),
         }
+
+############################################################################
+############################ Oemof Model ###################################
+############################################################################
 
     def run_oemof_model(self, oemof_inputs: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
         """Build the oemof model, solve it (full horizon) and return the schedule."""
