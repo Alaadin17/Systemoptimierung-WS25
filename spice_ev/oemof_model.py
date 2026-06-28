@@ -293,8 +293,243 @@ class EnergySystemModel:
         return self.config.enable_vehicles and bool(self.vehicle_params)
 
     def _create_components(self) -> None:
-        """Build buses + components conditionally (the orchestrator)."""
-        raise NotImplementedError("Step 2: _create_components")
+        """Build buses + components conditionally (the orchestrator).
+
+        Always: bus_home + grid_supply + household_demand (2b).
+        Conditional: home battery per battery_params entry (2c); bus_pv + pv/excess if
+        PV (2d); one mobility part per vehicle_params entry (2e); a grid_feedin sink at
+        bus_home if enable_grid_feedin (lets home/BEV surplus reach the grid).
+        """
+        # --- always: home bus + grid supply + household load ---
+        b_home = buses.Bus(label="bus_home")
+        self.es.add(b_home)
+        self._b_home = b_home
+        self._add_grid_and_demand(b_home)
+
+        # --- PV side: bus_pv + pv + excess [+ converter] (2d) ---
+        if self._has_pv():
+            self._add_pv(b_home)
+
+        # --- one home battery per entry in battery_params (2c) ---
+        if self._has_battery():
+            for bid, bp in self.battery_params.items():
+                self._add_battery(bid, bp, b_home)
+
+        # --- one mobility part per entry in vehicle_params (2e) ---
+        if self._has_vehicles():
+            for vid, params in self.vehicle_params.items():
+                self._add_vehicle(vid, params, b_home)
+
+        # --- grid feed-in at bus_home: lets home/BEV surplus reach the grid (2e) ---
+        if self.config.enable_grid_feedin:
+            self.es.add(cmp.Sink(
+                label="grid_feedin",
+                inputs={b_home: flows.Flow(variable_costs=self.config.grid_feedin_tariff)},
+            ))
+
+    # ------------------------------------------------------------------
+    # Component builders (called by _create_components)
+    # ------------------------------------------------------------------
+    def _add_grid_and_demand(self, b_home) -> None:
+        """[2b] Grid supply (Source) + household load (Sink) at bus_home.
+
+        - grid_supply: draws from the grid, capped at ``grid_power`` kW (falls back to
+          ``config.grid_supply_power_kW``) and priced with ``grid_variable_costs`` so
+          the optimizer avoids unnecessary grid draw. Draw only — no export here
+          (grid feed-in comes later, only via PV ``excess``).
+        - household_demand: a FIXED load (``Load_kW``) that must be served every step
+          (missing column -> 0).
+        """
+        periods = self.config.periods
+        grid_power_kW = (self.grid_power if self.grid_power is not None
+                         else self.config.grid_supply_power_kW)
+        if "Load_kW" in self.df_timeseries.columns:
+            load = self.df_timeseries["Load_kW"].iloc[:periods]
+        else:
+            load = pd.Series(0.0, index=range(periods))
+
+        self.es.add(cmp.Source(
+            label="grid_supply",
+            outputs={b_home: flows.Flow(
+                nominal_value=grid_power_kW,
+                variable_costs=self.config.grid_variable_costs,
+            )},
+        ))
+        self.es.add(cmp.Sink(
+            label="household_demand",
+            inputs={b_home: flows.Flow(fix=load, nominal_value=1)},
+        ))
+
+    def _add_pv(self, b_home) -> None:
+        """[2d] PV side: bus_pv + pv source + grid feed-in (excess) [+ converter].
+
+        - pv: fixed generation (``PV_kW``) feeding bus_pv.
+        - excess_electricity: grid feed-in sink, priced with ``grid_feedin_tariff``
+          (negative = revenue).
+        - converter_pv_to_home (bus_pv -> bus_home): only if ``config.enable_pv_to_home``;
+          efficiency from ``converter_pv_to_home_efficiency``, capped at
+          ``converter_pv_to_home_power_kW``. Without it PV can only be exported.
+        """
+        periods = self.config.periods
+        pv_series = self.df_timeseries["PV_kW"].iloc[:periods]
+
+        b_pv = buses.Bus(label="bus_pv")
+        self.es.add(b_pv)
+
+        self.es.add(cmp.Source(
+            label="pv",
+            outputs={b_pv: flows.Flow(
+                fix=pv_series, nominal_value=1,
+                variable_costs=self.config.pv_variable_costs)},
+        ))
+        # grid feed-in only from PV (no path from battery/vehicle to the grid)
+        self.es.add(cmp.Sink(
+            label="excess_electricity",
+            inputs={b_pv: flows.Flow(variable_costs=self.config.grid_feedin_tariff)},
+        ))
+        if self.config.enable_pv_to_home:
+            self.es.add(cmp.Converter(
+                label="converter_pv_to_home",
+                inputs={b_pv: flows.Flow(
+                    nominal_value=self.config.converter_pv_to_home_power_kW,
+                    variable_costs=self.config.converter_pv_to_home_variable_costs)},
+                outputs={b_home: flows.Flow()},
+                conversion_factors={b_home: self.config.converter_pv_to_home_efficiency},
+            ))
+
+    def _add_battery(self, bid, bp, b_home) -> None:
+        """[2c] One home battery <bid>: bus_battery_<bid> + storage + DC/AC link.
+
+        Variant A (losses in the link): the scenario efficiency is split evenly over
+        both link directions (sqrt(eff) each, so charge*discharge = eff); the storage
+        itself is lossless (loss_rate=0, conversion factors 1.0) so losses are not
+        counted twice. Sizing comes from ``bp`` (one battery_params entry) with config
+        fallbacks. Called once per entry -> supports multiple batteries.
+        """
+        capacity = float(bp.get("capacity_kWh", self.config.battery_capacity_kWh))
+        power = float(bp.get("power_kW", self.config.battery_max_power_kW))
+        discharge_power = float(bp.get("discharge_power_kW", power))
+        init = float(bp.get("initial_soc", self.config.battery_initial_soc))
+        init = min(max(init, self.config.battery_min_soc), self.config.battery_max_soc)
+        efficiency = float(bp.get("efficiency", self.config.battery_efficiency))
+        eff_dir = efficiency ** 0.5  # half the losses per link direction
+
+        b_battery = buses.Bus(label=f"bus_battery_{bid}")
+        self.es.add(b_battery)
+
+        # ideal DC/AC link bus_home <-> bus_battery; the losses live here
+        self.es.add(cmp.Link(
+            label=f"link_home_battery_{bid}",
+            inputs={
+                b_battery: flows.Flow(nominal_value=discharge_power),  # discharge
+                b_home: flows.Flow(nominal_value=power),               # charge
+            },
+            outputs={
+                b_home: flows.Flow(nominal_value=discharge_power),
+                b_battery: flows.Flow(nominal_value=power),
+            },
+            conversion_factors={
+                (b_battery, b_home): eff_dir,   # discharge into the home
+                (b_home, b_battery): eff_dir,   # charge from the home
+            },
+        ))
+        # storage itself lossless (losses are in the link above)
+        self.es.add(cmp.GenericStorage(
+            label=f"home_battery_{bid}",
+            inputs={b_battery: flows.Flow(nominal_value=power)},
+            outputs={b_battery: flows.Flow(nominal_value=discharge_power)},
+            nominal_storage_capacity=capacity,
+            min_storage_level=self.config.battery_min_soc,
+            max_storage_level=self.config.battery_max_soc,
+            initial_storage_level=init,
+            inflow_conversion_factor=1.0,
+            outflow_conversion_factor=1.0,
+            loss_rate=0.0,
+            balanced=False,
+        ))
+
+    def _loss_factor(self) -> float:
+        """kWh/step -> kW factor: oemof multiplies fixed_losses_absolute by the step
+        duration (hours), so divide the per-step kWh by the step hours."""
+        if len(self.time_index) > 1:
+            step_hours = (self.time_index[1] - self.time_index[0]) / pd.Timedelta(hours=1)
+        else:
+            step_hours = 0.25
+        return 1.0 / step_hours
+
+    def _add_vehicle(self, vid, params, b_home) -> None:
+        """[2e] One vehicle <vid>: bus_mobility + wallbox_charge [+ wallbox_discharge] + BEV.
+
+        Mode follows spice_ev (binary per-vehicle ``v2g``) plus the global
+        ``enable_grid_feedin`` switch:
+        - charge_only : v2g False -> only wallbox_charge (bus_home -> bus_mobility).
+        - V2H         : v2g True  -> + wallbox_discharge (bus_mobility -> bus_home).
+        - V2G         : V2H + enable_grid_feedin -> surplus reaches the grid (grid_feedin
+                        sink at bus_home). ``config.enable_v2h`` is the global master off.
+
+        Refinements:
+        - at_home: the wallbox (charge AND discharge) only works while the vehicle is home
+          (``max = at_home``; 0 -> blocked).
+        - consumption: driving demand as ``fixed_losses_absolute`` (kWh/step -> kW via
+          ``_loss_factor``), drawn from the BEV storage even while away.
+        - discharge_limit (Option A): for V2H/V2G-capable vehicles the SOC floor is
+          raised to ``max(min_soc, discharge_limit)`` (spice_ev param, default 0.5), so
+          the controllable discharge stays above it in the LP. Note this also reserves
+          that SOC against driving (a bit more conservative than spice_ev, where
+          discharge_limit only caps the runtime unload).
+        """
+        periods = self.config.periods
+        at_home = _as_array(params.get("at_home", 1.0), periods)
+        consumption = _as_array(params.get("consumption", 0.0), periods)
+        loss_factor = self._loss_factor()
+
+        capacity = float(params.get("capacity_kWh", self.config.bev_capacity_kWh))
+        min_soc = float(params.get("min_soc", self.config.bev_min_soc))
+        max_soc = float(params.get("max_soc", self.config.bev_max_soc))
+        v2g = bool(params.get("v2g", False))
+        wallbox_power = float(params.get("wallbox_power_kW", self.config.wallbox_power_kW))
+
+        # discharge possible only if v2g and globally enabled; then raise the SOC floor
+        # to discharge_limit so V2H/V2G cannot drain below it (Option A).
+        can_discharge = self.config.enable_v2h and v2g
+        discharge_limit = float(params.get("discharge_limit", self.config.bev_discharge_limit))
+        storage_min = max(min_soc, discharge_limit) if can_discharge else min_soc
+        init_soc = min(max(float(params.get("initial_soc", self.config.bev_initial_soc)),
+                           storage_min), max_soc)
+
+        b_mobility = buses.Bus(label=f"bus_mobility_{vid}")
+        self.es.add(b_mobility)
+
+        # charge: bus_home -> bus_mobility (only while at home: max = at_home)
+        self.es.add(cmp.Converter(
+            label=f"wallbox_charge_{vid}",
+            inputs={b_home: flows.Flow()},
+            outputs={b_mobility: flows.Flow(max=at_home, nominal_value=wallbox_power)},
+            conversion_factors={b_mobility: self.config.wallbox_efficiency_charge},
+        ))
+
+        # discharge (V2H): bus_mobility -> bus_home (only if can_discharge, and at home)
+        if can_discharge:
+            self.es.add(cmp.Converter(
+                label=f"wallbox_discharge_{vid}",
+                inputs={b_mobility: flows.Flow()},
+                outputs={b_home: flows.Flow(max=at_home, nominal_value=wallbox_power)},
+                conversion_factors={b_home: self.config.wallbox_efficiency_discharge},
+            ))
+
+        # BEV battery at bus_mobility; driving demand = fixed absolute losses
+        self.es.add(cmp.GenericStorage(
+            label=f"bev_battery_{vid}",
+            inputs={b_mobility: flows.Flow()},
+            outputs={b_mobility: flows.Flow()},
+            nominal_storage_capacity=capacity,
+            min_storage_level=storage_min,
+            max_storage_level=max_soc,
+            initial_storage_level=init_soc,
+            loss_rate=0.0,
+            fixed_losses_absolute=consumption * loss_factor,
+            balanced=False,
+        ))
 
     def _optimize(self) -> None:
         """Build the oemof ``Model`` from the energy system."""
