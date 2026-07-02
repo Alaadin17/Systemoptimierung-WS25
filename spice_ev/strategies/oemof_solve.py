@@ -84,7 +84,7 @@ class OemofSolve(Strategy):
 
         # 3) State segments (parked/driving) + energy from trips
         state_segments_df = self._build_state_segments(
-            vehicle_events, self.start_time, self.stop_time)
+            vehicle_events, self.start_time, self.stop_time, vehicles)
         state_segments_df = self._map_trips_to_state_segments(
             trip_df_by_vehicle, state_segments_df)
 
@@ -248,26 +248,33 @@ class OemofSolve(Strategy):
         return trip_df_by_vehicle
 
 
-    def _build_state_segments(self, vehicle_events, start_time, stop_time) -> pd.DataFrame:
+    def _build_state_segments(self, vehicle_events, start_time, stop_time, vehicles=None) -> pd.DataFrame:
         """Build contiguous state segments (driving/parked) per vehicle.
 
         For each vehicle, departure and arrival events define state changes.
         The first segment starts at start_time; the last ends at stop_time.
+        Each parked segment also carries the connected_charging_station it is plugged
+        into (from the arrival event that starts it; the first segment uses the
+        vehicle's initial connected_charging_station). Driving segments -> None.
 
         Args:
             vehicle_events: List of VehicleEvent objects.
             start_time: Scenario start time (datetime).
             stop_time: Scenario stop time (datetime).
+            vehicles: Dict[vehicle_id, Vehicle] for the initial connected_charging_station.
 
         Returns:
-            DataFrame with columns: 
-                                    -vehicle_id, 
-                                    -start_time, 
-                                    -end_time, 
-                                    -state.
+            DataFrame with columns:
+                                    -vehicle_id,
+                                    -start_time,
+                                    -end_time,
+                                    -state,
+                                    -connected_charging_station.
         """
+        vehicles = vehicles or {}
         rows = []
-        vehicle_ids = sorted({ev.vehicle_id for ev in vehicle_events})
+        # include vehicles without any events (always parked) too
+        vehicle_ids = sorted(set(ev.vehicle_id for ev in vehicle_events) | set(vehicles))
         for vid in vehicle_ids:
             v_events = [
                 ev for ev in vehicle_events
@@ -275,6 +282,7 @@ class OemofSolve(Strategy):
             ]
             v_events = sorted(v_events, key=lambda e: e.start_time)
             state = "parked"  # Assume parked at the start until we see a departure
+            cs = getattr(vehicles.get(vid), "connected_charging_station", None)
             cursor = start_time
             for ev in v_events:
                 rows.append({
@@ -282,17 +290,21 @@ class OemofSolve(Strategy):
                     "start_time": cursor,
                     "end_time": ev.start_time,
                     "state": state,
+                    "connected_charging_station": cs,
                 })
                 if ev.event_type == "departure":
                     state = "driving"
+                    cs = None  # not plugged in while driving
                 elif ev.event_type == "arrival":
                     state = "parked"
+                    cs = ev.update.get("connected_charging_station")
                 cursor = ev.start_time
             rows.append({
                 "vehicle_id": vid,
                 "start_time": cursor,
                 "end_time": stop_time,
                 "state": state,
+                "connected_charging_station": cs,
             })
         return pd.DataFrame(rows)
 
@@ -358,6 +370,7 @@ class OemofSolve(Strategy):
                 "end_time": end,
                 "state": state,
                 "energy_kwh": energy_kwh,
+                "connected_charging_station": segment["connected_charging_station"],
                 })
         return pd.DataFrame(rows)
 
@@ -408,6 +421,7 @@ class OemofSolve(Strategy):
                 df = pd.DataFrame(index=time_index)
                 df["state"] = "parked"  # Default state; will be overwritten by segments
                 df["energy_kwh"] = 0  # Default energy; will be overwritten by segments
+                df["connected_charging_station"] = None  # Default: not plugged in
 
                 # Apply each segment to all overlapping time bins.
                 # _: index of the segment (ignored), seg: the segment row with start_time, end_time, state, energy_kwh
@@ -421,7 +435,8 @@ class OemofSolve(Strategy):
                     if end.tzinfo is not None:
                         end = end.tz_localize(None)
 
-                    left = time_index.searchsorted(start, side="right")
+                    # bin ts belongs to the segment iff start <= ts < end
+                    left = time_index.searchsorted(start, side="left")
                     right = time_index.searchsorted(end, side="left")
 
 
@@ -430,6 +445,7 @@ class OemofSolve(Strategy):
                         df.loc[ts_slice, "state"] = seg["state"]
                         df.loc[ts_slice, "energy_kwh"] = 0
                         df.loc[ts_slice[-1], "energy_kwh"] = seg["energy_kwh"]
+                        df.loc[ts_slice, "connected_charging_station"] = seg["connected_charging_station"]
 
                 # Convenience boolean columns for quick filtering/plotting.
                 df["unterwegs"] = df["state"].eq("driving")
@@ -443,10 +459,10 @@ class OemofSolve(Strategy):
             # Concatenate all vehicles into one long table (timestamp, vehicle_id, ...).
             if long_rows:
                 long_df = pd.concat(long_rows, ignore_index=True)
-                long_df = long_df[["timestamp", "vehicle_id", "state", "unterwegs", "zuhause", "energy_kwh"]]
+                long_df = long_df[["timestamp", "vehicle_id", "state", "unterwegs", "zuhause", "energy_kwh", "connected_charging_station"]]
             else:
                 long_df = pd.DataFrame(
-                    columns=["timestamp", "vehicle_id", "state", "unterwegs", "zuhause", "energy_kwh"]
+                    columns=["timestamp", "vehicle_id", "state", "unterwegs", "zuhause", "energy_kwh", "connected_charging_station"]
                 )
             print(f"Mapped segments to timeseries for {len(per_vehicle)} vehicles, resulting 1) dictionary with {len(per_vehicle)} vehicles with {len(per_vehicle)} dataframes with {len(per_vehicle[vid])} rows and 2) complete table with {len(long_df)} rows.")
             # Return both representations: per-vehicle dict and long-format table.
@@ -566,29 +582,6 @@ class OemofSolve(Strategy):
             total = total.add(self._sample_event_list(ev_list, time_index), fill_value=0.0)
         return total
 
-    def _vehicle_cs_map(self) -> Dict[str, str]:
-        """
-        Map each vehicle to its charging station (from events / initial state).
-        Args:
-            vehicle_events: List[VehicleEvent] with possible "connected_charging_station" updates.
-            world_state.vehicles: Dict[vehicle_id, Vehicle] with initially connected charging stations.
-
-        Returns:
-            Dict[vehicle_id, charging_station_id] with the assigned charging station per vehicle.
-
-        example: if a vehicle is connected to a charging station at the start of the simulation, we need to know which charging station it is connected to in order to pull the wallbox power from the scenario.
-        """
-        mapping: Dict[str, str] = {}
-        for ev in getattr(self.events, "vehicle_events", []):
-            cs = ev.update.get("connected_charging_station")
-            if cs:
-                mapping.setdefault(ev.vehicle_id, cs)
-        # Fallback: initially connected CS from the world_state
-        for vid, v in self.world_state.vehicles.items():
-            if vid not in mapping and getattr(v, "connected_charging_station", None):
-                mapping[vid] = v.connected_charging_station
-        return mapping
-
     def _grid_power(self) -> Optional[float]:
         """
         Sum of the grid connection powers (max_power) of the grid connectors.
@@ -601,6 +594,18 @@ class OemofSolve(Strategy):
         powers = [gc.max_power for gc in self.world_state.grid_connectors.values()
                   if getattr(gc, "max_power", None)]
         return float(sum(powers)) if powers else None
+
+    def _grid_connectors(self) -> Dict[str, Dict[str, Any]]:
+        """Per grid connector: max_power (oemof builds one grid source/sink per GC).
+
+        Returns {connector_id: {"max_power": float}} for every GC that has a max_power.
+        """
+        result: Dict[str, Dict[str, Any]] = {}
+        for gcid, gc in self.world_state.grid_connectors.items():
+            mp = getattr(gc, "max_power", None)
+            if mp:
+                result[gcid] = {"max_power": float(mp)}
+        return result
 
     def _battery_params(self, config) -> Dict[str, Dict[str, Any]]:
         """Read ALL stationary batteries from the scenario.
@@ -657,48 +662,30 @@ class OemofSolve(Strategy):
         timeseries_df = pd.DataFrame(
             {"PV_kW": pv.to_numpy(), "Load_kW": load.to_numpy()}, index=self.time_index)
 
-        # Vehicle master data (capacity/SOC/v2g) per vehicle
+        # Vehicle master data (capacity/SOC/v2g/discharge_limit) per vehicle
         vehicles_df = self.input_frames["vehicles"].set_index("vehicle_id")
         per_vehicle_ts = self.input_frames["per_vehicle_ts"]
 
-        # Vehicle -> charging station, to pull the wallbox power from the scenario
-        cs_map = self._vehicle_cs_map()
-        charging_stations = self.world_state.charging_stations
-
         vehicle_params: Dict[str, Dict[str, Any]] = {}
         for vid, ts in per_vehicle_ts.items():
-            at_home = ts["zuhause"].astype(float).to_numpy()
             consumption = ts["energy_kwh"].fillna(0).astype(float).to_numpy()
+            # Per-step charging station the vehicle is plugged into (None while driving).
+            # The oemof model derives the wallbox availability/power from this.
+            connected_cs = ts["connected_charging_station"].to_numpy()
 
             if vid in vehicles_df.index:
                 row = vehicles_df.loc[vid]
                 capacity = float(row["capacity_kwh"])
                 init_soc = float(row["soc"])
                 v2g = bool(row["v2g"])
-                desired_soc = float(row["desired_soc"]) if not pd.isna(
-                    row.get("desired_soc")) else config.bev_max_soc
+                discharge_limit = (float(row["discharge_limit"])
+                                   if not pd.isna(row.get("discharge_limit"))
+                                   else config.bev_discharge_limit)
             else:
                 capacity = config.bev_capacity_kWh
                 init_soc = config.bev_initial_soc
                 v2g = config.enable_v2h
-                desired_soc = config.bev_max_soc
-
-            # Clamp desired_soc into the allowed range
-            desired_soc = min(max(desired_soc, config.bev_min_soc), config.bev_max_soc)
-
-            # Wallbox power from the assigned charging station (fallback: config)
-            cs = charging_stations.get(cs_map.get(vid))
-            wallbox_power = (float(cs.max_power) if cs is not None
-                             else config.wallbox_power_kW)
-
-            # Time-dependent minimum SOC: before each departure (the last at-home
-            # step before a trip) the BEV must be charged to desired_soc. This keeps
-            # enough buffer so that spice_ev (nonlinear battery model) does not
-            # drop below 0 / desired.
-            min_soc_series = np.full(len(at_home), config.bev_min_soc, dtype=float)
-            for i in range(len(at_home) - 1):
-                if at_home[i] >= 0.5 and at_home[i + 1] < 0.5:
-                    min_soc_series[i] = desired_soc
+                discharge_limit = config.bev_discharge_limit
 
             vehicle_params[vid] = {
                 "capacity_kWh": capacity,
@@ -706,11 +693,16 @@ class OemofSolve(Strategy):
                 "max_soc": config.bev_max_soc,
                 "initial_soc": init_soc,
                 "v2g": v2g,
-                "at_home": at_home,
+                "discharge_limit": discharge_limit,
                 "consumption": consumption,
-                "min_soc_series": min_soc_series,
-                "wallbox_power_kW": wallbox_power,
+                "connected_cs": connected_cs,
             }
+
+        # Charging stations (one wallbox per CS in the oemof model): power + parent GC
+        charging_stations = {
+            csid: {"max_power": float(cs.max_power), "parent": getattr(cs, "parent", None)}
+            for csid, cs in self.world_state.charging_stations.items()
+        }
 
         return {
             "config": config,
@@ -718,7 +710,9 @@ class OemofSolve(Strategy):
             "time_index": self.time_index,
             "vehicle_params": vehicle_params,
             "grid_power": self._grid_power(),
+            "grid_connectors": self._grid_connectors(),
             "battery_params": self._battery_params(config),
+            "charging_stations": charging_stations,
         }
 
 ############################################################################
@@ -735,7 +729,9 @@ class OemofSolve(Strategy):
             time_index=oemof_inputs["time_index"],
             vehicle_params=oemof_inputs["vehicle_params"],
             grid_power=oemof_inputs.get("grid_power"),
+            grid_connectors=oemof_inputs.get("grid_connectors"),
             battery_params=oemof_inputs.get("battery_params"),
+            charging_stations=oemof_inputs.get("charging_stations"),
         )
         model.run()
         self._model = model
