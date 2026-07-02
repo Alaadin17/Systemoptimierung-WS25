@@ -136,6 +136,7 @@ class SystemConfig:
     # Result storage
     should_dump_results: bool = True
     dump_filename: str = "dump"
+    export_graph: bool = False  # render the built topology as SVG (oemof.network.graph -> Graphviz)
 
     @classmethod
     def from_options(cls, options: Optional[Dict[str, Any]] = None) -> "SystemConfig":
@@ -245,6 +246,8 @@ class EnergySystemModel:
         self._create_time_index()
         self._create_energy_system()
         self._create_components()
+        if self.config.export_graph:
+            self._export_graph()
         self._optimize()
         self._solve()
         self._extract_results()
@@ -608,6 +611,64 @@ class EnergySystemModel:
     def get_wallbox_schedule(self) -> Dict[str, pd.DataFrame]:
         """Return the per-vehicle wallbox schedule (charge/discharge/net per step)."""
         raise NotImplementedError("Step 4: get_wallbox_schedule")
+
+    def _export_graph(self) -> None:
+        """Render the built energy system as an SVG topology graph (when ``export_graph``).
+
+        Uses ``oemof.network.graph.create_nx_graph`` -> DOT -> Graphviz ``dot -Tsvg`` and
+        writes ``results/<dump_filename>_graph.svg`` (+ .dot), coloured by node type. If
+        Graphviz ``dot`` is not on the PATH, only the .dot file is written.
+        """
+        import shutil
+        import subprocess
+        from oemof.network.graph import create_nx_graph
+
+        style = {
+            "bus": ("box", "#dbeafe", "#1e40af"), "source": ("ellipse", "#dcfce7", "#15803d"),
+            "sink": ("ellipse", "#fee2e2", "#b91c1c"), "converter": ("box", "#ffffff", "#475569"),
+            "link": ("box", "#eef2ff", "#4338ca"), "storage": ("cylinder", "#fef9c3", "#a16207"),
+            "other": ("box", "#f1f5f9", "#64748b"),
+        }
+
+        def kind(n):
+            if isinstance(n, buses.Bus):
+                return "bus"
+            if isinstance(n, cmp.GenericStorage):
+                return "storage"
+            if isinstance(n, cmp.Link):
+                return "link"
+            if isinstance(n, cmp.Converter):
+                return "converter"
+            if isinstance(n, cmp.Source):
+                return "source"
+            if isinstance(n, cmp.Sink):
+                return "sink"
+            return "other"
+
+        typ = {str(n): kind(n) for n in self.es.nodes}
+        g = create_nx_graph(self.es)
+        lines = ["digraph oemof_model {", "  rankdir=LR;",
+                 '  node [style=filled, fontname="Segoe UI", fontsize=10];',
+                 '  edge [color="#64748b", arrowsize=0.7];']
+        for n in g.nodes():
+            shape, fill, border = style[typ.get(n, "other")]
+            lines.append(f'  "{n}" [shape={shape}, fillcolor="{fill}", color="{border}"];')
+        for u, v in g.edges():
+            lines.append(f'  "{u}" -> "{v}";')
+        lines.append("}")
+
+        base = Path("results") / f"{self.config.dump_filename}_graph"
+        base.parent.mkdir(parents=True, exist_ok=True)
+        dot_path = base.with_suffix(".dot")
+        dot_path.write_text("\n".join(lines), encoding="utf-8")
+
+        dot_exe = shutil.which("dot")
+        if dot_exe:
+            subprocess.run([dot_exe, "-Tsvg", str(dot_path), "-o", str(base.with_suffix(".svg"))],
+                           check=True)
+            logging.info("oemof graph written: %s", base.with_suffix(".svg"))
+        else:
+            logging.warning("Graphviz 'dot' not on PATH -> only %s written", dot_path)
 
 
 ###########################################################################
