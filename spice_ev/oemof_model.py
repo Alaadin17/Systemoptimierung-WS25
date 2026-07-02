@@ -55,11 +55,11 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
-from oemof.solph import EnergySystem, buses, components as cmp, flows
+from oemof.solph import EnergySystem, Model, buses, components as cmp, flows
 
 # Added in later steps when the stages need them:
-#   Step 3:      from oemof.solph import Model, processing
-#   Step 3:      from pyomo.opt import SolverStatus, TerminationCondition
+#   Step 3 (_solve):   import warnings; from pyomo.opt import SolverStatus, TerminationCondition
+#   Step 4 (_extract): from oemof.solph import processing
 
 
 ###########################################################################
@@ -573,8 +573,18 @@ class EnergySystemModel:
                          for i in range(n)], dtype=float)
 
     def _optimize(self) -> None:
-        """Build the oemof ``Model`` from the energy system."""
-        raise NotImplementedError("Step 3: _optimize")
+        """Build the oemof ``Model`` (the LP) from the energy system.
+
+        ``Model(self.es)`` turns every bus balance, flow limit (nominal_value/max) and
+        storage equation into constraints plus the objective (sum of variable_costs).
+        If ``config.debug`` is set, also write the model as a readable ``.lp`` file
+        (constraints + objective) into ``results/`` for inspection.
+        """
+        self.model = Model(self.es)
+        if self.config.debug:
+            lp_path = Path("results") / f"{self.config.dump_filename}_debug.lp"
+            lp_path.parent.mkdir(parents=True, exist_ok=True)
+            self.model.write(str(lp_path), io_options={"symbolic_solver_labels": True})
 
     def _solve(self) -> None:
         """Solve the optimization problem and check the solver status."""
