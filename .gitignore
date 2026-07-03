@@ -11,16 +11,7 @@ docs/
 _build/
 scenarios/
 
-# Ignore folder Grundlagen in systemoptimierung (systemoptimierung/Grundlagen)
-systemoptimierung/Grundlagen/
-systemoptimierung/Notebooks
-# Ignore folder Oemof in systemoptimierung (systemoptimierung/Oemof)
-systemoptimierung/Oemof/
-systemoptimierung/SpiceEv/test_spiceev_runner.ipynb
-systemoptimierung/SpiceEv/spiceev_runner.py
-systemoptimierung/SpiceEv/Scenario_year_2vehicles_JSON_Analyse.ipynb
-systemoptimierung/SpiceEv/run_spiceev.py
-systemoptimierung/SpiceEv/Pre-processing-vehicle-df.ipynb
-systemoptimierung/SpiceEv/run_spiceev.py
-systemoptimierung/SpiceEv/Oemof_Modell_angewandet.ipynb
+# systemoptimierung/: track ONLY examples/, ignore everything else
+systemoptimierung/*
+!systemoptimierung/examples/
 examples/configs/generate_from_statistics.cfg
