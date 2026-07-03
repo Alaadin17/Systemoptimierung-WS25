@@ -595,17 +595,34 @@ class OemofSolve(Strategy):
                   if getattr(gc, "max_power", None)]
         return float(sum(powers)) if powers else None
 
-    def _grid_connectors(self) -> Dict[str, Dict[str, Any]]:
-        """Per grid connector: max_power (oemof builds one grid source/sink per GC).
+    def _grid_connectors(self, time_index) -> Dict[str, Dict[str, Any]]:
+        """Per grid connector: max_power + its OWN household load and PV timeseries.
 
-        Returns {connector_id: {"max_power": float}} for every GC that has a max_power.
+        The oemof model builds one bus (Home_N) + source + feed-in sink per active GC;
+        each GC also carries its own load and PV, grouped by the events'
+        ``grid_connector_id``. Returns {gcid: {"max_power"(optional), "load", "pv"}}.
         """
+        fixed = getattr(self.events, "fixed_load_lists", {})
+        gen = getattr(self.events, "local_generation_lists", {})
         result: Dict[str, Dict[str, Any]] = {}
         for gcid, gc in self.world_state.grid_connectors.items():
+            info: Dict[str, Any] = {
+                "load": self._aggregate_event_lists_for_gc(fixed, gcid, time_index),
+                "pv": self._aggregate_event_lists_for_gc(gen, gcid, time_index),
+            }
             mp = getattr(gc, "max_power", None)
             if mp:
-                result[gcid] = {"max_power": float(mp)}
+                info["max_power"] = float(mp)
+            result[gcid] = info
         return result
+
+    def _aggregate_event_lists_for_gc(self, event_lists, gcid, time_index):
+        """Sum only the EnergyValuesLists whose grid_connector_id == gcid (as np array)."""
+        total = pd.Series(0.0, index=time_index)
+        for ev_list in (event_lists or {}).values():
+            if getattr(ev_list, "grid_connector_id", None) == gcid:
+                total = total.add(self._sample_event_list(ev_list, time_index), fill_value=0.0)
+        return total.to_numpy()
 
     def _battery_params(self, config) -> Dict[str, Dict[str, Any]]:
         """Read ALL stationary batteries from the scenario.
@@ -710,7 +727,7 @@ class OemofSolve(Strategy):
             "time_index": self.time_index,
             "vehicle_params": vehicle_params,
             "grid_power": self._grid_power(),
-            "grid_connectors": self._grid_connectors(),
+            "grid_connectors": self._grid_connectors(self.time_index),
             "battery_params": self._battery_params(config),
             "charging_stations": charging_stations,
         }
