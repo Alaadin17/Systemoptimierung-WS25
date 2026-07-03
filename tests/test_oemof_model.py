@@ -172,3 +172,38 @@ def test_solve_small_model(tmp_path, monkeypatch, caplog):
     assert math.isfinite(m.model.objective())
     assert (tmp_path / "lp_out" / "dump_debug.lp").exists()    # LP dump in config.output_dir
     assert "oemof solved" in caplog.text                        # _solve debug log line
+
+
+# ---------------------------------------------------------------------------
+# Test 4 — full run() extracts a per-vehicle schedule and dumps CSVs (CBC)
+# ---------------------------------------------------------------------------
+@pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
+def test_full_run_extracts_schedule(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    idx = pd.date_range("2025-01-01", periods=8, freq="15min")
+    m = EnergySystemModel(
+        config=SystemConfig(debug=False, should_dump_results=True, output_dir="out"),
+        time_index=idx,
+        # car starts at 50% (25 kWh), drives steps 4-7 (16 kWh) -> must charge to stay >= min
+        grid_connectors={"GC1": {"max_power": 30.0,
+                                 "load": [1] * 8, "pv": [0, 0, 2, 4, 4, 2, 0, 0]}},
+        charging_stations={"CS1": {"max_power": 11.0, "parent": "GC1"}},
+        vehicle_params={"v1": {"capacity_kWh": 50.0, "initial_soc": 0.5, "min_soc": 0.2,
+                               "connected_cs": ["CS1", "CS1", "CS1", "CS1", None, None, None, None],
+                               "consumption": [0, 0, 0, 0, 4, 4, 4, 4]}},
+    )
+    m.run()   # full pipeline incl. _extract_results + _save_results
+
+    sched = m.get_wallbox_schedule()
+    assert set(sched) == {"v1"}
+    df = sched["v1"]
+    assert list(df.columns) == ["charge_kW", "discharge_kW", "net_kW", "soc_kWh"]
+    assert len(df) == 8
+    assert df["charge_kW"].sum() > 0                              # must charge to survive the drive
+    assert (df["net_kW"] == df["charge_kW"] - df["discharge_kW"]).all()
+    assert df["soc_kWh"].notna().all()                            # BEV SOC extracted
+
+    # CSVs land in config.output_dir
+    assert (tmp_path / "out" / "dump_wallbox_v1.csv").exists()
+    assert (tmp_path / "out" / "dump_summary.csv").exists()
+    assert (tmp_path / "out" / "dump_costs.csv").exists()

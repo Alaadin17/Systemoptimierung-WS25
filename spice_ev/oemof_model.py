@@ -58,10 +58,8 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 from oemof.solph import EnergySystem, Model, buses, components as cmp, flows
+from oemof.solph import processing
 from pyomo.opt import SolverStatus, TerminationCondition
-
-# Added in later steps when the stages need them:
-#   Step 4 (_extract): from oemof.solph import processing
 
 
 ###########################################################################
@@ -237,6 +235,9 @@ class EnergySystemModel:
         self.model = None           # oemof Model (Step 3)
         self.df_timeseries: Optional[pd.DataFrame] = None
         self._results_main = None   # processing.results(model) (Step 4)
+        self._wallbox_schedule: Optional[Dict[str, pd.DataFrame]] = None  # per vehicle (Step 4)
+        self._summary_df: Optional[pd.DataFrame] = None  # per-GC grid/PV + battery SOC (Step 4)
+        self._costs: Optional[Dict[str, float]] = None   # objective value (Step 4)
         self._b_home = None         # bus_home reference (Step 2)
         self._vehicle_nodes: Dict[str, Dict[str, Any]] = {}  # per-vehicle nodes (Step 2)
 
@@ -605,24 +606,123 @@ class EnergySystemModel:
                 solve_seconds, status, termination, self.model.objective(),
             )
 
+    # ------------------------------------------------------------------
+    # Result extraction helpers (Step 4)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _fit(arr, n) -> np.ndarray:
+        """Coerce a result sequence to length n (truncate, or pad with the last value)."""
+        arr = np.asarray(arr, dtype=float)
+        if len(arr) >= n:
+            return arr[:n]
+        pad = arr[-1] if len(arr) else 0.0
+        return np.concatenate([arr, np.full(n - len(arr), pad)])
+
+    def _flow(self, res, source, target, n) -> np.ndarray:
+        """Per-step flow (kW) between two nodes, 0 if that edge does not exist."""
+        data = res.get((source, target))
+        if data is None:
+            return np.zeros(n)
+        return self._fit(data["sequences"]["flow"].to_numpy(), n)
+
+    def _storage_content(self, res, node, n) -> np.ndarray:
+        """Per-step storage content (kWh) of a GenericStorage node (NaN if absent)."""
+        data = res.get((node, None))
+        if data is None:
+            return np.full(n, np.nan)
+        seq = data["sequences"]
+        col = "storage_content" if "storage_content" in seq.columns else seq.columns[0]
+        return self._fit(seq[col].to_numpy(), n)
+
     def _extract_results(self) -> None:
-        """
-        Extract the oemof results into ``self._results_main``.
+        """Read the solved model into a per-vehicle schedule, a summary and the cost.
 
-        - Flows (Ladestationen)
-        - Storage levels (Batterien + BEVs)
-        - Costs ()
-
+        - self._wallbox_schedule: {vid: DataFrame[charge_kW, discharge_kW, net_kW, soc_kWh]}
+          measured as AC power at the vehicle's grid-connector bus (what spice_ev applies).
+        - self._summary_df: per-GC grid supply/feed-in and PV, plus every battery's SOC.
+        - self._costs: {"objective": <solver objective>}.
         """
-        raise NotImplementedError("Step 4: _extract_results")
+        res = processing.results(self.model)
+        self._results_main = res
+        n = len(self.time_index)
+        idx = self.time_index
+
+        # --- per-vehicle wallbox schedule (AC at the GC bus) ---
+        charge = {vid: np.zeros(n) for vid in self.vehicle_params}
+        discharge = {vid: np.zeros(n) for vid in self.vehicle_params}
+        for node in self.es.nodes:
+            if not isinstance(node, cmp.Converter):
+                continue
+            if node.label.startswith("wallbox_charge_"):
+                gc_bus = list(node.inputs)[0]          # gc_bus -> converter (AC drawn)
+                b_mob = list(node.outputs)[0]
+                vid = b_mob.label[len("bus_mobility_"):]
+                charge[vid] = charge[vid] + self._flow(res, gc_bus, node, n)
+            elif node.label.startswith("wallbox_discharge_"):
+                b_mob = list(node.inputs)[0]
+                gc_bus = list(node.outputs)[0]         # converter -> gc_bus (AC fed back)
+                vid = b_mob.label[len("bus_mobility_"):]
+                discharge[vid] = discharge[vid] + self._flow(res, node, gc_bus, n)
+
+        schedule = {}
+        for vid in self.vehicle_params:
+            bev = self._node("bev_battery_" + vid)
+            soc = self._storage_content(res, bev, n) if bev is not None else np.full(n, np.nan)
+            schedule[vid] = pd.DataFrame({
+                "charge_kW": charge[vid],
+                "discharge_kW": discharge[vid],
+                "net_kW": charge[vid] - discharge[vid],
+                "soc_kWh": soc,
+            }, index=idx)
+        self._wallbox_schedule = schedule
+
+        # --- per-GC summary: grid supply / feed-in / PV + battery SOC ---
+        summary: Dict[str, np.ndarray] = {}
+        for node in self.es.nodes:
+            lbl = node.label
+            if lbl.startswith("grid_supply_"):
+                summary[lbl] = self._flow(res, node, list(node.outputs)[0], n)
+            elif lbl.startswith("grid_feedin_"):
+                summary[lbl] = self._flow(res, list(node.inputs)[0], node, n)
+            elif lbl.startswith("pv_") and isinstance(node, cmp.Source):
+                summary[lbl] = self._flow(res, node, list(node.outputs)[0], n)
+            elif lbl.startswith("home_battery_"):
+                summary[f"{lbl}_soc_kWh"] = self._storage_content(res, node, n)
+        self._summary_df = pd.DataFrame(summary, index=idx)
+
+        # --- cost ---
+        self._costs = {"objective": float(self.model.objective())}
 
     def _save_results(self) -> None:
-        """Optionally dump the results to disk."""
-        raise NotImplementedError("Step 4: _save_results")
+        """Write the schedule, summary and cost as CSV into ``config.output_dir``."""
+        if not self.config.should_dump_results:
+            return
+        out = Path(self.config.output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        stem = self.config.dump_filename
+        for vid, df in (self._wallbox_schedule or {}).items():
+            df.to_csv(out / f"{stem}_wallbox_{vid}.csv")
+        if self._summary_df is not None:
+            self._summary_df.to_csv(out / f"{stem}_summary.csv")
+        if self._costs is not None:
+            pd.DataFrame([self._costs]).to_csv(out / f"{stem}_costs.csv", index=False)
+
+    def _node(self, label):
+        """Look up a built node by its label (None if it does not exist)."""
+        for node in self.es.nodes:
+            if node.label == label:
+                return node
+        return None
 
     def get_wallbox_schedule(self) -> Dict[str, pd.DataFrame]:
-        """Return the per-vehicle wallbox schedule (charge/discharge/net per step)."""
-        raise NotImplementedError("Step 4: get_wallbox_schedule")
+        """Return the per-vehicle wallbox schedule (charge/discharge/net/soc per step).
+
+        The columns ``charge_kW`` and ``discharge_kW`` are the contract consumed by
+        ``OemofSolve.commands_from_oemof``; ``net_kW`` and ``soc_kWh`` are extras.
+        """
+        if self._wallbox_schedule is None:
+            raise RuntimeError("get_wallbox_schedule() called before _extract_results()")
+        return self._wallbox_schedule
 
     def _export_graph(self) -> None:
         """Render the built energy system as an SVG topology graph (when ``export_graph``).
