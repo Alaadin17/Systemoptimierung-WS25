@@ -49,6 +49,8 @@ to the spice_ev simulation.
 
 import json
 import logging
+import time
+import warnings
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -56,9 +58,9 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 from oemof.solph import EnergySystem, Model, buses, components as cmp, flows
+from pyomo.opt import SolverStatus, TerminationCondition
 
 # Added in later steps when the stages need them:
-#   Step 3 (_solve):   import warnings; from pyomo.opt import SolverStatus, TerminationCondition
 #   Step 4 (_extract): from oemof.solph import processing
 
 
@@ -563,8 +565,44 @@ class EnergySystemModel:
             self.model.write(str(lp_path), io_options={"symbolic_solver_labels": True})
 
     def _solve(self) -> None:
-        """Solve the optimization problem and check the solver status."""
-        raise NotImplementedError("Step 3: _solve")
+        """Solve the LP with the configured solver and verify optimality.
+
+        Debug mode (``config.debug``) makes testing fast to inspect: the solver console
+        output is shown (``tee``) and a one-line summary — solve time, status,
+        termination and objective — is logged. A non-optimal result raises
+        ``RuntimeError`` instead of silently continuing with garbage.
+        """
+        solver_options = {}
+        if self.config.solver == "cbc":
+            solver_options = {"threads": self.config.solver_threads,
+                              "ratioGap": self.config.solver_ratio_gap}
+        # debug turns the solver console on so a run can be watched live
+        tee = self.config.solver_verbose or self.config.debug
+
+        t0 = time.perf_counter()
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning)
+            results = self.model.solve(
+                solver=self.config.solver,
+                solve_kwargs={"tee": tee},
+                cmdline_options=solver_options,
+            )
+        solve_seconds = time.perf_counter() - t0
+
+        status = results.solver.status
+        termination = results.solver.termination_condition
+        if status != SolverStatus.ok or termination != TerminationCondition.optimal:
+            raise RuntimeError(
+                "oemof solve did not reach an optimal solution "
+                f"(status={status}, termination={termination}, "
+                f"message={getattr(results.solver, 'message', 'n/a')})"
+            )
+
+        if self.config.debug:
+            logging.info(
+                "oemof solved in %.3fs | status=%s | termination=%s | objective=%.4f",
+                solve_seconds, status, termination, self.model.objective(),
+            )
 
     def _extract_results(self) -> None:
         """
