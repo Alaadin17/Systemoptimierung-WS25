@@ -137,6 +137,7 @@ class SystemConfig:
 
     # Result storage
     should_dump_results: bool = True
+    output_dir: str = "results"  # directory for the LP dump, result dump and graph
     dump_filename: str = "dump"
     export_graph: bool = False  # render the built topology as SVG (oemof.network.graph -> Graphviz)
 
@@ -556,11 +557,11 @@ class EnergySystemModel:
         ``Model(self.es)`` turns every bus balance, flow limit (nominal_value/max) and
         storage equation into constraints plus the objective (sum of variable_costs).
         If ``config.debug`` is set, also write the model as a readable ``.lp`` file
-        (constraints + objective) into ``results/`` for inspection.
+        (constraints + objective) into ``config.output_dir`` for inspection.
         """
         self.model = Model(self.es)
         if self.config.debug:
-            lp_path = Path("results") / f"{self.config.dump_filename}_debug.lp"
+            lp_path = Path(self.config.output_dir) / f"{self.config.dump_filename}_debug.lp"
             lp_path.parent.mkdir(parents=True, exist_ok=True)
             self.model.write(str(lp_path), io_options={"symbolic_solver_labels": True})
 
@@ -627,8 +628,8 @@ class EnergySystemModel:
         """Render the built energy system as an SVG topology graph (when ``export_graph``).
 
         Uses ``oemof.network.graph.create_nx_graph`` -> DOT -> Graphviz ``dot -Tsvg`` and
-        writes ``results/<dump_filename>_graph.svg`` (+ .dot), coloured by node type. If
-        Graphviz ``dot`` is not on the PATH, only the .dot file is written.
+        writes ``<output_dir>/<dump_filename>_graph.svg`` (+ .dot), coloured by node type.
+        If Graphviz ``dot`` is not on the PATH, only the .dot file is written.
         """
         import shutil
         import subprocess
@@ -668,7 +669,7 @@ class EnergySystemModel:
             lines.append(f'  "{u}" -> "{v}";')
         lines.append("}")
 
-        base = Path("results") / f"{self.config.dump_filename}_graph"
+        base = Path(self.config.output_dir) / f"{self.config.dump_filename}_graph"
         base.parent.mkdir(parents=True, exist_ok=True)
         dot_path = base.with_suffix(".dot")
         dot_path.write_text("\n".join(lines), encoding="utf-8")

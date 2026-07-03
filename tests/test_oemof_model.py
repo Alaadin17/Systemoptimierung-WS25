@@ -154,7 +154,7 @@ def test_solve_small_model(tmp_path, monkeypatch, caplog):
     monkeypatch.chdir(tmp_path)   # keep the debug LP dump inside the tmp dir
     idx = pd.date_range("2025-01-01", periods=4, freq="15min")
     m = EnergySystemModel(
-        config=SystemConfig(debug=True, enable_grid_feedin=False),
+        config=SystemConfig(debug=True, enable_grid_feedin=False, output_dir="lp_out"),
         time_index=idx,
         grid_connectors={"GC1": {"max_power": 30.0, "load": [1, 1, 1, 1]}},
         charging_stations={"CS1": {"max_power": 11.0, "parent": "GC1"}},
@@ -170,5 +170,5 @@ def test_solve_small_model(tmp_path, monkeypatch, caplog):
         m._solve()             # raises RuntimeError if not optimal
 
     assert math.isfinite(m.model.objective())
-    assert (tmp_path / "results" / "dump_debug.lp").exists()   # _optimize debug dump
+    assert (tmp_path / "lp_out" / "dump_debug.lp").exists()    # LP dump in config.output_dir
     assert "oemof solved" in caplog.text                        # _solve debug log line
