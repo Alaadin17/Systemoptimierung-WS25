@@ -257,17 +257,13 @@ class EnergySystemModel:
     # Stages (stubs — implemented in later steps)
     # ------------------------------------------------------------------
     def _load_data(self) -> None:
-        """Validate the provided timeseries DataFrame into ``self.df_timeseries``.
+        """Keep the optional legacy timeseries DataFrame (no longer required).
 
-        Requires a DataFrame (there is no CSV path). Clips PV to >= 0 and fills
-        NaN with 0 — a light safety net; the data should already be clean.
+        Load and PV are now provided PER grid connector
+        (``grid_connectors[gcid]['load'/'pv']``), so a global timeseries_df is optional.
         """
-        if self._timeseries_df_input is None:
-            raise ValueError("timeseries_df is required")
-        df = self._timeseries_df_input.copy()
-        if "PV_kW" in df.columns:
-            df["PV_kW"] = df["PV_kW"].clip(lower=0)
-        self.df_timeseries = df.fillna(0)
+        self.df_timeseries = (self._timeseries_df_input.copy()
+                              if self._timeseries_df_input is not None else None)
 
     def _create_time_index(self) -> None:
         """Set ``self.time_index``: adopt the provided one, else build from config."""
@@ -285,139 +281,120 @@ class EnergySystemModel:
         """Create the oemof ``EnergySystem`` on ``self.time_index`` (the backbone)."""
         self.es = EnergySystem(timeindex=self.time_index, infer_last_interval=True)
 
-    # --- existence helpers: decide what gets built ---
-    def _has_pv(self) -> bool:
-        """True if PV should be modelled: enabled in config AND PV_kW data present."""
-        if not self.config.enable_pv:
-            return False
-        df = self.df_timeseries
-        return df is not None and "PV_kW" in df.columns and float(df["PV_kW"].sum()) > 0.0
-
-    def _has_battery(self) -> bool:
-        """True if a stationary home battery should be modelled."""
-        return self.config.enable_battery and bool(self.battery_params)
-
-    def _has_vehicles(self) -> bool:
-        """True if vehicles should be modelled."""
-        return self.config.enable_vehicles and bool(self.vehicle_params)
-
     def _create_components(self) -> None:
-        """Build buses + components conditionally (the orchestrator).
+        """Per-GC topology (with pruning) — the orchestrator.
 
-        Always: bus_home + grid_supply + household_demand (2b).
-        Conditional: home battery per battery_params entry (2c); bus_pv + pv/excess if
-        PV (2d); one mobility part per vehicle_params entry (2e); a grid_feedin sink at
-        bus_home if enable_grid_feedin (lets home/BEV surplus reach the grid).
+        1. Build a bus + BEV storage per vehicle.
+        2. A charging station (wallbox) is kept only if >=1 vehicle plugs into it, and
+           is connected only to the vehicles that actually use it (masked by
+           ``connected_cs``).
+        3. A grid connector is 'active' if it has a used wallbox OR load OR PV OR a
+           battery. Each active GC gets its own bus ``Home_1``, ``Home_2``, ... with its
+           own grid_supply source, grid_feedin sink, household_demand, PV and batteries.
         """
-        # --- always: home bus + grid supply + household load ---
-        b_home = buses.Bus(label="bus_home")
-        self.es.add(b_home)
-        self._b_home = b_home
-        self._add_grid_and_demand(b_home)
+        periods = self.config.periods
 
-        # --- PV side: bus_pv + pv + excess [+ converter] (2d) ---
-        if self._has_pv():
-            self._add_pv(b_home)
+        # 1) one bus + BEV per vehicle
+        for vid, params in self.vehicle_params.items():
+            self._add_vehicle(vid, params)
 
-        # --- one home battery per entry in battery_params (2c) ---
-        if self._has_battery():
-            for bid, bp in self.battery_params.items():
-                self._add_battery(bid, bp, b_home)
+        # 2) which vehicles use each charging station (>=1 step) -> keep only used CS
+        cs_users = {}
+        for csid in self.charging_stations:
+            users = [vid for vid, node in self._vehicle_nodes.items()
+                     if csid in {c for c in node["connected_cs"] if c is not None}]
+            if users:
+                cs_users[csid] = users
 
-        # --- one mobility part per vehicle, then one wallbox per CS to all vehicles (2e) ---
-        if self._has_vehicles():
-            for vid, params in self.vehicle_params.items():
-                self._add_vehicle(vid, params)
-            self._add_wallboxes(b_home)
+        def gc_used_cs(gcid):
+            return [c for c in cs_users if self.charging_stations[c].get("parent") == gcid]
 
-        # --- grid feed-in at bus_home: one sink per grid connector (2e) ---
-        if self.config.enable_grid_feedin:
-            for gcid, _ in self._grid_list():
-                self.es.add(cmp.Sink(
-                    label=f"grid_feedin_{gcid}" if gcid else "grid_feedin",
-                    inputs={b_home: flows.Flow(variable_costs=self.config.grid_feedin_tariff)},
-                ))
+        def gc_has_battery(gcid):
+            return any(bp.get("parent") == gcid for bp in self.battery_params.values())
+
+        def nonzero(arr):
+            return arr is not None and float(np.sum(_as_array(arr, periods))) > 0.0
+
+        # 3) active grid connectors -> named Home_1, Home_2, ...
+        self._gc_bus = {}
+        n = 0
+        for gcid, gc in self.grid_connectors.items():
+            has_pv = self.config.enable_pv and nonzero(gc.get("pv"))
+            has_bat = self.config.enable_battery and gc_has_battery(gcid)
+            if not (gc_used_cs(gcid) or nonzero(gc.get("load")) or has_pv or has_bat):
+                continue  # GC carries nothing -> exclude it entirely
+            n += 1
+            name = f"Home_{n}"
+            b = buses.Bus(label=name)
+            self.es.add(b)
+            self._gc_bus[gcid] = b
+            self._add_grid_connector(gcid, gc, b, name, cs_users)
 
     # ------------------------------------------------------------------
     # Component builders (called by _create_components)
     # ------------------------------------------------------------------
-    def _grid_list(self):
-        """[(gcid, max_power), ...] — one entry per grid connector.
-
-        Fallback (no grid_connectors given): a single connection
-        [(None, grid_power or config.grid_supply_power_kW)] -> plain
-        ``grid_supply``/``grid_feedin`` labels.
-        """
-        if self.grid_connectors:
-            return [(gcid, float(gc.get("max_power", self.config.grid_supply_power_kW)))
-                    for gcid, gc in self.grid_connectors.items()]
-        power = self.grid_power if self.grid_power is not None else self.config.grid_supply_power_kW
-        return [(None, power)]
-
-    def _add_grid_and_demand(self, b_home) -> None:
-        """[2b] Grid supply (one Source per grid connector) + household load (Sink) at bus_home.
-
-        - grid_supply[_<gcid>]: one source per grid connector, capped at the GC's
-          ``max_power`` (fallback ``config.grid_supply_power_kW``), priced with
-          ``grid_variable_costs``. Draw only — export is the grid_feedin sink(s).
-        - household_demand: a FIXED load (``Load_kW``) that must be served every step
-          (missing column -> 0).
-        """
+    def _add_grid_connector(self, gcid, gc, b, name, cs_users) -> None:
+        """Build one active grid connector ``name`` and everything on its bus ``b``:
+        grid_supply source, grid_feedin sink, household_demand, PV, batteries and the
+        wallboxes of the charging stations that belong to this GC (only used ones)."""
         periods = self.config.periods
-        if "Load_kW" in self.df_timeseries.columns:
-            load = self.df_timeseries["Load_kW"].iloc[:periods]
-        else:
-            load = pd.Series(0.0, index=range(periods))
 
-        # one grid supply source per grid connector (fallback: a single connection)
-        for gcid, power in self._grid_list():
-            self.es.add(cmp.Source(
-                label=f"grid_supply_{gcid}" if gcid else "grid_supply",
-                outputs={b_home: flows.Flow(
-                    nominal_value=power,
-                    variable_costs=self.config.grid_variable_costs,
-                )},
-            ))
-        self.es.add(cmp.Sink(
-            label="household_demand",
-            inputs={b_home: flows.Flow(fix=load, nominal_value=1)},
-        ))
-
-    def _add_pv(self, b_home) -> None:
-        """[2d] PV side: bus_pv + pv source + grid feed-in (excess) [+ converter].
-
-        - pv: fixed generation (``PV_kW``) feeding bus_pv.
-        - excess_electricity: grid feed-in sink, priced with ``grid_feedin_tariff``
-          (negative = revenue).
-        - converter_pv_to_home (bus_pv -> bus_home): only if ``config.enable_pv_to_home``;
-          efficiency from ``converter_pv_to_home_efficiency``, capped at
-          ``converter_pv_to_home_power_kW``. Without it PV can only be exported.
-        """
-        periods = self.config.periods
-        pv_series = self.df_timeseries["PV_kW"].iloc[:periods]
-
-        b_pv = buses.Bus(label="bus_pv")
-        self.es.add(b_pv)
-
+        # grid supply source
         self.es.add(cmp.Source(
-            label="pv",
-            outputs={b_pv: flows.Flow(
-                fix=pv_series, nominal_value=1,
-                variable_costs=self.config.pv_variable_costs)},
+            label=f"grid_supply_{name}",
+            outputs={b: flows.Flow(
+                nominal_value=float(gc.get("max_power", self.config.grid_supply_power_kW)),
+                variable_costs=self.config.grid_variable_costs)},
         ))
-        # grid feed-in only from PV (no path from battery/vehicle to the grid)
+        # grid feed-in sink (export)
+        if self.config.enable_grid_feedin:
+            self.es.add(cmp.Sink(
+                label=f"grid_feedin_{name}",
+                inputs={b: flows.Flow(variable_costs=self.config.grid_feedin_tariff)},
+            ))
+        # household load (fixed) if this GC has one
+        load = gc.get("load")
+        if load is not None and float(np.sum(_as_array(load, periods))) > 0.0:
+            self.es.add(cmp.Sink(
+                label=f"household_demand_{name}",
+                inputs={b: flows.Flow(fix=_as_array(load, periods), nominal_value=1)},
+            ))
+        # PV on this GC
+        pv = gc.get("pv")
+        if self.config.enable_pv and pv is not None and float(np.sum(_as_array(pv, periods))) > 0.0:
+            self._add_pv(b, name, _as_array(pv, periods))
+        # stationary batteries whose parent is this GC
+        if self.config.enable_battery:
+            for bid, bp in self.battery_params.items():
+                if bp.get("parent") == gcid:
+                    self._add_battery(bid, bp, b)
+        # wallboxes of this GC's used charging stations
+        for csid, users in cs_users.items():
+            if self.charging_stations[csid].get("parent") == gcid:
+                self._add_wallbox(csid, users, b)
+
+    def _add_pv(self, gc_bus, name, pv_series) -> None:
+        """[2d] PV on grid connector ``name``: bus_pv_<name> + pv source + excess sink
+        [+ converter_pv_to_home to this GC's bus]."""
+        b_pv = buses.Bus(label=f"bus_pv_{name}")
+        self.es.add(b_pv)
+        self.es.add(cmp.Source(
+            label=f"pv_{name}",
+            outputs={b_pv: flows.Flow(fix=pv_series, nominal_value=1,
+                                      variable_costs=self.config.pv_variable_costs)},
+        ))
         self.es.add(cmp.Sink(
-            label="excess_electricity",
+            label=f"excess_{name}",
             inputs={b_pv: flows.Flow(variable_costs=self.config.grid_feedin_tariff)},
         ))
         if self.config.enable_pv_to_home:
             self.es.add(cmp.Converter(
-                label="converter_pv_to_home",
+                label=f"converter_pv_to_home_{name}",
                 inputs={b_pv: flows.Flow(
                     nominal_value=self.config.converter_pv_to_home_power_kW,
                     variable_costs=self.config.converter_pv_to_home_variable_costs)},
-                outputs={b_home: flows.Flow()},
-                conversion_factors={b_home: self.config.converter_pv_to_home_efficiency},
+                outputs={gc_bus: flows.Flow()},
+                conversion_factors={gc_bus: self.config.converter_pv_to_home_efficiency},
             ))
 
     def _add_battery(self, bid, bp, b_home) -> None:
@@ -484,7 +461,7 @@ class EnergySystemModel:
         """[2e] One vehicle <vid>: bus_mobility + bev_battery.
 
         The wallboxes are NOT built here — they are added per charging station in
-        ``_add_wallboxes`` (one wallbox per CS, connected to every vehicle).
+        ``_add_wallbox`` (only to the vehicles that actually use the station).
 
         - consumption: driving demand as ``fixed_losses_absolute`` (kWh/step -> kW via
           ``_loss_factor``), drawn from the BEV storage even while away.
@@ -534,39 +511,35 @@ class EnergySystemModel:
             "connected_cs": list(params.get("connected_cs", [])),
         }
 
-    def _add_wallboxes(self, b_home) -> None:
-        """[2e] One wallbox per charging station, connected to EVERY vehicle bus.
+    def _add_wallbox(self, csid, users, gc_bus) -> None:
+        """[2e] One wallbox (charging station ``csid``) on ``gc_bus``, connected to the
+        vehicles that actually use it.
 
-        spice_ev model: each charging station = one wallbox; a vehicle can plug into
-        different stations over time. For every (charging_station, vehicle) pair a
-        masked Converter is built between bus_home and bus_mobility_<vid>; its ``max``
-        is 1 exactly in the steps where that vehicle is plugged into THAT station
-        (``connected_cs == csid``), else 0. Power = the station's ``max_power``.
-        For v2g vehicles (and ``enable_v2h``) a matching discharge converter is added.
-        All stations attach to ``bus_home`` (the single grid connector); per-GC buses
-        are a later extension.
+        For each using vehicle a masked Converter gc_bus -> bus_mobility_<vid> is built;
+        its ``max`` is 1 exactly in the steps where that vehicle is plugged into THIS
+        station (``connected_cs == csid``), else 0. Power = the station's ``max_power``.
+        For v2g vehicles (and ``enable_v2h``) a matching discharge converter (V2H/V2G)
+        bus_mobility -> gc_bus is added.
         """
         periods = self.config.periods
-        for csid, cs in self.charging_stations.items():
-            power = float(cs.get("max_power", self.config.wallbox_power_kW))
-            for vid, node in self._vehicle_nodes.items():
-                mask = self._cs_mask(node["connected_cs"], csid, periods)
-                b_mob = node["bus"]
-                # charge: bus_home -> bus_mobility (only while plugged into THIS station)
+        power = float(self.charging_stations[csid].get("max_power", self.config.wallbox_power_kW))
+        for vid in users:
+            node = self._vehicle_nodes[vid]
+            mask = self._cs_mask(node["connected_cs"], csid, periods)
+            b_mob = node["bus"]
+            self.es.add(cmp.Converter(
+                label=f"wallbox_charge_{csid}_{vid}",
+                inputs={gc_bus: flows.Flow()},
+                outputs={b_mob: flows.Flow(max=mask, nominal_value=power)},
+                conversion_factors={b_mob: self.config.wallbox_efficiency_charge},
+            ))
+            if node["can_discharge"]:
                 self.es.add(cmp.Converter(
-                    label=f"wallbox_charge_{csid}_{vid}",
-                    inputs={b_home: flows.Flow()},
-                    outputs={b_mob: flows.Flow(max=mask, nominal_value=power)},
-                    conversion_factors={b_mob: self.config.wallbox_efficiency_charge},
+                    label=f"wallbox_discharge_{csid}_{vid}",
+                    inputs={b_mob: flows.Flow()},
+                    outputs={gc_bus: flows.Flow(max=mask, nominal_value=power)},
+                    conversion_factors={gc_bus: self.config.wallbox_efficiency_discharge},
                 ))
-                # discharge (V2H/V2G): bus_mobility -> bus_home
-                if node["can_discharge"]:
-                    self.es.add(cmp.Converter(
-                        label=f"wallbox_discharge_{csid}_{vid}",
-                        inputs={b_mob: flows.Flow()},
-                        outputs={b_home: flows.Flow(max=mask, nominal_value=power)},
-                        conversion_factors={b_home: self.config.wallbox_efficiency_discharge},
-                    ))
 
     @staticmethod
     def _cs_mask(connected_cs, csid, n) -> np.ndarray:
