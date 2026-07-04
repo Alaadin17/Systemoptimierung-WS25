@@ -14,4 +14,8 @@ scenarios/
 # systemoptimierung/: track ONLY examples/, ignore everything else
 systemoptimierung/*
 !systemoptimierung/examples/
+# abgeleitete Notebook-Artefakte (Vorlage + Overrides) — nicht committen
+systemoptimierung/examples/**/*.effective.cfg
+# das Test-Notebook vorerst nicht tracken
+systemoptimierung/examples/**/test_run.ipynb
 examples/configs/generate_from_statistics.cfg
