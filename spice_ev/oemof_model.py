@@ -498,18 +498,37 @@ class EnergySystemModel:
                                           self.config.grid_feedin_tariff))
         else:
             feedin_tariff = homebus_tariff = float(self.config.grid_feedin_tariff)
-        # Above the feed-in remuneration the bonus stops being a tie-breaker and starts
-        # buying self-consumption with real money: the LP then prefers storing over
-        # exporting even when the stored energy is worthless, and it begins circulating
-        # energy through the storage (charging and discharging in the same step) just to
-        # collect it. Bounded — only genuine PV kWh can ever collect the bonus — but wasteful.
-        max_bonus = max(float(self.config.pv_charge_bonus_vehicle_ct_kWh),
-                        float(self.config.pv_charge_bonus_battery_ct_kWh))
-        if self.config.pv_direct_to_storage and max_bonus > abs(feedin_tariff):
-            logging.warning(
-                "PV-Ladebonus %.3f ct/kWh liegt ueber der Einspeiseverguetung %.3f ct/kWh (%s): "
-                "der Plan verlaesst damit bewusst das Kostenoptimum. Der Preis dafuer steht "
-                "als objective_ohne_bonus in den Kosten.", max_bonus, abs(feedin_tariff), name)
+        # Wie gross darf der Bonus sein? Viel kleiner als man denkt.
+        # Er macht es lohnend, PV DURCH den Speicher ins Haus zu leiten statt direkt: dabei
+        # gehen (1 - eff^2) der kWh verloren, die sonst eingespeist worden waere. Rentabel
+        # wird das ab
+        #     bonus > (1 - eff^2) * |Einspeiseverguetung|
+        # also z. B. 0.0975 * 6.24 = 0.61 ct/kWh -- weit UNTER der Verguetung selbst.
+        # Darueber zirkuliert das LP Energie (laden und entladen im selben Schritt), der
+        # Fahrplan wird real teurer, und - schlimmer - die gemeldete PV->Speicher-Menge
+        # wird deutlich groesser als das, was tatsaechlich gespeichert bleibt. Die Kennzahl
+        # misst dann nicht mehr "PV gespeichert", sondern "PV hat den Speicherbus beruehrt".
+        # Der Bonus taugt deshalb als Tie-Breaker fuer eine EINDEUTIGE Zuordnung, nicht als
+        # Steuerungsinstrument. Gegengeprueft in example_1: 0.5 ct/kWh = kein einziger
+        # Kreislaufschritt, 1.0 ct/kWh = 2478 Schritte und +403 ct echte Mehrkosten.
+        # Betroffen ist nur ein Speicher, der auch WIEDER ins Haus abgeben kann: die
+        # Hausbatterie immer, das Fahrzeug nur mit V2H. Ohne Rueckweg gibt es keinen
+        # Kreislauf, dort ist der Bonus unkritisch (in example_1 nachgemessen: 3 ct auf dem
+        # Auto-Zweig ohne V2H -> kein einziger Kreislaufschritt).
+        eff = float(self.config.battery_efficiency)
+        cycle_bound = (1.0 - eff ** 2) * abs(feedin_tariff)
+        riskant = {"Hausbatterie": float(self.config.pv_charge_bonus_battery_ct_kWh)}
+        if self.config.enable_v2h:
+            riskant["Fahrzeug (V2H aktiv)"] = float(self.config.pv_charge_bonus_vehicle_ct_kWh)
+        if self.config.pv_direct_to_storage:
+            for wer, bonus in riskant.items():
+                if bonus > cycle_bound:
+                    logging.warning(
+                        "PV-Ladebonus %s %.3f ct/kWh liegt ueber der Kreislauf-Schwelle "
+                        "%.3f ct/kWh ((1-eff^2)*Einspeiseverguetung, %s): das LP kann Energie "
+                        "durch den Speicher zirkulieren, um ihn einzusammeln. pv_direct_* "
+                        "meldet dann MEHR als wirklich gespeichert wird, und "
+                        "objective_ohne_bonus steigt.", wer, bonus, cycle_bound, name)
         # grid feed-in sink (export from the home bus; battery/V2G)
         if self.config.enable_grid_feedin:
             self.es.add(cmp.Sink(
