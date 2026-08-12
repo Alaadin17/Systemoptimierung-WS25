@@ -1,17 +1,27 @@
 '''
------------------ OemofSolve strategies structure -----------------------
- 
- Goal: Optimize the charging strategy via Oemof to reduce the simulation runtime.
+----------------- OemofSolve strategy -----------------------
 
+Autor: Alaa Alsleman, GitHub: Alaadin17
 
- Inputs:
- - self.events (Events object)
- - self.world_state (Vehicles, Charging Stations, Grid Connectors)
- - self.cfg (configuration for the later Oemof integration)
+Goal: derive the charging strategy from an oemof optimization instead of a heuristic.
+The whole horizon is optimized ONCE (open loop) and the resulting plan is then applied
+step by step by the spice_ev simulation.
 
+Inputs (from the kwargs that scenario.py passes in):
+ - self.events       (Events object: vehicle events, fixed_load / local_generation lists)
+ - self.world_state  (Vehicles, Charging Stations, Grid Connectors, Batteries)
+ - self.oemof_config (flat dict of the oemof_* keys from simulate.cfg, prefix stripped;
+                      turned into a SystemConfig via SystemConfig.from_options)
+ - self.interval     (datetime.timedelta of one simulation step)
+ - self.stop_time    (end of the simulation)
+
+Flow:
+ step() -> _ensure_solved() -> prepare_inputs() -> build_oemof_inputs()
+        -> run_oemof_model() [EnergySystemModel.run()] -> commands_from_oemof()
 '''
 
 
+import json
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -19,13 +29,15 @@ import pandas as pd
 
 from spice_ev import events
 from spice_ev.strategy import Strategy
-from spice_ev.util import clamp_power
+from spice_ev.util import get_cost
 
 
 class OemofSolve(Strategy):
-    """
-    The goal is to prepare inputs (cfg + dataframes) for an Oemof model.
-    Actual model creation/solving is intentionally left as placeholders.
+    """Charging strategy that follows a plan optimized with oemof.
+
+    Prepares the inputs from the spice_ev scenario, builds and solves the oemof model once
+    over the full horizon (``_ensure_solved``) and caches the resulting per-vehicle plan in
+    ``self._schedule``. ``step()`` then applies that plan step by step.
     """
 
     def __init__(self, components, start_time, **kwargs):
@@ -41,17 +53,74 @@ class OemofSolve(Strategy):
         self.interval = kwargs.get("interval")
         self.stop_time = kwargs.get("stop_time")
         self.start_time = start_time
+        self._price_sheet = None   # lazy-loaded JSON (price sheet, see below)
 
         # Output containers, populated later by prepare_inputs()
         self.time_index = None
         self.input_frames = {}
         self._prepared = False
 
-        # Closed-loop state: solve the optimization once + cached schedule
+        # Open-loop state: the optimization runs ONCE, then the cached plan is applied.
         self._solved = False
         self._model = None
-        self._schedule: Dict[str, list] = {}  # vehicle_id -> list of (charge_kW, discharge_kW)
+        # The full plan, grouped by component type — filled ONCE by commands_from_oemof():
+        #   {"vehicles":  {vid:  [(charge_kW, discharge_kW, soc_end), ...]}, applied by step()
+        #    "batteries": {bid:  [(charge_kW, discharge_kW, soc_end), ...]}, applied by step()
+        #    "grid":      {gcid: [(supply_kW, feedin_kW),            ...]}}  verification only
+        # One tuple per simulation step. step() applies soc_end (the SOC the optimization
+        # reaches at the END of that step); the powers are for reporting and verification.
+        self._plan: Dict[str, Dict[str, list]] = {}
+        # Alias to self._plan["vehicles"], kept for existing references.
+        self._schedule: Dict[str, list] = {}
+        # Index of the CURRENT simulation step = position in the lists above; step() reads
+        # self._plan[<type>][<id>][self._oemof_step] and increments it afterwards.
         self._oemof_step = 0
+
+        # Optionally switch off spice_ev's minimum charging power (see the method's docstring).
+        # Done here, so it is guaranteed to happen before the first simulation step. The
+        # config object is kept — step() needs it for the V2G discharge floor.
+        from spice_ev.oemof_model import SystemConfig
+        self._oemof_cfg = SystemConfig.from_options(self.oemof_config)
+        self._apply_min_power_override(self._oemof_cfg)
+
+        # Path to spice_ev's price sheet (source of the PV feed-in remuneration and the
+        # retail markup). It arrives as the oemof_cost_parameters_file cfg key, so that
+        # spice_ev's own scripts need no modification; a kwargs value still wins if some
+        # caller supplies one directly. Empty -> the config values stay the fallback.
+        self.cost_parameters_file = (kwargs.get("cost_parameters_file")
+                                     or self._oemof_cfg.cost_parameters_file or None)
+
+    def _apply_min_power_override(self, config) -> None:
+        """Optionally drop spice_ev's minimum charging power to zero.
+
+        ``clamp_power`` (spice_ev/util.py) sets any charging power below ``cs.min_power`` or
+        ``vehicle_type.min_charging_power`` to ZERO. Other strategies call it to turn a
+        computed power into a command; the oemof model does not know that rule (it would
+        need binary variables) and plans such small powers anyway — e.g. to use a little PV
+        surplus. That energy then silently never reaches the battery.
+
+        NOTE: since ``step()`` applies the planned SOC (``Battery.load(target_soc=...)``)
+        instead of a commanded power, it does NOT call ``clamp_power`` — so on this path the
+        flag currently has no effect. It is kept because it belongs to the scenario, not to
+        the strategy: it stays correct if a power-based command path is ever reintroduced.
+
+        With ``config.ignore_min_charging_power`` both limits are set to 0.
+        ``min_charging_power`` is an optional VehicleType field defaulting to 0.0 anyway, so
+        this is a regular value.
+
+        Stationary batteries (``Battery.min_charging_power``) are deliberately NOT touched:
+        they are not driven by the oemof charging plan.
+
+        Args:
+            config: SystemConfig carrying the ``ignore_min_charging_power`` flag.
+        """
+        if not getattr(config, "ignore_min_charging_power", False):
+            return
+        # VehicleType objects are shared between vehicles of the same type -> covers all types
+        for vehicle in self.world_state.vehicles.values():
+            vehicle.vehicle_type.min_charging_power = 0.0
+        for cs in self.world_state.charging_stations.values():
+            cs.min_power = 0.0
 
 
 ###########################################################################
@@ -269,7 +338,10 @@ class OemofSolve(Strategy):
                                     -start_time,
                                     -end_time,
                                     -state,
-                                    -connected_charging_station.
+                                    -connected_charging_station,
+                                    -desired_soc (SOC the vehicle must reach before it
+                                     leaves again; seeded from the vehicle and updated by
+                                     every arrival event).
         """
         vehicles = vehicles or {}
         rows = []
@@ -283,6 +355,9 @@ class OemofSolve(Strategy):
             v_events = sorted(v_events, key=lambda e: e.start_time)
             state = "parked"  # Assume parked at the start until we see a departure
             cs = getattr(vehicles.get(vid), "connected_charging_station", None)
+            # SOC the vehicle must reach before it leaves again (spice_ev: desired_soc).
+            # Set on the vehicle initially and updated by every arrival event.
+            desired = getattr(vehicles.get(vid), "desired_soc", None)
             cursor = start_time
             for ev in v_events:
                 rows.append({
@@ -291,6 +366,7 @@ class OemofSolve(Strategy):
                     "end_time": ev.start_time,
                     "state": state,
                     "connected_charging_station": cs,
+                    "desired_soc": desired,
                 })
                 if ev.event_type == "departure":
                     state = "driving"
@@ -298,6 +374,7 @@ class OemofSolve(Strategy):
                 elif ev.event_type == "arrival":
                     state = "parked"
                     cs = ev.update.get("connected_charging_station")
+                    desired = ev.update.get("desired_soc", desired)
                 cursor = ev.start_time
             rows.append({
                 "vehicle_id": vid,
@@ -305,6 +382,7 @@ class OemofSolve(Strategy):
                 "end_time": stop_time,
                 "state": state,
                 "connected_charging_station": cs,
+                "desired_soc": desired,
             })
         return pd.DataFrame(rows)
 
@@ -321,9 +399,10 @@ class OemofSolve(Strategy):
         Args:
             start_time: Scenario start time (datetime).
             stop_time: Scenario stop time (datetime).
-            interval: Time interval (e.g., '1H' for hourly).
+            interval: Length of one simulation step as a datetime.timedelta
+                (spice_ev passes ``datetime.timedelta(minutes=scenario['interval'])``).
         Returns:
-            DatetimeIndex format: DatetimeIndex(['2024-01-01 00:00:00', '2024-01-01 01:00:00', ...])
+            DatetimeIndex format: DatetimeIndex(['2024-01-01 00:00:00', '2024-01-01 00:15:00', ...])
         """
         return pd.date_range(
             start=start_time, end=stop_time - pd.Timedelta(interval), freq=interval)
@@ -338,14 +417,18 @@ class OemofSolve(Strategy):
 
             Args:
                 trip_df_by_vehicle: Dict[vehicle_id, DataFrame] with trips per vehicle (columns: departure_time, arrival_time, energy_kwh)
-                state_segments_df: DataFrame with columns [vehicle_id, start_time, end_time, state]
+                state_segments_df: DataFrame from _build_state_segments, i.e. columns
+                    [vehicle_id, start_time, end_time, state, connected_charging_station,
+                     desired_soc]
             Returns:
-                DataFrame with columns: 
-                                        -vehicle_id, 
-                                        -start_time, 
-                                        -end_time, 
-                                        -state, 
-                                        -energy_kwh
+                DataFrame with columns:
+                                        -vehicle_id,
+                                        -start_time,
+                                        -end_time,
+                                        -state,
+                                        -energy_kwh,
+                                        -connected_charging_station (passed through),
+                                        -desired_soc (passed through)
         '''
         rows = []
         for _, segment in state_segments_df.iterrows():
@@ -371,6 +454,7 @@ class OemofSolve(Strategy):
                 "state": state,
                 "energy_kwh": energy_kwh,
                 "connected_charging_station": segment["connected_charging_station"],
+                "desired_soc": segment["desired_soc"],
                 })
         return pd.DataFrame(rows)
 
@@ -382,11 +466,14 @@ class OemofSolve(Strategy):
             """Build per-vehicle timeseries on a fixed time grid.
 
             Each row in state_segments_df represents a continuous segment [start_time, end_time)
-            with a state and optional energy_kwh. A time bin [ts, ts+interval) is marked active
-            if it overlaps the segment. Returns both per-vehicle tables and a long-format table.
+            with a state and optional energy_kwh. A time bin belongs to the segment iff its own
+            start lies in [start_time, end_time) — i.e. the assignment is by bin START, not by
+            overlap. Returns both per-vehicle tables and a long-format table.
 
             Args:
-                state_segments_df: DataFrame with columns [vehicle_id, start_time, end_time, state, energy_kwh].
+                state_segments_df: DataFrame with columns [vehicle_id, start_time, end_time,
+                    state, energy_kwh, connected_charging_station, desired_soc]; the last two
+                    are mapped onto the grid as well.
                 time_index: Iterable of timestamps defining bin starts.
                 interval: Bin width as Timedelta or a pandas-compatible frequency string (e.g. "15min").
 
@@ -422,6 +509,7 @@ class OemofSolve(Strategy):
                 df["state"] = "parked"  # Default state; will be overwritten by segments
                 df["energy_kwh"] = 0  # Default energy; will be overwritten by segments
                 df["connected_charging_station"] = None  # Default: not plugged in
+                df["desired_soc"] = np.nan  # SOC required before the next departure
 
                 # Apply each segment to all overlapping time bins.
                 # _: index of the segment (ignored), seg: the segment row with start_time, end_time, state, energy_kwh
@@ -446,6 +534,8 @@ class OemofSolve(Strategy):
                         df.loc[ts_slice, "energy_kwh"] = 0
                         df.loc[ts_slice[-1], "energy_kwh"] = seg["energy_kwh"]
                         df.loc[ts_slice, "connected_charging_station"] = seg["connected_charging_station"]
+                        if seg["desired_soc"] is not None and not pd.isna(seg["desired_soc"]):
+                            df.loc[ts_slice, "desired_soc"] = float(seg["desired_soc"])
 
                 # Convenience boolean columns for quick filtering/plotting.
                 df["unterwegs"] = df["state"].eq("driving")
@@ -459,10 +549,10 @@ class OemofSolve(Strategy):
             # Concatenate all vehicles into one long table (timestamp, vehicle_id, ...).
             if long_rows:
                 long_df = pd.concat(long_rows, ignore_index=True)
-                long_df = long_df[["timestamp", "vehicle_id", "state", "unterwegs", "zuhause", "energy_kwh", "connected_charging_station"]]
+                long_df = long_df[["timestamp", "vehicle_id", "state", "unterwegs", "zuhause", "energy_kwh", "connected_charging_station", "desired_soc"]]
             else:
                 long_df = pd.DataFrame(
-                    columns=["timestamp", "vehicle_id", "state", "unterwegs", "zuhause", "energy_kwh", "connected_charging_station"]
+                    columns=["timestamp", "vehicle_id", "state", "unterwegs", "zuhause", "energy_kwh", "connected_charging_station", "desired_soc"]
                 )
             print(f"Mapped segments to timeseries for {len(per_vehicle)} vehicles, resulting 1) dictionary with {len(per_vehicle)} vehicles with {len(per_vehicle)} dataframes with {len(per_vehicle[vid])} rows and 2) complete table with {len(long_df)} rows.")
             # Return both representations: per-vehicle dict and long-format table.
@@ -613,6 +703,25 @@ class OemofSolve(Strategy):
             mp = getattr(gc, "max_power", None)
             if mp:
                 info["max_power"] = float(mp)
+            # values sourced from the scenario / price sheet (config stays the fallback):
+            price = self._grid_price_series(gcid, time_index)
+            if price is not None:
+                markup = self._retail_markup_ct(gcid)
+                if markup is not None:
+                    # retail price like the spice_ev cost calculation: net components
+                    # summed, VAT on top of everything (feed-in stays net there too)
+                    net_markup, vat_percent = markup
+                    price = (price + net_markup) * (1.0 + vat_percent / 100.0)
+                info["price_ct_kWh"] = price          # time-varying grid price
+            tariff = self._feedin_tariff_ct(gcid)
+            if tariff is not None:
+                info["feedin_tariff_ct_kWh"] = tariff  # PV feed-in remuneration (negative)
+            hb = self._homebus_feedin_tariff_ct(gcid)
+            if hb is not None:
+                info["homebus_feedin_tariff_ct_kWh"] = hb  # battery/V2G export (0 by sheet)
+            kwp = self._pv_kwp(gcid)
+            if kwp > 0:
+                info["pv_power_kW"] = kwp              # PV plant size -> converter limit
             result[gcid] = info
         return result
 
@@ -623,6 +732,167 @@ class OemofSolve(Strategy):
             if getattr(ev_list, "grid_connector_id", None) == gcid:
                 total = total.add(self._sample_event_list(ev_list, time_index), fill_value=0.0)
         return total.to_numpy()
+
+    def _grid_price_series(self, gcid, time_index) -> Optional[np.ndarray]:
+        """Time-varying grid price for one GC from the scenario's grid operator signals.
+
+        spice_ev carries prices as GridOperatorSignal events (a ``cost`` dict per GC,
+        evaluated with ``util.get_cost`` — the same mechanism every other strategy uses).
+        The LP receives them as a per-step array in ct/kWh (signals are EUR/kWh -> x100),
+        piecewise constant from each signal's ``start_time``. Returns None if the scenario
+        has no priced signals for this GC (-> the config value stays as fallback).
+        """
+        sigs = [s for s in getattr(self.events, "grid_operator_signals", []) or []
+                if getattr(s, "grid_connector_id", None) == gcid
+                and getattr(s, "cost", None)]
+        if not sigs:
+            return None
+        pairs = []
+        for s in sorted(sigs, key=lambda s: s.start_time):
+            t = pd.Timestamp(s.start_time)
+            if t.tzinfo is not None:
+                t = t.tz_localize(None)
+            pairs.append((t, float(get_cost(1, s.cost)) * 100.0))   # EUR/kWh -> ct/kWh
+        target = time_index
+        if target.tz is not None:
+            target = target.tz_localize(None)
+        starts = pd.DatetimeIndex([p[0] for p in pairs])
+        values = np.array([p[1] for p in pairs])
+        # NEGATIVE prices are clipped to 0 for the LP: a linear model cannot forbid
+        # "disposing" of energy (storage in+out cycling burns it), so being PAID to buy
+        # becomes a money pump — buy, burn, get paid to re-buy. Real households cannot
+        # destroy energy for profit. At 0 ct the LP still charges everything useful, only
+        # the destruction premium is gone. (Exact modelling would need binary variables.)
+        values = np.maximum(values, 0.0)
+        idx = np.searchsorted(starts, target, side="right") - 1
+        idx = np.clip(idx, 0, len(values) - 1)   # before the first signal: first value
+        return values[idx]
+
+    def _retail_markup_ct(self, gcid) -> Optional[Tuple[float, float]]:
+        """Fixed per-kWh retail components + VAT rate from the price sheet.
+
+        Mirrors spice_ev's cost calculation (costs.py) so both worlds price identically:
+        grid fee commodity charge by ``fee_type`` (SLP flat net price; RLM by the GC's
+        voltage_level in the <2500 h/a bracket — the same edge-condition constant costs.py
+        uses), plus all levies, the concession fee and the electricity tax. All values are
+        NET; VAT is applied by the caller on (spot + markup), exactly like costs.py applies
+        it to the total while leaving the feed-in remuneration untaxed.
+
+        Returns (markup_net_ct_per_kWh, vat_percent), or None when the markup is disabled,
+        no price sheet is configured or the sheet lacks the entries (-> spot price only).
+        """
+        cfg = getattr(self, "_oemof_cfg", None)
+        if cfg is None or not getattr(cfg, "use_retail_markup", False):
+            return None
+        if not self.cost_parameters_file:
+            return None
+        if self._price_sheet is None:
+            with open(self.cost_parameters_file, encoding="utf-8") as f:
+                self._price_sheet = json.load(f)
+        gc = self.world_state.grid_connectors.get(gcid)
+        operator = getattr(gc, "grid_operator", "default_grid_operator") or "default_grid_operator"
+        try:
+            sheet = self._price_sheet[operator]
+            if str(cfg.fee_type).upper() == "SLP":
+                commodity = float(sheet["grid_fee"]["SLP"]["commodity_charge_ct/kWh"]["net_price"])
+            else:   # RLM: by voltage level, <2500 h/a utilization bracket
+                voltage = getattr(gc, "voltage_level", None) or "MV"
+                commodity = float(
+                    sheet["grid_fee"]["RLM"]["<2500_h/a"]["commodity_charge_ct/kWh"][voltage])
+            levies = sum(v for v in sheet["levies"].values() if isinstance(v, (int, float)))
+            concession = float(sheet["concession_fee"]["charge"])
+            electricity_tax = float(sheet["taxes"]["tax_on_electricity"])
+            vat_percent = float(sheet["taxes"]["value_added_tax"])
+        except (KeyError, TypeError):
+            return None
+        return commodity + float(levies) + concession + electricity_tax, vat_percent
+
+    def _pv_kwp(self, gcid) -> float:
+        """Installed PV nominal power (kWp) at one grid connector, summed over its plants."""
+        return sum(float(pv.nominal_power)
+                   for pv in getattr(self.world_state, "photovoltaics", {}).values()
+                   if getattr(pv, "parent", None) == gcid)
+
+    def _feedin_tariff_ct(self, gcid) -> Optional[float]:
+        """PV feed-in tariff for one GC from spice_ev's price sheet (negative = revenue).
+
+        Reads the SAME price sheet the spice_ev cost calculation uses
+        (``cost_parameters_file`` in simulate.cfg): ``feed-in_remuneration.PV`` maps plant
+        size steps (kWp) to a remuneration in ct/kWh. The step is chosen by the installed
+        PV power at this GC. Returns None if no sheet is configured or the GC has no PV
+        (-> the config value stays as fallback).
+        """
+        kwp = self._pv_kwp(gcid)
+        if not self.cost_parameters_file or kwp <= 0:
+            return None
+        if self._price_sheet is None:
+            with open(self.cost_parameters_file, encoding="utf-8") as f:
+                self._price_sheet = json.load(f)
+        operator = getattr(self.world_state.grid_connectors.get(gcid), "grid_operator",
+                           "default_grid_operator") or "default_grid_operator"
+        try:
+            fee = self._price_sheet[operator]["feed-in_remuneration"]["PV"]
+            steps, rems = fee["kWp"], fee["remuneration"]
+        except (KeyError, TypeError):
+            return None
+        i = int(np.searchsorted(np.asarray(steps, dtype=float), kwp, side="left"))
+        i = min(i, len(rems) - 1)
+        return -float(rems[i])   # negative = revenue (model convention)
+
+    def _homebus_feedin_tariff_ct(self, gcid) -> Optional[float]:
+        """Remuneration for exports from the HOME bus (battery / V2G), from the price sheet.
+
+        The sheet lists these separately from PV (``feed-in_remuneration.V2G`` and
+        ``.battery`` — both 0 in the default sheet): re-exported or battery energy earns
+        nothing, only PV does. Returns None without a sheet (-> config fallback).
+        """
+        if not self.cost_parameters_file:
+            return None
+        if self._price_sheet is None:
+            with open(self.cost_parameters_file, encoding="utf-8") as f:
+                self._price_sheet = json.load(f)
+        operator = getattr(self.world_state.grid_connectors.get(gcid), "grid_operator",
+                           "default_grid_operator") or "default_grid_operator"
+        try:
+            fee = self._price_sheet[operator]["feed-in_remuneration"]
+            value = max(float(fee.get("V2G", 0.0)), float(fee.get("battery", 0.0)))
+        except (KeyError, TypeError):
+            return None
+        return -value   # 0 in the default sheet -> exporting from the home bus earns nothing
+
+    @staticmethod
+    def _min_soc_series(ts, config) -> np.ndarray:
+        """Per-step SOC floor for one vehicle, taken from the spice_ev scenario.
+
+        spice_ev expects a vehicle to be charged to its ``desired_soc`` when it leaves
+        (the trips are sized for that). The oemof model therefore gets a time-varying
+        ``min_storage_level``: ``desired_soc`` at every DEPARTURE step (the last step the
+        vehicle is still plugged in before it drives off), and the global
+        ``config.bev_min_soc`` everywhere else — a constant desired_soc floor would be
+        infeasible, since driving must be allowed to drain the battery below it.
+
+        Args:
+            ts: per-vehicle timeseries with columns connected_charging_station, desired_soc.
+            config: SystemConfig (fallback floor ``bev_min_soc``).
+
+        Returns:
+            np.ndarray of length len(ts) with the SOC floor (0..1) per step.
+        """
+        base = float(config.bev_min_soc)
+        connected = np.array([c is not None for c in ts["connected_charging_station"]])
+        n = len(connected)
+        floor = np.full(n, base, dtype=float)
+        if n == 0:
+            return floor
+
+        desired = ts["desired_soc"].to_numpy(dtype=float)
+        desired = np.where(np.isnan(desired), base, desired)
+
+        # departure = plugged in now, gone in the next step
+        departs = np.zeros(n, dtype=bool)
+        departs[:-1] = connected[:-1] & ~connected[1:]
+        floor[departs] = np.maximum(base, desired[departs])
+        return floor
 
     def _battery_params(self, config) -> Dict[str, Dict[str, Any]]:
         """Read ALL stationary batteries from the scenario.
@@ -663,7 +933,14 @@ class OemofSolve(Strategy):
         return result
 
     def build_oemof_inputs(self) -> Dict[str, Any]:
-        """Build the oemof inputs (config, timeseries, vehicle parameters)."""
+        """Assemble every input EnergySystemModel needs, from the spice_ev scenario.
+
+        Returns a dict with: config (SystemConfig from the oemof_* cfg keys), time_index,
+        grid_connectors (per GC: max_power + its own load/pv), charging_stations (max_power
+        + parent GC), vehicle_params (capacity/SOC/v2g/efficiency + consumption,
+        connected_cs and min_soc_series), battery_params, plus the legacy timeseries_df and
+        grid_power (kept for standalone use, not read by the model).
+        """
         if not self._prepared:
             raise ValueError("Inputs must be prepared before building Oemof inputs")
 
@@ -704,6 +981,14 @@ class OemofSolve(Strategy):
                 v2g = config.enable_v2h
                 discharge_limit = config.bev_discharge_limit
 
+            # spice_ev has NO wallbox loss: the charging station only limits the power and
+            # the loss happens INSIDE the battery (Battery.efficiency, default 0.95). The
+            # oemof model mirrors that (storage inflow/outflow_conversion_factor), so we
+            # hand over the vehicle's real battery efficiency. Any mismatch here makes the
+            # planned SOC drift away from the simulated one.
+            veh = self.world_state.vehicles.get(vid)
+            eff = float(getattr(getattr(veh, "battery", None), "efficiency", 0.95) or 0.95)
+
             vehicle_params[vid] = {
                 "capacity_kWh": capacity,
                 "min_soc": config.bev_min_soc,
@@ -713,6 +998,8 @@ class OemofSolve(Strategy):
                 "discharge_limit": discharge_limit,
                 "consumption": consumption,
                 "connected_cs": connected_cs,
+                "min_soc_series": self._min_soc_series(ts, config),
+                "efficiency": eff,   # spice_ev Battery.efficiency -> storage in/outflow
             }
 
         # Charging stations (one wallbox per CS in the oemof model): power + parent GC
@@ -736,8 +1023,12 @@ class OemofSolve(Strategy):
 ############################ Oemof Model ###################################
 ############################################################################
 
-    def run_oemof_model(self, oemof_inputs: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
-        """Build the oemof model, solve it (full horizon) and return the schedule."""
+    def run_oemof_model(self, oemof_inputs: Dict[str, Any]) -> Dict[str, Dict[str, pd.DataFrame]]:
+        """Build the oemof model, solve it (full horizon) and return the full plan.
+
+        The returned dict comes from ``EnergySystemModel.get_plan()`` and is grouped by
+        component type: ``vehicles`` / ``batteries`` / ``grid`` (see there).
+        """
         from spice_ev.oemof_model import EnergySystemModel
 
         model = EnergySystemModel(
@@ -752,16 +1043,46 @@ class OemofSolve(Strategy):
         )
         model.run()
         self._model = model
-        return model.get_wallbox_schedule()
+        return model.get_plan()
 
-    def commands_from_oemof(self, oemof_results: Dict[str, pd.DataFrame]) -> Dict[str, list]:
-        """Convert the per-vehicle schedules into position-indexed command lists."""
-        schedule: Dict[str, list] = {}
-        for vid, df in (oemof_results or {}).items():
-            charge = df["charge_kW"].to_numpy()
-            discharge = df["discharge_kW"].to_numpy()
-            schedule[vid] = list(zip(charge.tolist(), discharge.tolist()))
-        return schedule
+    @staticmethod
+    def _frames_to_step_lists(frames: Dict[str, pd.DataFrame], *cols: str
+                              ) -> Dict[str, list]:
+        """{id: DataFrame} -> {id: [(col_1, col_2, ...), ...]}, one tuple per step.
+
+        A column that the frame does not carry becomes NaN, so callers can ask for the
+        optional ``soc_end`` without every producer having to supply it.
+        """
+        out: Dict[str, list] = {}
+        for key, df in (frames or {}).items():
+            series = [df[c].astype(float).tolist() if c in df.columns
+                      else [float("nan")] * len(df) for c in cols]
+            out[key] = list(zip(*series))
+        return out
+
+    def commands_from_oemof(self, plan: Dict[str, Dict[str, pd.DataFrame]]
+                            ) -> Dict[str, Dict[str, list]]:
+        """Convert the plan DataFrames into position-indexed lists per component.
+
+        Result: ``{"vehicles": {vid: [(charge_kW, discharge_kW, soc_end), ...]},
+        "batteries": {bid: [(charge_kW, discharge_kW, soc_end), ...]},
+        "grid": {gcid: [(supply_kW, feedin_kW), ...]}}`` — index = simulation step, so
+        ``step()`` can read the values for the current step directly via
+        ``self._plan[<type>][<id>][self._oemof_step]``. The grid entry is not applied,
+        it exists to verify the executed plan against the optimized one.
+
+        ``soc_end`` is the SOC (0..1) the optimization reaches at the END of that step and
+        is what ``step()`` actually applies; the two powers are kept for reporting and for
+        the plan-vs-actual comparison.
+        """
+        plan = plan or {}
+        return {
+            "vehicles": self._frames_to_step_lists(
+                plan.get("vehicles"), "charge_kW", "discharge_kW", "soc_end"),
+            "batteries": self._frames_to_step_lists(
+                plan.get("batteries"), "charge_kW", "discharge_kW", "soc_end"),
+            "grid": self._frames_to_step_lists(plan.get("grid"), "supply_kW", "feedin_kW"),
+        }
 
     def _ensure_solved(self) -> None:
         """Solve the optimization exactly once and cache the charging plan."""
@@ -770,49 +1091,108 @@ class OemofSolve(Strategy):
         self.prepare_inputs()
         oemof_inputs = self.build_oemof_inputs()
         results = self.run_oemof_model(oemof_inputs)
-        self._schedule = self.commands_from_oemof(results)
+        self._plan = self.commands_from_oemof(results)
+        self._schedule = self._plan["vehicles"]   # alias, kept for existing references
         self._solved = True
         self._oemof_step = 0
 
     def step(self):
-        """Apply the oemof-optimized charging plan for the current time step."""
+        """Apply the optimized plan for the current simulation step.
+
+        The plan is applied via the **SOC**, not via a power: for every vehicle and every
+        stationary battery the optimization knows the state of charge it wants at the END
+        of this step (``soc_end`` in the plan tuple), and ``step()`` simply steers the
+        simulated battery to exactly that value with ``Battery.load(target_soc=...)`` /
+        ``Battery.unload(target_soc=...)``. spice_ev then works out the power itself and
+        returns it as ``avg_power``, which is what gets booked at the grid connector.
+
+        Why the SOC and not the power:
+        - The SOC is the ONE state both models share. Steering it makes plan and simulation
+          agree by construction, and a deviation cannot accumulate: the next step targets
+          the plan's absolute SOC again, so the run self-corrects instead of drifting.
+        - spice_ev applies its own limits inside ``Battery.load`` (loading curve, full
+          battery). Handing it a target SOC lets it do that, whereas a commanded power
+          could silently be cut — which is exactly how the simulated SOC used to fall
+          behind the planned one.
+
+        Design (decided):
+        - PV and household load need NO handling here — the base class books their events
+          directly into ``gc.current_loads`` at the right grid connector.
+        - ``distribute_surplus_power()`` and ``update_batteries()`` are deliberately NOT
+          called: the plan already decides surplus usage and battery behaviour, the
+          heuristics would work against it.
+        - Multi-entity scaling is implicit: every charging station / battery knows its
+          ``parent`` grid connector, so bookings land at the right GC for any number of
+          vehicles, batteries and GCs.
+        """
         # On the first call, solve the full-horizon optimization once
         if not self._solved and self.events is not None:
             self._ensure_solved()
 
+        # Reset the per-step power of every charging station (every strategy does this;
+        # it keeps cs.current_power meaningful for the reports).
+        for cs in self.world_state.charging_stations.values():
+            cs.current_power = 0
+
         idx = self._oemof_step
         commands: Dict[str, Any] = {}
 
-        for vid, vehicle in self.world_state.vehicles.items():
+        # --- 1) vehicles: steer to the SOC the plan wants at the end of this step -----
+        vehicle_plan = self._plan.get("vehicles", {})
+        for vid in sorted(self.world_state.vehicles):
+            vehicle = self.world_state.vehicles[vid]
             cs_id = vehicle.connected_charging_station
             if cs_id is None:
-                continue  # vehicle not connected -> no charging command
+                continue          # away/driving: the base class already booked soc_delta
             cs = self.world_state.charging_stations.get(cs_id)
-            if cs is None:
+            plan = vehicle_plan.get(vid)
+            if cs is None or plan is None or idx >= len(plan):
+                continue          # unknown station / no plan entry / past the horizon
+            target_soc = plan[idx][2]
+            if target_soc is None or target_soc != target_soc:      # NaN -> no plan value
                 continue
             gc = self.world_state.grid_connectors[cs.parent]
+            soc_now = vehicle.battery.soc
 
-            plan = self._schedule.get(vid)
-            if plan is None or idx >= len(plan):
-                continue
-            charge_kw, discharge_kw = plan[idx]
-            net = charge_kw - discharge_kw  # AC at bus_home: + = charge, - = V2H
-
-            if net > self.EPS:
-                # Charge
-                power = clamp_power(net, vehicle, cs)
+            if target_soc > soc_now + self.EPS:
+                # charge up to the planned SOC. max_power is the station rating: the plan
+                # respects it anyway, so this only guarantees the command can never exceed
+                # what the charging station can physically deliver.
                 avg_power = vehicle.battery.load(
-                    self.interval, max_power=power)["avg_power"]
+                    self.interval, target_soc=target_soc, max_power=cs.max_power)["avg_power"]
                 commands[cs_id] = gc.add_load(cs_id, avg_power)
                 cs.current_power += avg_power
-            elif net < -self.EPS and vehicle.vehicle_type.v2g:
-                # V2H discharge
-                discharge_power = -net
-                target_soc = max(vehicle.desired_soc, vehicle.vehicle_type.discharge_limit)
+            elif target_soc < soc_now - self.EPS and vehicle.vehicle_type.v2g:
+                # V2H/V2G: discharge down to the planned SOC. The plan never goes below the
+                # LP's own floor (max of bev_min_soc and discharge_limit), so the target IS
+                # the floor — no separate safety net needed.
                 avg_power = vehicle.battery.unload(
-                    self.interval, max_power=discharge_power, target_soc=target_soc)["avg_power"]
+                    self.interval, target_soc=target_soc, max_power=cs.max_power)["avg_power"]
                 commands[cs_id] = gc.add_load(cs_id, -avg_power)
                 cs.current_power -= avg_power
+
+        # --- 2) stationary batteries: same, steered to the planned SOC ---------------
+        battery_plan = self._plan.get("batteries", {})
+        for bid in sorted(self.world_state.batteries):
+            battery = self.world_state.batteries[bid]
+            plan = battery_plan.get(bid)
+            gc = self.world_state.grid_connectors.get(battery.parent)
+            if plan is None or gc is None or idx >= len(plan):
+                continue          # battery's GC was pruned in the LP / past the horizon
+            target_soc = plan[idx][2]
+            if target_soc is None or target_soc != target_soc:
+                continue
+            soc_now = battery.soc
+
+            if target_soc > soc_now + self.EPS:
+                avg_power = battery.load(self.interval, target_soc=target_soc)["avg_power"]
+                gc.add_load(bid, avg_power)
+            elif target_soc < soc_now - self.EPS:
+                avg_power = battery.unload(self.interval, target_soc=target_soc)["avg_power"]
+                gc.add_load(bid, -avg_power)
+
+        # --- 3) PV + household load: nothing to do (events already booked at the GC) --
+        # --- 4) no distribute_surplus_power / update_batteries (plan replaces them) ---
 
         self._oemof_step += 1
         return {"current_time": self.current_time, "commands": commands}
