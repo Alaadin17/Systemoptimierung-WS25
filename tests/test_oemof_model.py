@@ -939,6 +939,45 @@ def test_pv_direct_bonus_moves_pv_into_the_car():
 
 
 @pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
+def test_forbid_simultaneous_storage_stops_the_circulation():
+    """The binary "charge XOR discharge" removes the circulation a large bonus induces.
+
+    Without it a bonus above (1 - eff^2) * feed-in tariff makes it profitable to route PV
+    *through* the storage into the house: every single flow is legal, together they only
+    burn the round-trip efficiency while collecting the full bonus. That is an
+    either/or statement, which a pure LP cannot express — hence one binary per storage and
+    step. This test pins both halves: the circulation exists, and the switch removes it.
+    """
+    frei = _pv_rich_scenario(_pv_direct_config(pv_charge_bonus_battery_ct_kWh=100.0))
+    fest = _pv_rich_scenario(_pv_direct_config(pv_charge_bonus_battery_ct_kWh=100.0,
+                                               forbid_simultaneous_storage=True))
+    frei.run()
+    fest.run()
+    b_frei = frei.get_plan()["batteries"]["BAT1"]
+    b_fest = fest.get_plan()["batteries"]["BAT1"]
+    assert np.minimum(b_frei["charge_kW"], b_frei["discharge_kW"]).max() > 1e-6
+    assert np.minimum(b_fest["charge_kW"], b_fest["discharge_kW"]).max() < 1e-6
+    # and the reported PV-into-storage now really is stored: no more than the SOC can hold
+    soc = fest._summary_df["home_battery_BAT1_soc_kWh"].to_numpy()
+    gespeichert = np.maximum(np.diff(soc, prepend=soc[0]), 0.0).sum()
+    assert fest._summary_df["pv_direct_battery_BAT1"].sum() * 0.25 <= gespeichert / 0.95 + 1e-6
+
+
+def test_forbid_simultaneous_storage_is_off_and_lp_stays_an_lp():
+    """Default off — and with it off no binary variable is created at all."""
+    assert SystemConfig().forbid_simultaneous_storage is False
+    m = _split_scenario(_pv_direct_config())
+    m._load_data()
+    m._create_time_index()
+    m._create_energy_system()
+    m._create_components()
+    m._optimize()
+    assert not hasattr(m.model, "speicher_modus")
+    # the registry is filled either way, so switching on needs no rebuild of the topology
+    assert {p["label"] for p in m._storage_pairs} == {"home_battery_BAT1", "bev_battery_v1"}
+
+
+@pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
 def test_pv_direct_malus_has_no_effect():
     """Only POSITIVE bonuses act: a malus just leaves the direct branch unused.
 
