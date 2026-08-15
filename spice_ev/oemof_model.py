@@ -110,17 +110,18 @@ class SystemConfig:
     enable_pv: bool = True
     enable_pv_to_home: bool = True  # build the PV->home converter (else PV only feeds in)
     enable_battery: bool = True
-    enable_vehicles: bool = True
     enable_grid_feedin: bool = True  # allow home/BEV surplus to be exported to the grid
+    # (there is deliberately no enable_vehicles: _create_components builds a bus + BEV
+    #  storage for every entry in vehicle_params, so the switch would have been a lie)
 
     # System parameters
     grid_supply_power_kW: float = 30.0
 
-    # Converter
+    # Converter. The battery LINK is lossless on purpose (conversion factors 1.0) — the
+    # charging/discharging loss lives in the storage, exactly like spice_ev's Battery, see
+    # _add_battery. There are therefore no per-direction link efficiencies to configure.
     converter_pv_to_home_power_kW: float = 10.0
     converter_pv_to_home_efficiency: float = 1.0
-    converter_home_to_battery_efficiency: float = 0.96
-    converter_battery_to_home_efficiency: float = 0.96
     converter_pv_to_home_variable_costs: float = 0.0
 
     # Stationary battery storage
