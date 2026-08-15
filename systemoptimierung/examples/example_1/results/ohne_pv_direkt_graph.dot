@@ -1,0 +1,34 @@
+digraph oemof_model {
+  rankdir=LR;
+  node [style=filled, fontname="Segoe UI", fontsize=10];
+  edge [color="#64748b", arrowsize=0.7];
+  "bus_mobility_golf_0" [shape=box, fillcolor="#dbeafe", color="#1e40af"];
+  "bev_battery_golf_0" [shape=cylinder, fillcolor="#fef9c3", color="#a16207"];
+  "Home_1" [shape=box, fillcolor="#dbeafe", color="#1e40af"];
+  "grid_supply_Home_1" [shape=ellipse, fillcolor="#dcfce7", color="#15803d"];
+  "household_demand_Home_1" [shape=ellipse, fillcolor="#fee2e2", color="#b91c1c"];
+  "bus_pv_Home_1" [shape=box, fillcolor="#dbeafe", color="#1e40af"];
+  "pv_Home_1" [shape=ellipse, fillcolor="#dcfce7", color="#15803d"];
+  "excess_Home_1" [shape=ellipse, fillcolor="#fee2e2", color="#b91c1c"];
+  "converter_pv_to_home_Home_1" [shape=box, fillcolor="#ffffff", color="#475569"];
+  "bus_battery_BAT1" [shape=box, fillcolor="#dbeafe", color="#1e40af"];
+  "link_home_battery_BAT1" [shape=box, fillcolor="#eef2ff", color="#4338ca"];
+  "home_battery_BAT1" [shape=cylinder, fillcolor="#fef9c3", color="#a16207"];
+  "wallbox_charge_CS_golf_0_golf_0" [shape=box, fillcolor="#ffffff", color="#475569"];
+  "bus_mobility_golf_0" -> "bev_battery_golf_0";
+  "bev_battery_golf_0" -> "bus_mobility_golf_0";
+  "Home_1" -> "household_demand_Home_1";
+  "Home_1" -> "link_home_battery_BAT1";
+  "Home_1" -> "wallbox_charge_CS_golf_0_golf_0";
+  "grid_supply_Home_1" -> "Home_1";
+  "bus_pv_Home_1" -> "excess_Home_1";
+  "bus_pv_Home_1" -> "converter_pv_to_home_Home_1";
+  "pv_Home_1" -> "bus_pv_Home_1";
+  "converter_pv_to_home_Home_1" -> "Home_1";
+  "bus_battery_BAT1" -> "link_home_battery_BAT1";
+  "bus_battery_BAT1" -> "home_battery_BAT1";
+  "link_home_battery_BAT1" -> "Home_1";
+  "link_home_battery_BAT1" -> "bus_battery_BAT1";
+  "home_battery_BAT1" -> "bus_battery_BAT1";
+  "wallbox_charge_CS_golf_0_golf_0" -> "bus_mobility_golf_0";
+}

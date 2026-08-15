@@ -19,120 +19,125 @@
     "info": "charging strategy for electric vehicles"
   },
   "avg flex per window": {
-    "04-10": 200.0,
-    "10-16": 200.0,
-    "16-22": 200.0,
-    "22-04": 199.10714285714286,
+    "04-10": 25.820265609020954,
+    "10-16": 10.179925175873489,
+    "16-22": 28.41767945897715,
+    "22-04": 31.996584699453553,
     "unit": "kW",
     "info": "Average flexible power range per time window"
   },
   "sum of energy": {
-    "value": 2.749999999999999,
+    "value": -1521.6250668039008,
     "unit": "kWh",
     "info": "Total drawn energy from grid connection point during simulation"
   },
   "sum of energy per window": {
-    "04-10": 0.0,
-    "10-16": 0.0,
-    "16-22": 2.749999999999999,
-    "22-04": 0.0,
+    "04-10": -289.2191079562416,
+    "10-16": -1261.1448350049532,
+    "16-22": 9.040994121793863,
+    "22-04": 19.69788203549999,
     "unit": "kWh",
     "info": "Total drawn energy per time window"
   },
   "avg standing time": {
-    "single": 18.916666666666668,
+    "single": 19.46698113207547,
     "total": {
-      "GC1": 85.125
+      "GC1": 1031.75
     },
     "unit": "h",
     "info": "Average duration of a single standing event and average total time standing time of all vehicles"
   },
   "standing per window": {
-    "04-10": 29.662261380323056,
-    "10-16": 12.187958883994126,
-    "16-22": 25.25697503671072,
-    "22-04": 32.8928046989721,
+    "04-10": 28.25296825781439,
+    "10-16": 6.178822389144657,
+    "16-22": 30.094499636539858,
+    "22-04": 35.47370971650109,
     "unit": "%",
     "info": "Share of standing time per time window"
   },
   "avg needed energy": {
-    "value": 14.511306183873833,
+    "value": 3.4354554403879924,
     "unit": "kWh",
     "info": "Average amount of energy needed to reach the desired SoC (averaged over all vehicles and charge events)"
   },
   "power peaks": {
-    "fixed": 0,
-    "variable": 10.999999999999996,
-    "total": 10.999999999999996,
+    "fixed": 9.257666666666664,
+    "variable": 21.589635891597098,
+    "total": 21.745302558263763,
     "unit": "kW",
     "info": "Maximum drawn power, by fixed loads (building), variable loads (charging stations, stationary batteries) and all loads"
   },
   "avg drawn power": {
-    "value": 0.024390243902439015,
+    "value": -1.039361384428894,
     "unit": "kW",
     "info": "Drawn power, averaged over all time steps"
   },
   "local energy generation": {
-    "value": 0.0,
+    "value": 2783.4667696414813,
     "unit": "kWh",
     "info": "Total energy from renewable energy sources"
   },
   "feed-in energy": {
-    "generation": 0.0,
+    "generation": 1575.21175,
     "v2g": 0.0,
     "battery": 0.0,
     "unit": "kWh",
     "info": "Total energy fed into grid per component type"
   },
+  "max. stored energy in batteries": {
+    "BAT1": 10.0,
+    "unit": "kWh",
+    "info": "Maximum stored energy in each battery by name"
+  },
   "stationary battery cycles": {
-    "value": 0.0,
+    "value": 50.45399989478892,
     "unit": null,
     "info": "Number of load cycles of stationary batteries (averaged)"
   },
   "all vehicle battery cycles": {
-    "value": 0.08730158730158727,
+    "value": 31.919149568546246,
     "unit": null,
     "info": "Number of load cycles per vehicle (averaged)"
   },
   "times below desired soc": {
-    "without margin": 5,
-    "with margin": 4,
-    "margin": 0.2,
-    "info": "Number of times vehicle SoC was below desired SoC on departure (with and without margin of 20.0%)"
+    "without margin": 0,
+    "with margin": 0,
+    "margin": 0.05,
+    "info": "Number of times vehicle SoC was below desired SoC on departure (with and without margin of 5.0%)"
   },
   "costs": {
     "electricity costs": {
       "per year": {
-        "total (gross)": 577.64,
+        "total (gross)": 534.62,
         "grid_fee": {
-          "total grid fee": 459.12,
+          "total grid fee": 904.04,
           "commodity costs": {
-            "total costs": 7.46,
+            "total costs": 11.19,
             "costs for fixed load": "no differentiation between fixed and flexible load",
             "costs for flexible load": "no differentiation between fixed and flexible load"
           },
           "capacity_or_basic_costs": {
-            "total costs": 451.66,
+            "total costs": 892.85,
             "costs for fixed load": "no differentiation between fixed and flexible load",
             "costs for flexible load": "no differentiation between fixed and flexible load"
           },
           "additional costs": 0
         },
-        "power procurement": 16.45,
+        "power procurement": 24.69,
         "levies": {
           "EEG levy": 0.0,
-          "chp levy": 0.81,
-          "individual charge levy": 0.93,
-          "Offshore levy": 0.9,
+          "chp levy": 1.21,
+          "individual charge levy": 1.4,
+          "Offshore levy": 1.34,
           "interruptible loads levy": 0.01
         },
-        "concession fee": 2.82,
+        "concession fee": 4.23,
         "taxes": {
-          "value added tax": 92.23,
-          "tax on electricity": 4.38
+          "value added tax": 179.27,
+          "tax on electricity": 6.57
         },
         "feed-in remuneration": {
-          "PV": 0.0,
+          "PV": 588.15,
           "V2G": 0.0,
           "battery": 0.0
         },
@@ -140,36 +145,36 @@
         "info": "energy costs for one year"
       },
       "for simulation period": {
-        "total (gross)": 537.99,
+        "total (gross)": 974.27,
         "grid fee": {
-          "total grid fee": 451.76,
+          "total grid fee": 894.72,
           "commodity costs": {
-            "total costs": 0.1,
+            "total costs": 1.87,
             "costs for fixed load": "no differentiation between fixed and flexible load",
             "costs for flexible load": "no differentiation between fixed and flexible load"
           },
           "capacity costs": {
-            "total costs": 451.66,
+            "total costs": 892.85,
             "costs for fixed load": "no differentiation between fixed and flexible load",
             "costs for flexible load": "no differentiation between fixed and flexible load"
           },
           "additional costs": 0.0
         },
-        "power procurement": 0.21,
+        "power procurement": 4.13,
         "levies": {
           "EEG levy": 0.0,
-          "chp levy": 0.01,
-          "individual charge levy": 0.01,
-          "Offshore levy": 0.01,
+          "chp levy": 0.2,
+          "individual charge levy": 0.23,
+          "Offshore levy": 0.22,
           "interruptible loads levy": 0.0
         },
-        "concession fee": 0.04,
+        "concession fee": 0.71,
         "taxes": {
-          "value added tax": 85.9,
-          "tax on electricity": 0.06
+          "value added tax": 171.25,
+          "tax on electricity": 1.1
         },
         "feed-in remuneration": {
-          "PV": 0.0,
+          "PV": 98.29,
           "V2G": 0.0,
           "battery": 0.0
         },
