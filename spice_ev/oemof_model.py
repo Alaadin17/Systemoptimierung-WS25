@@ -262,13 +262,13 @@ class SystemConfig:
         Values are expected to already have the right Python type.
         """
         config = cls()                                  # start with all defaults
-        valid_fields = {f.name for f in fields(cls)}    # set of allowed field names
+        typ = {f.name: f.type for f in fields(cls)}     # Feldname -> deklarierter Typ
         for key, value in (options or {}).items():
             name = key.removeprefix("oemof_")           # "oemof_solver" -> "solver"
-            if name in valid_fields:
-                setattr(config, name, value)            # config.<name> = value
-            else:
+            if name not in typ:
                 logging.warning("Unknown oemof parameter ignored: %s", key)
+                continue
+            setattr(config, name, _coerce(name, value, typ[name]))
         return config
 
     @classmethod
@@ -307,6 +307,42 @@ def _as_array(values, n):
     if len(arr) < n:
         arr = np.concatenate([arr, np.zeros(n - len(arr))])
     return arr[:n]
+
+
+_WAHR = {"true", "yes", "on", "1"}
+_FALSCH = {"false", "no", "off", "0"}
+
+
+def _coerce(name, value, typ):
+    """Einen cfg-Wert auf den deklarierten Typ des SystemConfig-Feldes bringen.
+
+    Noetig, weil die cfg per ``json.loads`` gelesen wird und JSON nur ``true``/``false``
+    kennt. Ein ``oemof_enable_v2h = False`` mit grossem F ist fuer JSON kein Boolean, landet
+    also als STRING "False" im Config-Feld - und ein nichtleerer String ist in Python wahr.
+    Der Schalter waere damit stillschweigend AN, obwohl in der cfg "False" steht. Genau
+    dieser Fall ist schon einmal passiert, deshalb wird hier umgewandelt statt zugewiesen.
+    """
+    ziel = str(typ)
+    if "bool" in ziel:
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in _WAHR:
+            return True
+        if text in _FALSCH:
+            return False
+        logging.warning("oemof_%s: '%s' ist kein Wahrheitswert (erwartet true/false)",
+                        name, value)
+        return bool(value)
+    if "float" in ziel or "int" in ziel:
+        try:
+            zahl = float(value)
+        except (TypeError, ValueError):
+            logging.warning("oemof_%s: '%s' ist keine Zahl - Wert wird uebernommen wie er ist",
+                            name, value)
+            return value
+        return int(zahl) if "int" in ziel and "float" not in ziel else zahl
+    return value
 
 
 def _vid_from_bus(label) -> str:

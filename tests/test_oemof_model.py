@@ -246,6 +246,28 @@ def test_feedin_tariff_from_price_sheet_switch():
         [30.0, 5.0, 5.0, 30.0]
 
 
+def test_from_options_coerces_cfg_types():
+    """A cfg value must land on the field's declared type, not as a raw string.
+
+    The cfg is read with json.loads, which only knows lowercase true/false. Written with a
+    capital F, "False" stays a STRING — and a non-empty string is truthy, so the switch
+    would silently be ON while the cfg says False. This actually happened once.
+    """
+    c = SystemConfig.from_options({"oemof_enable_v2h": "False",
+                                   "oemof_grid_price_from_scenario": "FALSE",
+                                   "oemof_pv_direct_to_storage": "yes",
+                                   "oemof_grid_variable_costs": "22.5",
+                                   "oemof_solver_threads": "4",
+                                   "oemof_solver": "cbc"})
+    assert c.enable_v2h is False and c.grid_price_from_scenario is False
+    assert c.pv_direct_to_storage is True
+    assert c.grid_variable_costs == 22.5 and isinstance(c.grid_variable_costs, float)
+    assert c.solver_threads == 4 and isinstance(c.solver_threads, int)
+    assert c.solver == "cbc"          # Strings bleiben unangetastet
+    # echte JSON-Werte gehen unveraendert durch
+    assert SystemConfig.from_options({"oemof_enable_v2h": False}).enable_v2h is False
+
+
 def test_fixed_grid_price_overrides_the_scenario_signals():
     """grid_price_from_scenario = False turns grid_variable_costs into a FIXED price.
 
