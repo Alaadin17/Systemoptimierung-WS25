@@ -16,10 +16,6 @@ systemoptimierung/*
 !systemoptimierung/examples/
 # abgeleitete Notebook-Artefakte (Vorlage + Overrides) — nicht committen
 systemoptimierung/examples/**/*.effective.cfg
-# Drei-Tage-Debug: abgeleitete Szenarien/Profil-Slices/Ergebnisse
-systemoptimierung/examples/**/scenario_debug_*.json
-systemoptimierung/examples/**/input_debug_*.csv
-systemoptimierung/examples/**/results/debug_tag_*/
 # Bonus-Sweep / Variantenlaeufe der Notebooks und das erzeugte Homeoffice-Szenario
 systemoptimierung/examples/**/pv_sweep/
 systemoptimierung/examples/**/varianten/

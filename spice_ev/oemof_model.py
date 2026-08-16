@@ -247,21 +247,6 @@ class SystemConfig:
     solver_threads: int = 8
     solver_ratio_gap: float = 0.01
 
-    # Three-day debug mode. These switches steer the NOTEBOOK (example_1, Schritt 6), not
-    # the model or the strategy: a spice_ev scenario is one continuous horizon, so the
-    # notebook orchestrates three independent single-day generate+simulate runs. PV/load
-    # are sliced BY INDEX from the yearly profile (day d -> rows d*96..(d+1)*96).
-    debug_three_days: bool = False
-    debug_day_starts: list = field(default_factory=lambda: [15, 180, 300])
-    # Tage je Debug-Fenster; ausgewertet wird immer der LETZTE. Mit 2 hat der Speicher
-    # einen Folgetag, fuer den sich Laden lohnt - sonst waere gespeicherte Energie um
-    # Mitternacht wertlos (End-of-Horizon-Effekt) und die Batterie bliebe fast leer.
-    debug_window_days: int = 2
-    # Start-SOC des Fahrzeugs in den Debug-Tagen (die Hausbatterie startet immer leer).
-    # Bewusst unter desired_soc, damit das Fahrzeug bis zur Abfahrt laden MUSS - sonst
-    # zeigt der Debug-Tag keinen einzigen Ladevorgang.
-    debug_initial_soc: float = 0.3
-
     # Result storage
     should_dump_results: bool = True
     output_dir: str = "results"  # directory for the LP dump, result dump and graph
