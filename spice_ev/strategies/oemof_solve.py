@@ -742,6 +742,14 @@ class OemofSolve(Strategy):
         piecewise constant from each signal's ``start_time``. Returns None if the scenario
         has no priced signals for this GC (-> the config value stays as fallback).
         """
+        # Fester Preis statt Szenario-Signalen: eine konstante Reihe zurueckgeben, damit
+        # alles danach (Retail-Aufschlag, MwSt) unveraendert weiterlaeuft. Wuerden wir
+        # stattdessen None liefern, griffe im Modell zwar auch grid_variable_costs - aber
+        # OHNE Aufschlag, und fest und variabel waeren nicht mehr vergleichbar.
+        cfg = getattr(self, "_oemof_cfg", None)
+        if cfg is not None and not getattr(cfg, "grid_price_from_scenario", True):
+            return np.full(len(time_index), float(cfg.grid_variable_costs))
+
         sigs = [s for s in getattr(self.events, "grid_operator_signals", []) or []
                 if getattr(s, "grid_connector_id", None) == gcid
                 and getattr(s, "cost", None)]

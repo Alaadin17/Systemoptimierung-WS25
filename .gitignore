@@ -20,8 +20,9 @@ systemoptimierung/examples/**/*.effective.cfg
 systemoptimierung/examples/**/scenario_debug_*.json
 systemoptimierung/examples/**/input_debug_*.csv
 systemoptimierung/examples/**/results/debug_tag_*/
-# Schritt 8: Bonus-Sweep und das daraus erzeugte Homeoffice-Szenario (abgeleitet)
+# Bonus-Sweep / Variantenlaeufe der Notebooks und das erzeugte Homeoffice-Szenario
 systemoptimierung/examples/**/pv_sweep/
+systemoptimierung/examples/**/varianten/
 systemoptimierung/examples/**/scenario_homeoffice.json
 systemoptimierung/examples/**/generate.homeoffice.cfg
 # Default-Ausgabeordner, falls simulate.py ohne oemof_output_dir laeuft

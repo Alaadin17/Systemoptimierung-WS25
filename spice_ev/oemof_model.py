@@ -205,6 +205,13 @@ class SystemConfig:
 
     # Costs (ct/kWh)
     pv_variable_costs: float = 0.0
+    # Bezugspreis. Normalerweise kommt er ZEITVARIABEL aus den grid_operator_signals des
+    # Szenarios und grid_variable_costs ist nur der Rueckfallwert, falls es keine gibt.
+    # grid_price_from_scenario = False dreht das um: dann gilt grid_variable_costs als
+    # FESTER Preis ueber den ganzen Horizont, die Signale werden ignoriert.
+    # Der Retail-Aufschlag (use_retail_markup) wird danach genauso angewendet wie beim
+    # variablen Preis - der Schalter aendert nur die Quelle, nicht die Preisbildung.
+    grid_price_from_scenario: bool = True
     grid_variable_costs: float = 35.0
     grid_feedin_tariff: float = -8.0  # negative = revenue
     # Wer bestimmt die Einspeiseverguetung: das Preisblatt oder die cfg?

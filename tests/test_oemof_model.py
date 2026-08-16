@@ -246,6 +246,31 @@ def test_feedin_tariff_from_price_sheet_switch():
         [30.0, 5.0, 5.0, 30.0]
 
 
+def test_fixed_grid_price_overrides_the_scenario_signals():
+    """grid_price_from_scenario = False turns grid_variable_costs into a FIXED price.
+
+    It must return a constant series rather than None, so the retail markup still runs and
+    a fixed run stays comparable to a variable one.
+    """
+    idx = pd.date_range("2025-01-01", periods=4, freq="15min")
+    strat = OemofSolve.__new__(OemofSolve)
+    strat.events = SimpleNamespace(grid_operator_signals=[
+        SimpleNamespace(grid_connector_id="GC1", start_time=idx[0],
+                        cost={"type": "fixed", "value": 0.30}),
+        SimpleNamespace(grid_connector_id="GC1", start_time=idx[2],
+                        cost={"type": "fixed", "value": 0.05}),
+    ])
+    # Default: the scenario's signals win and the price varies
+    strat._oemof_cfg = SystemConfig(debug=False)
+    assert list(strat._grid_price_series("GC1", idx)) == [30.0, 30.0, 5.0, 5.0]
+    # Switched off: one constant price from the config, signals ignored
+    strat._oemof_cfg = SystemConfig(debug=False, grid_price_from_scenario=False,
+                                    grid_variable_costs=22.5)
+    assert list(strat._grid_price_series("GC1", idx)) == [22.5] * 4
+    # ... and it is a series, not None — otherwise the retail markup would be skipped
+    assert strat._grid_price_series("GC1", idx) is not None
+
+
 def test_strategy_sources_price_and_feedin_from_spice_ev(tmp_path):
     strat = OemofSolve.__new__(OemofSolve)
     idx = pd.date_range("2025-01-01", periods=4, freq="15min")
