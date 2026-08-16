@@ -8,6 +8,7 @@ that the min-charging-power override works. The remaining three need CBC (they a
 skipped without it) and actually solve: the debug mode, the per-step SOC floor from
 ``desired_soc``, and a full ``run()`` including the result dumps.
 """
+import dataclasses
 import json
 import logging
 import math
@@ -216,7 +217,7 @@ def test_feedin_tariff_from_price_sheet_switch():
 
     Otherwise ``oemof_grid_feedin_tariff`` is silently ignored whenever a price sheet is
     configured — the surprise this switch exists to remove. The grid SUPPLY price is not
-    affected either way (that is what use_retail_markup steers).
+    affected either way (that is what the tariff steers).
     """
     idx = pd.date_range("2025-01-01", periods=4, freq="15min")
     gc = {"GC1": {"max_power": 30.0, "load": [1, 1, 1, 1], "pv": [0, 3, 3, 0],
@@ -244,6 +245,32 @@ def test_feedin_tariff_from_price_sheet_switch():
     # the purchase price is untouched by the switch
     assert tariffs(SystemConfig(debug=False, feedin_tariff_from_price_sheet=False))[2] == \
         [30.0, 5.0, 5.0, 30.0]
+
+
+def test_tariff_selects_the_price_build_up(caplog):
+    """RLM | SLP | fixed — one switch instead of fee_type plus use_retail_markup.
+
+    RLM is the default because simulate.py bills every strategy outside
+    greedy/balanced/distributed as RLM (its line 71), and oemof_solve is one of them. With
+    the previous SLP default the LP priced 7.48 ct/kWh of grid fee and no capacity charge
+    while the bill was written with 3.49 ct/kWh plus 41.06 EUR/(kW*a).
+    """
+    assert SystemConfig().tariff == "RLM"
+    assert SystemConfig().include_capacity_charge is False
+    # die alten Felder gibt es nicht mehr
+    felder = {f.name for f in dataclasses.fields(SystemConfig)}
+    assert "fee_type" not in felder and "use_retail_markup" not in felder
+
+    strat = OemofSolve.__new__(OemofSolve)
+    for wert, erwartet in (("RLM", "RLM"), ("SLP", "SLP"), ("fixed", "fixed"),
+                           ("rlm", "RLM"), ("FIXED", "fixed")):
+        strat._oemof_cfg = SystemConfig(tariff=wert)
+        assert strat.tariff() == erwartet, wert
+    # Unsinn faellt NICHT still auf einen Zweig, sondern warnt und nimmt den Default
+    strat._oemof_cfg = SystemConfig(tariff="Haushalt")
+    with caplog.at_level(logging.WARNING):
+        assert strat.tariff() == "RLM"
+    assert "Haushalt" in caplog.text and "unbekannt" in caplog.text
 
 
 def test_from_options_coerces_cfg_types():
@@ -321,8 +348,8 @@ def test_strategy_sources_price_and_feedin_from_spice_ev(tmp_path):
     assert list(strat._grid_price_series("GC1", idx)) == [30.0, 30.0, 5.0, 0.0]
     assert strat._grid_price_series("GC3", idx) is None          # no signals -> fallback
 
-    # retail markup, mirroring spice_ev's costs.py (same fee_type name and values):
-    # commodity(SLP net) + levies + concession + electricity tax, plus the VAT rate
+    # tariff markup, mirroring spice_ev's costs.py (same SLP/RLM names and values):
+    # commodity + levies + concession + electricity tax, plus the VAT rate
     strat._price_sheet = None   # reload with fee components
     sheet["default_grid_operator"].update({
         "grid_fee": {"SLP": {"commodity_charge_ct/kWh": {"net_price": 7.48}},
@@ -333,15 +360,15 @@ def test_strategy_sources_price_and_feedin_from_spice_ev(tmp_path):
         "taxes": {"value_added_tax": 19, "tax_on_electricity": 2.05},
     })
     sheet_path.write_text(json.dumps(sheet), encoding="utf-8")
-    strat._oemof_cfg = SystemConfig(use_retail_markup=True, fee_type="SLP")
     strat.world_state.grid_connectors["GC1"].voltage_level = "MV"
+    strat._oemof_cfg = SystemConfig(tariff="SLP")
     markup, vat = strat._retail_markup_ct("GC1")
     assert abs(markup - (7.48 + 1.237 + 1.32 + 2.05)) < 1e-9     # = 12.087 ct netto
     assert vat == 19
-    strat._oemof_cfg = SystemConfig(use_retail_markup=True, fee_type="RLM")
+    strat._oemof_cfg = SystemConfig()                            # Default RLM
     markup_rlm, _ = strat._retail_markup_ct("GC1")               # RLM: je Spannungsebene
     assert abs(markup_rlm - (3.49 + 1.237 + 1.32 + 2.05)) < 1e-9
-    strat._oemof_cfg = SystemConfig()                            # default: markup off
+    strat._oemof_cfg = SystemConfig(tariff="fixed")              # fixed: gar kein Aufschlag
     assert strat._retail_markup_ct("GC1") is None
 
     # feed-in from the price sheet, staggered by installed kWp (negative = revenue)

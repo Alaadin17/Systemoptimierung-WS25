@@ -209,8 +209,8 @@ class SystemConfig:
     # Szenarios und grid_variable_costs ist nur der Rueckfallwert, falls es keine gibt.
     # grid_price_from_scenario = False dreht das um: dann gilt grid_variable_costs als
     # FESTER Preis ueber den ganzen Horizont, die Signale werden ignoriert.
-    # Der Retail-Aufschlag (use_retail_markup) wird danach genauso angewendet wie beim
-    # variablen Preis - der Schalter aendert nur die Quelle, nicht die Preisbildung.
+    # Der Tarif-Aufschlag wird danach genauso angewendet wie beim variablen Preis - dieser
+    # Schalter aendert nur die Quelle des Preises, nicht seine Zusammensetzung (siehe tariff).
     grid_price_from_scenario: bool = True
     grid_variable_costs: float = 35.0
     grid_feedin_tariff: float = -8.0  # negative = revenue
@@ -221,20 +221,29 @@ class SystemConfig:
     # oemof_grid_feedin_tariff = 0.0 in der cfg bleibt dabei wirkungslos.
     # False: das Preisblatt wird fuer die Einspeisung ignoriert und grid_feedin_tariff gilt
     # fuer BEIDE Pfade (PV-Excess und Hausbus-Export). So laesst sich "Einspeisung ohne
-    # Verguetung" tatsaechlich rechnen. Der Retail-Aufschlag auf den BEZUGSpreis bleibt
-    # davon unberuehrt — das steuert use_retail_markup.
+    # Verguetung" tatsaechlich rechnen. Der Aufschlag auf den BEZUGSpreis bleibt davon
+    # unberuehrt — den steuert tariff.
     feedin_tariff_from_price_sheet: bool = True
-    # Retail markup on the grid price, mirroring the spice_ev cost calculation: adds the
-    # grid fee (by fee_type), all levies, the concession fee and the electricity tax from
-    # the price sheet to the spot price series, then applies VAT on top (the feed-in
-    # remuneration stays net, exactly like costs.py). Only active when the strategy has a
-    # price sheet AND the scenario provides price signals.
-    use_retail_markup: bool = False
-    # Same name and values as spice_ev's cost calculation (simulate.py/costs.py):
-    # "SLP" = household standard load profile (flat grid fee) or "RLM" = metered
-    # commercial customers (grid fee by the GC's voltage_level; like costs.py's edge
-    # condition, the <2500 h/a utilization bracket is used).
-    fee_type: str = "SLP"
+    # --- Tarif: wie sich der Bezugspreis zusammensetzt ------------------------------
+    #   "RLM"   Gewerbetarif. Arbeitspreis = Netzentgelt nach voltage_level (Staffel
+    #           <2500 h/a) + Umlagen + Konzessionsabgabe + Stromsteuer, darauf MwSt.
+    #           NUR hier gibt es einen Leistungspreis, siehe include_capacity_charge.
+    #   "SLP"   Haushaltstarif. Wie RLM, aber mit dem festen SLP-Netzentgelt. Der
+    #           "Leistungspreis" ist dort ein fester Jahresgrundpreis, haengt also nicht
+    #           von der Spitze ab und gehoert nicht in die Zielfunktion.
+    #   "fixed" Kein Preisblatt: grid_variable_costs ist der KOMPLETTE Preis in ct/kWh,
+    #           ohne jeden Aufschlag. Fuer "ich gebe meinen Strompreis selbst vor".
+    #
+    # Default RLM, weil simulate.py fuer jede Strategie ausser greedy/balanced/distributed
+    # ohnehin RLM abrechnet (dort Zeile 71) - oemof_solve gehoert dazu. Mit dem frueheren
+    # Default SLP rechnete das LP mit 7.48 ct/kWh Netzentgelt und ohne Leistungspreis,
+    # waehrend die Rechnung mit 3.49 ct/kWh + 41.06 EUR/(kW*a) geschrieben wurde.
+    # Ersetzt die frueheren Felder fee_type und use_retail_markup.
+    tariff: str = "RLM"
+    # Leistungspreis in die Zielfunktion holen - wirkt NUR bei tariff = "RLM", weil nur dort
+    # ein spitzenabhaengiger Preis existiert (bei SLP ist es ein fester Jahresgrundpreis).
+    # Default AUS, weil der Term den Fahrplan aendert: das LP glaettet dann die Spitze.
+    include_capacity_charge: bool = False
     # Path to spice_ev's price sheet (same file the cost calculation uses). Source of the
     # PV feed-in remuneration and the retail markup components. Passed as an oemof_* key so
     # that spice_ev's own scripts stay untouched; relative to the working directory.

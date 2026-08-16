@@ -22,6 +22,7 @@ Flow:
 
 
 import json
+import logging
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -776,21 +777,37 @@ class OemofSolve(Strategy):
         idx = np.clip(idx, 0, len(values) - 1)   # before the first signal: first value
         return values[idx]
 
+    def tariff(self) -> str:
+        """Der gewaehlte Tarif, normalisiert auf "RLM" / "SLP" / "fixed".
+
+        Ein unbekannter Wert faellt NICHT still auf einen Zweig zurueck, sondern warnt und
+        nimmt den Default - sonst rechnet man unbemerkt mit einem anderen Tarif, als in der
+        cfg steht.
+        """
+        wert = str(getattr(getattr(self, "_oemof_cfg", None), "tariff", "RLM")).strip()
+        for gueltig in ("RLM", "SLP", "fixed"):
+            if wert.lower() == gueltig.lower():
+                return gueltig
+        logging.warning("oemof_tariff = '%s' ist unbekannt (RLM | SLP | fixed) - "
+                        "es wird RLM gerechnet", wert)
+        return "RLM"
+
     def _retail_markup_ct(self, gcid) -> Optional[Tuple[float, float]]:
         """Fixed per-kWh retail components + VAT rate from the price sheet.
 
         Mirrors spice_ev's cost calculation (costs.py) so both worlds price identically:
-        grid fee commodity charge by ``fee_type`` (SLP flat net price; RLM by the GC's
+        grid fee commodity charge by tariff (SLP flat net price; RLM by the GC's
         voltage_level in the <2500 h/a bracket — the same edge-condition constant costs.py
         uses), plus all levies, the concession fee and the electricity tax. All values are
         NET; VAT is applied by the caller on (spot + markup), exactly like costs.py applies
         it to the total while leaving the feed-in remuneration untaxed.
 
-        Returns (markup_net_ct_per_kWh, vat_percent), or None when the markup is disabled,
-        no price sheet is configured or the sheet lacks the entries (-> spot price only).
+        Returns (markup_net_ct_per_kWh, vat_percent), or None when the tariff is "fixed"
+        (then grid_variable_costs IS the price), no price sheet is configured or the sheet
+        lacks the entries (-> spot price only).
         """
         cfg = getattr(self, "_oemof_cfg", None)
-        if cfg is None or not getattr(cfg, "use_retail_markup", False):
+        if cfg is None or self.tariff() == "fixed":
             return None
         if not self.cost_parameters_file:
             return None
@@ -801,7 +818,7 @@ class OemofSolve(Strategy):
         operator = getattr(gc, "grid_operator", "default_grid_operator") or "default_grid_operator"
         try:
             sheet = self._price_sheet[operator]
-            if str(cfg.fee_type).upper() == "SLP":
+            if self.tariff() == "SLP":
                 commodity = float(sheet["grid_fee"]["SLP"]["commodity_charge_ct/kWh"]["net_price"])
             else:   # RLM: by voltage level, <2500 h/a utilization bracket
                 voltage = getattr(gc, "voltage_level", None) or "MV"
