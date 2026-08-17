@@ -127,7 +127,6 @@ def test_per_gc_load_pv_from_events():
     start = idx[0]
 
     strat = OemofSolve.__new__(OemofSolve)   # bypass __init__, we only need two attrs
-    strat.cost_parameters_file = None        # no price sheet in this test
     strat.events = SimpleNamespace(
         fixed_load_lists={"L1": _ev([1, 1, 1, 1], start, "GC1"),
                           "L2": _ev([2, 2, 2, 2], start, "GC2")},
@@ -188,89 +187,70 @@ def test_solve_small_model(tmp_path, monkeypatch, caplog):
 
 
 # ---------------------------------------------------------------------------
-# Test 2a2 — per-GC price series, feed-in tariff and PV power reach the model
+# Test 2a2 — feste Preise: die cfg ist die einzige Quelle
 # ---------------------------------------------------------------------------
-def test_per_gc_price_tariff_and_pv_power_from_scenario():
+def test_prices_are_fixed_and_come_only_from_the_config():
+    """Ein Bezugspreis, eine Einspeiseverguetung, beide konstant.
+
+    Frueher konnte ein Preis aus drei Quellen kommen - den grid_operator_signals des
+    Szenarios, dem Preisblatt (Netzentgelt, Umlagen, Konzession, Stromsteuer, MwSt) und der
+    cfg -, die sich gegenseitig ueberschrieben haben. Genau daraus sind zwei stille Fehler
+    entstanden: das LP kalkulierte einen anderen Tarif als abgerechnet wurde, und
+    ``oemof_grid_feedin_tariff = 0`` blieb wirkungslos, solange ein Preisblatt konfiguriert
+    war. Jetzt gibt es nur noch die cfg.
+    """
     idx = pd.date_range("2025-01-01", periods=4, freq="15min")
     m = EnergySystemModel(
-        config=SystemConfig(debug=False),
+        config=SystemConfig(debug=False, grid_variable_costs=35.0, grid_feedin_tariff=0.0),
         time_index=idx,
-        grid_connectors={"GC1": {"max_power": 30.0, "load": [1, 1, 1, 1],
-                                 "pv": [0, 3, 3, 0],
+        # Preis-Keys, wie die Strategie sie frueher mitgeliefert hat: sie muessen wirkungslos
+        # sein, sonst haette sich die alte Quelle nur versteckt
+        grid_connectors={"GC1": {"max_power": 30.0, "load": [1, 1, 1, 1], "pv": [0, 3, 3, 0],
                                  "price_ct_kWh": np.array([30.0, 5.0, 5.0, 30.0]),
                                  "feedin_tariff_ct_kWh": -6.24,
-                                 "homebus_feedin_tariff_ct_kWh": 0.0,
+                                 "homebus_feedin_tariff_ct_kWh": -1.5,
                                  "pv_power_kW": 7.5}},
     )
     _build_es(m)
     nodes = _nodes(m)
     supply = _out_flow(nodes["grid_supply_Home_1"])
-    assert [float(supply.variable_costs[t]) for t in range(4)] == [30.0, 5.0, 5.0, 30.0]
-    # the two export paths have DIFFERENT tariffs: PV earns, home-bus export does not
+    assert [float(supply.variable_costs[t]) for t in range(4)] == [35.0] * 4
+    # beide Exportwege bekommen denselben cfg-Wert
     assert float(list(nodes["grid_feedin_Home_1"].inputs.values())[0].variable_costs[0]) == 0.0
-    assert float(list(nodes["excess_Home_1"].inputs.values())[0].variable_costs[0]) == -6.24
+    assert float(list(nodes["excess_Home_1"].inputs.values())[0].variable_costs[0]) == 0.0
+    # die Anlagengroesse ist KEIN Preis und kommt weiterhin aus dem Szenario
     assert list(nodes["converter_pv_to_home_Home_1"].inputs.values())[0].nominal_value == 7.5
+    # ... und die Preis-Felder existieren nicht mehr
+    felder = {f.name for f in dataclasses.fields(SystemConfig)}
+    assert not felder & {"tariff", "fee_type", "use_retail_markup", "cost_parameters_file",
+                         "grid_price_from_scenario", "feedin_tariff_from_price_sheet"}
 
 
-def test_feedin_tariff_from_price_sheet_switch():
-    """feedin_tariff_from_price_sheet = False lets the cfg value win over the price sheet.
+def test_strategy_hands_the_model_physics_only():
+    """Die Strategie reicht Last, PV, Anschlussleistung und kWp durch - keine Preise.
 
-    Otherwise ``oemof_grid_feedin_tariff`` is silently ignored whenever a price sheet is
-    configured — the surprise this switch exists to remove. The grid SUPPLY price is not
-    affected either way (that is what the tariff steers).
+    Das Szenario hier HAT Preissignale. Wuerden sie noch ausgewertet, taeuschte der feste
+    Preis in der cfg nur Ruhe vor.
     """
     idx = pd.date_range("2025-01-01", periods=4, freq="15min")
-    gc = {"GC1": {"max_power": 30.0, "load": [1, 1, 1, 1], "pv": [0, 3, 3, 0],
-                  "price_ct_kWh": np.array([30.0, 5.0, 5.0, 30.0]),
-                  "feedin_tariff_ct_kWh": -6.24,          # from the price sheet
-                  "homebus_feedin_tariff_ct_kWh": -1.5}}
-
-    def tariffs(cfg):
-        m = EnergySystemModel(config=cfg, time_index=idx,
-                              grid_connectors={k: dict(v) for k, v in gc.items()})
-        _build_es(m)
-        n = _nodes(m)
-        return (float(list(n["excess_Home_1"].inputs.values())[0].variable_costs[0]),
-                float(list(n["grid_feedin_Home_1"].inputs.values())[0].variable_costs[0]),
-                [float(_out_flow(n["grid_supply_Home_1"]).variable_costs[t]) for t in range(4)])
-
-    # default: the sheet wins on BOTH paths, each with its own value
-    assert tariffs(SystemConfig(debug=False, grid_feedin_tariff=0.0))[:2] == (-6.24, -1.5)
-    # switched off: the cfg value wins on both paths
-    assert tariffs(SystemConfig(debug=False, grid_feedin_tariff=0.0,
-                                feedin_tariff_from_price_sheet=False))[:2] == (0.0, 0.0)
-    # ... and it really is the cfg value, not a hard-coded zero
-    assert tariffs(SystemConfig(debug=False, grid_feedin_tariff=-8.0,
-                                feedin_tariff_from_price_sheet=False))[:2] == (-8.0, -8.0)
-    # the purchase price is untouched by the switch
-    assert tariffs(SystemConfig(debug=False, feedin_tariff_from_price_sheet=False))[2] == \
-        [30.0, 5.0, 5.0, 30.0]
-
-
-def test_tariff_selects_the_price_build_up(caplog):
-    """RLM | SLP | fixed — one switch instead of fee_type plus use_retail_markup.
-
-    RLM is the default because simulate.py bills every strategy outside
-    greedy/balanced/distributed as RLM (its line 71), and oemof_solve is one of them. With
-    the previous SLP default the LP priced 7.48 ct/kWh of grid fee while the bill was
-    written with 3.49 ct/kWh. Only the COMMODITY charge is meant here — the capacity charge
-    stays what it always was: something spice_ev accounts for afterwards, outside the LP.
-    """
-    assert SystemConfig().tariff == "RLM"
-    # die alten Felder gibt es nicht mehr
-    felder = {f.name for f in dataclasses.fields(SystemConfig)}
-    assert "fee_type" not in felder and "use_retail_markup" not in felder
-
     strat = OemofSolve.__new__(OemofSolve)
-    for wert, erwartet in (("RLM", "RLM"), ("SLP", "SLP"), ("fixed", "fixed"),
-                           ("rlm", "RLM"), ("FIXED", "fixed")):
-        strat._oemof_cfg = SystemConfig(tariff=wert)
-        assert strat.tariff() == erwartet, wert
-    # Unsinn faellt NICHT still auf einen Zweig, sondern warnt und nimmt den Default
-    strat._oemof_cfg = SystemConfig(tariff="Haushalt")
-    with caplog.at_level(logging.WARNING):
-        assert strat.tariff() == "RLM"
-    assert "Haushalt" in caplog.text and "unbekannt" in caplog.text
+    strat.events = SimpleNamespace(
+        fixed_load_lists={"L1": _ev([1, 1, 1, 1], idx[0], "GC1")},
+        local_generation_lists={"PV1": _ev([0, 3, 3, 0], idx[0], "GC1")},
+        grid_operator_signals=[SimpleNamespace(grid_connector_id="GC1", start_time=idx[0],
+                                               cost={"type": "fixed", "value": 0.30})],
+    )
+    strat.world_state = SimpleNamespace(
+        grid_connectors={"GC1": SimpleNamespace(max_power=30.0)},
+        photovoltaics={"PV1": SimpleNamespace(parent="GC1", nominal_power=10.0)},
+    )
+    info = strat._grid_connectors(idx)["GC1"]
+    assert set(info) == {"load", "pv", "max_power", "pv_power_kW"}
+    assert info["pv_power_kW"] == 10.0
+    # die Preis-Methoden gibt es nicht mehr - kein toter Pfad, ueber den etwas zurueckkommt
+    for name in ("_grid_price_series", "_retail_markup_ct", "_feedin_tariff_ct",
+                 "_homebus_feedin_tariff_ct", "tariff"):
+        assert not hasattr(OemofSolve, name), name
 
 
 def test_from_options_coerces_cfg_types():
@@ -281,102 +261,18 @@ def test_from_options_coerces_cfg_types():
     would silently be ON while the cfg says False. This actually happened once.
     """
     c = SystemConfig.from_options({"oemof_enable_v2h": "False",
-                                   "oemof_grid_price_from_scenario": "FALSE",
+                                   "oemof_enable_grid_feedin": "FALSE",
                                    "oemof_pv_direct_to_storage": "yes",
                                    "oemof_grid_variable_costs": "22.5",
                                    "oemof_solver_threads": "4",
                                    "oemof_solver": "cbc"})
-    assert c.enable_v2h is False and c.grid_price_from_scenario is False
+    assert c.enable_v2h is False and c.enable_grid_feedin is False
     assert c.pv_direct_to_storage is True
     assert c.grid_variable_costs == 22.5 and isinstance(c.grid_variable_costs, float)
     assert c.solver_threads == 4 and isinstance(c.solver_threads, int)
     assert c.solver == "cbc"          # Strings bleiben unangetastet
     # echte JSON-Werte gehen unveraendert durch
     assert SystemConfig.from_options({"oemof_enable_v2h": False}).enable_v2h is False
-
-
-def test_fixed_grid_price_overrides_the_scenario_signals():
-    """grid_price_from_scenario = False turns grid_variable_costs into a FIXED price.
-
-    It must return a constant series rather than None, so the retail markup still runs and
-    a fixed run stays comparable to a variable one.
-    """
-    idx = pd.date_range("2025-01-01", periods=4, freq="15min")
-    strat = OemofSolve.__new__(OemofSolve)
-    strat.events = SimpleNamespace(grid_operator_signals=[
-        SimpleNamespace(grid_connector_id="GC1", start_time=idx[0],
-                        cost={"type": "fixed", "value": 0.30}),
-        SimpleNamespace(grid_connector_id="GC1", start_time=idx[2],
-                        cost={"type": "fixed", "value": 0.05}),
-    ])
-    # Default: the scenario's signals win and the price varies
-    strat._oemof_cfg = SystemConfig(debug=False)
-    assert list(strat._grid_price_series("GC1", idx)) == [30.0, 30.0, 5.0, 5.0]
-    # Switched off: one constant price from the config, signals ignored
-    strat._oemof_cfg = SystemConfig(debug=False, grid_price_from_scenario=False,
-                                    grid_variable_costs=22.5)
-    assert list(strat._grid_price_series("GC1", idx)) == [22.5] * 4
-    # ... and it is a series, not None — otherwise the retail markup would be skipped
-    assert strat._grid_price_series("GC1", idx) is not None
-
-
-def test_strategy_sources_price_and_feedin_from_spice_ev(tmp_path):
-    strat = OemofSolve.__new__(OemofSolve)
-    idx = pd.date_range("2025-01-01", periods=4, freq="15min")
-    strat.events = SimpleNamespace(grid_operator_signals=[
-        SimpleNamespace(grid_connector_id="GC1", start_time=idx[0],
-                        cost={"type": "fixed", "value": 0.30}),      # EUR/kWh!
-        SimpleNamespace(grid_connector_id="GC1", start_time=idx[2],
-                        cost={"type": "fixed", "value": 0.05}),
-        SimpleNamespace(grid_connector_id="GC1", start_time=idx[3],
-                        cost={"type": "fixed", "value": -0.04}),     # negativ -> gekappt
-        SimpleNamespace(grid_connector_id="GC2", start_time=idx[0],
-                        cost={"type": "fixed", "value": 0.99}),
-    ])
-    sheet = {"default_grid_operator": {"feed-in_remuneration": {
-        "PV": {"kWp": [10, 40, 100], "remuneration": [6.24, 6.06, 4.74]}}}}
-    sheet_path = tmp_path / "price_sheet.json"
-    sheet_path.write_text(json.dumps(sheet), encoding="utf-8")
-    strat.cost_parameters_file = str(sheet_path)
-    strat._price_sheet = None
-    strat.world_state = SimpleNamespace(
-        grid_connectors={"GC1": SimpleNamespace(grid_operator="default_grid_operator")},
-        photovoltaics={"PV1": SimpleNamespace(parent="GC1", nominal_power=10.0)},
-    )
-
-    # signals -> ct/kWh, piecewise constant, only the matching GC; negatives clipped to 0
-    assert list(strat._grid_price_series("GC1", idx)) == [30.0, 30.0, 5.0, 0.0]
-    assert strat._grid_price_series("GC3", idx) is None          # no signals -> fallback
-
-    # tariff markup, mirroring spice_ev's costs.py (same SLP/RLM names and values):
-    # commodity + levies + concession + electricity tax, plus the VAT rate
-    strat._price_sheet = None   # reload with fee components
-    sheet["default_grid_operator"].update({
-        "grid_fee": {"SLP": {"commodity_charge_ct/kWh": {"net_price": 7.48}},
-                     "RLM": {"<2500_h/a": {"commodity_charge_ct/kWh": {"MV": 3.49}}}},
-        "levies": {"EEG_levy": 0, "chp_levy": 0.378, "individual_charge_levy": 0.437,
-                   "offshore_levy": 0.419, "interruptible_loads_levy": 0.003},
-        "concession_fee": {"charge": 1.32},
-        "taxes": {"value_added_tax": 19, "tax_on_electricity": 2.05},
-    })
-    sheet_path.write_text(json.dumps(sheet), encoding="utf-8")
-    strat.world_state.grid_connectors["GC1"].voltage_level = "MV"
-    strat._oemof_cfg = SystemConfig(tariff="SLP")
-    markup, vat = strat._retail_markup_ct("GC1")
-    assert abs(markup - (7.48 + 1.237 + 1.32 + 2.05)) < 1e-9     # = 12.087 ct netto
-    assert vat == 19
-    strat._oemof_cfg = SystemConfig()                            # Default RLM
-    markup_rlm, _ = strat._retail_markup_ct("GC1")               # RLM: je Spannungsebene
-    assert abs(markup_rlm - (3.49 + 1.237 + 1.32 + 2.05)) < 1e-9
-    strat._oemof_cfg = SystemConfig(tariff="fixed")              # fixed: gar kein Aufschlag
-    assert strat._retail_markup_ct("GC1") is None
-
-    # feed-in from the price sheet, staggered by installed kWp (negative = revenue)
-    assert strat._feedin_tariff_ct("GC1") == -6.24               # 10 kWp -> first step
-    strat.world_state.photovoltaics["PV1"].nominal_power = 50.0
-    assert strat._feedin_tariff_ct("GC1") == -4.74               # 50 kWp -> <=100 step
-    strat.world_state.photovoltaics["PV1"].parent = "GC_other"
-    assert strat._feedin_tariff_ct("GC1") is None                # no PV here -> fallback
 
 
 # ---------------------------------------------------------------------------
@@ -729,13 +625,14 @@ def test_full_run_extracts_schedule(tmp_path, monkeypatch):
 def _split_scenario(config):
     """A small PV + battery + car scenario, built with the given config.
 
-    Two things make the optimum UNIQUE, which any flow-level comparison needs:
-    - ``homebus_feedin_tariff_ct_kWh = 0`` mirrors the real price sheet. On the config
-      fallback (-8.0) exporting from the home bus PAYS, so with a cheap price window the LP
-      finds a money pump — charge cheap, export at a profit — with countless optima.
-    - the household load is big enough that the 10 kWh battery cannot carry it alone. With a
-      small load the LP simply drains the battery, buys NOTHING, and the marginal cost is
-      zero in every step — then the price series has no effect at all and every schedule ties.
+    The household load is deliberately big enough that the 10 kWh battery cannot carry it
+    alone — with a small load the LP simply drains the battery, buys nothing, and every
+    schedule ties at zero cost.
+
+    Since the price is a CONSTANT (35 ct/kWh in every step), the schedule itself is largely
+    degenerate: buying now or in three steps costs exactly the same, so CBC is free to pick
+    any vertex. Flow-level comparisons therefore only hold where the physics decides — net
+    power, SOC, totals — which is what the tests below assert.
     """
     idx = pd.date_range("2025-01-01", periods=8, freq="15min")
     return EnergySystemModel(
@@ -743,11 +640,6 @@ def _split_scenario(config):
         time_index=idx,
         grid_connectors={"GC1": {"max_power": 30.0, "load": [6] * 8,
                                  "pv": [0, 0, 2, 4, 4, 2, 0, 0],
-                                 # deliberately ALL DISTINCT: equal prices make charging in
-                                 # either step a tie, and CBC then picks an arbitrary vertex
-                                 "price_ct_kWh": np.array([41, 39, 5, 6, 42, 43, 44, 45.0]),
-                                 "feedin_tariff_ct_kWh": -6.24,
-                                 "homebus_feedin_tariff_ct_kWh": 0.0,
                                  "pv_power_kW": 10.0}},
         charging_stations={"CS1": {"max_power": 11.0, "parent": "GC1"}},
         battery_params={"BAT1": {"capacity_kWh": 10.0, "power_kW": 5.0, "parent": "GC1"}},
@@ -796,14 +688,19 @@ def test_storage_bus_split_builds_the_expected_nodes(v2h):
 @pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
 @pytest.mark.parametrize("v2h", [False, True])
 def test_storage_bus_split_is_cost_neutral(v2h):
-    """The split costs nothing and delivers the same physical schedule.
+    """The split costs nothing and moves the same amount of energy.
 
-    Asserted on the NET power and the SOC, not on charge/discharge separately, and that is
-    deliberate: the split also removes the degenerate cycles that the shared bus allows
-    (``Home -> link -> bus_battery -> link -> Home``, and charge+discharge in the same step
-    with V2H). Those cycles are lossless or nearly so, so they cost ~nothing and the solver
-    may or may not include them — but they inflate charge AND discharge by the same amount
-    and cancel in the net. Removing them is the point of the split, not a side effect.
+    Compared on TOTALS and the final SOC, not step by step. With a constant grid price the
+    LP has no reason to prefer one step over another, so the per-step split of a given
+    amount of energy is an arbitrary choice among equally optimal vertices — asserting on it
+    would test CBC's pivoting, not the model. What the physics does pin down is how much
+    energy has to flow in total and where the storages end up, and that must not change.
+
+    Net power, never charge and discharge separately: the split also removes the degenerate
+    cycles the shared bus allows (``Home -> link -> bus_battery -> link -> Home``, and
+    charge+discharge in the same step with V2H). Those are lossless, so the solver may or
+    may not include them — they inflate both directions equally and cancel in the net.
+    Removing them is the point of the split, not a side effect.
     """
     off = _split_scenario(SystemConfig(debug=False, enable_v2h=v2h, should_dump_results=False))
     on = _split_scenario(SystemConfig(debug=False, enable_v2h=v2h, should_dump_results=False,
@@ -811,19 +708,19 @@ def test_storage_bus_split_is_cost_neutral(v2h):
     off.run()
     on.run()
 
-    assert off._costs["objective"] == pytest.approx(on._costs["objective"], abs=1e-6)
-    # what physically happens must be identical: net power and the SOC trajectory
-    for col in ("net_kW", "soc_kWh", "soc_end"):
-        assert np.allclose(off.get_wallbox_schedule()["v1"][col],
-                           on.get_wallbox_schedule()["v1"][col], atol=1e-6), col
+    # 1e-3 ct statt 1e-6: gleich teure Optima, verschiedene Eckpunkte, minimal andere
+    # Rundung. Die Aussage ist "der Split kostet nichts", nicht "bitweise dasselbe".
+    assert off._costs["objective"] == pytest.approx(on._costs["objective"], abs=1e-3)
+    s_off, s_on = (x.get_wallbox_schedule()["v1"] for x in (off, on))
+    assert s_off["net_kW"].sum() == pytest.approx(s_on["net_kW"].sum(), abs=1e-6)
+    assert s_off["soc_end"].iloc[-1] == pytest.approx(s_on["soc_end"].iloc[-1], abs=1e-6)
     bat_off, bat_on = (x.get_plan()["batteries"]["BAT1"] for x in (off, on))
-    assert np.allclose(bat_off["charge_kW"] - bat_off["discharge_kW"],
-                       bat_on["charge_kW"] - bat_on["discharge_kW"], atol=1e-6)
-    assert np.allclose(bat_off["soc_end"], bat_on["soc_end"], atol=1e-6)
-    assert np.allclose(off._summary_df["grid_supply_Home_1"],
-                       on._summary_df["grid_supply_Home_1"], atol=1e-6)
-    assert np.allclose(off._summary_df["pv_feedin_Home_1"],
-                       on._summary_df["pv_feedin_Home_1"], atol=1e-6)
+    assert (bat_off["charge_kW"] - bat_off["discharge_kW"]).sum() == pytest.approx(
+        (bat_on["charge_kW"] - bat_on["discharge_kW"]).sum(), abs=1e-6)
+    assert bat_off["soc_end"].iloc[-1] == pytest.approx(bat_on["soc_end"].iloc[-1], abs=1e-6)
+    for spalte in ("grid_supply_Home_1", "pv_feedin_Home_1"):
+        assert off._summary_df[spalte].sum() == pytest.approx(
+            on._summary_df[spalte].sum(), abs=1e-6), spalte
 
     # and the split really does forbid the pointless cycling: never both directions at once
     assert (np.minimum(bat_on["charge_kW"], bat_on["discharge_kW"]) < 1e-6).all()

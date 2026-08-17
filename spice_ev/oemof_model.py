@@ -203,48 +203,21 @@ class SystemConfig:
     # darunter tritt das Kreisen ohnehin nicht auf.
     forbid_simultaneous_storage: bool = False
 
-    # Costs (ct/kWh)
+    # --- Preise (ct/kWh) -------------------------------------------------------------
+    # Beide FEST ueber den ganzen Horizont. Das LP kennt keine Preiszeitreihe: weder die
+    # grid_operator_signals des Szenarios noch das Preisblatt werden gelesen, und es gibt
+    # keinen Tarif-Aufschlag (Netzentgelt, Umlagen, Konzessionsabgabe, Stromsteuer, MwSt).
+    # grid_variable_costs ist der KOMPLETTE Bezugspreis, so wie er auf der Stromrechnung
+    # steht, grid_feedin_tariff die komplette Einspeiseverguetung.
+    #
+    # WICHTIG - die spice_ev-Kostenrechnung geht ihren eigenen Weg: simulate.py wertet nach
+    # der Simulation costs.py aus, und das liest Preisblatt und Szenariosignale weiterhin.
+    # Die EUR/a in results.json entstehen also aus anderen Preisen als der Fahrplan. Sie
+    # beantworten "was haette das gekostet", der Fahrplan beantwortet "was ist bei 35 ct
+    # sinnvoll". Beide Zahlen sind fuer sich richtig, nur nicht dieselbe Rechnung.
     pv_variable_costs: float = 0.0
-    # Bezugspreis. Normalerweise kommt er ZEITVARIABEL aus den grid_operator_signals des
-    # Szenarios und grid_variable_costs ist nur der Rueckfallwert, falls es keine gibt.
-    # grid_price_from_scenario = False dreht das um: dann gilt grid_variable_costs als
-    # FESTER Preis ueber den ganzen Horizont, die Signale werden ignoriert.
-    # Der Tarif-Aufschlag wird danach genauso angewendet wie beim variablen Preis - dieser
-    # Schalter aendert nur die Quelle des Preises, nicht seine Zusammensetzung (siehe tariff).
-    grid_price_from_scenario: bool = True
     grid_variable_costs: float = 35.0
-    grid_feedin_tariff: float = -8.0  # negative = revenue
-    # Wer bestimmt die Einspeiseverguetung: das Preisblatt oder die cfg?
-    # True (Default, bisheriges Verhalten): liegt ein Preisblatt vor, gewinnt dessen
-    # feed-in_remuneration.PV — bei 10 kWp sind das -6.24 ct/kWh, und grid_feedin_tariff
-    # oben ist dann nur noch der Rueckfallwert fuer GCs ohne Blattwert. Das ueberrascht:
-    # oemof_grid_feedin_tariff = 0.0 in der cfg bleibt dabei wirkungslos.
-    # False: das Preisblatt wird fuer die Einspeisung ignoriert und grid_feedin_tariff gilt
-    # fuer BEIDE Pfade (PV-Excess und Hausbus-Export). So laesst sich "Einspeisung ohne
-    # Verguetung" tatsaechlich rechnen. Der Aufschlag auf den BEZUGSpreis bleibt davon
-    # unberuehrt — den steuert tariff.
-    feedin_tariff_from_price_sheet: bool = True
-    # --- Tarif: wie sich der Bezugspreis zusammensetzt ------------------------------
-    #   "RLM"   Gewerbetarif. Arbeitspreis = Netzentgelt nach voltage_level (Staffel
-    #           <2500 h/a) + Umlagen + Konzessionsabgabe + Stromsteuer, darauf MwSt.
-    #   "SLP"   Haushaltstarif. Wie RLM, aber mit dem festen SLP-Netzentgelt.
-    #   "fixed" Kein Preisblatt: grid_variable_costs ist der KOMPLETTE Preis in ct/kWh,
-    #           ohne jeden Aufschlag. Fuer "ich gebe meinen Strompreis selbst vor".
-    #
-    # Default RLM, weil simulate.py fuer jede Strategie ausser greedy/balanced/distributed
-    # ohnehin RLM abrechnet (dort Zeile 71) - oemof_solve gehoert dazu. Mit dem frueheren
-    # Default SLP rechnete das LP mit 7.48 ct/kWh Netzentgelt, waehrend die Rechnung mit
-    # 3.49 ct/kWh geschrieben wurde. Ersetzt die Felder fee_type und use_retail_markup.
-    #
-    # Es geht hier NUR um den Arbeitspreis. Den Leistungspreis (bei RLM 41.06 EUR/(kW*a) auf
-    # die hoechste Viertelstunde) rechnet spice_ev nachgelagert aus der fertigen Zeitreihe
-    # aus - costs.py, calculate_capacity_costs_rlm. Das ist reine Buchhaltung und beeinflusst
-    # keine Ladeentscheidung; das LP kennt den Posten bewusst nicht.
-    tariff: str = "RLM"
-    # Path to spice_ev's price sheet (same file the cost calculation uses). Source of the
-    # PV feed-in remuneration and the retail markup components. Passed as an oemof_* key so
-    # that spice_ev's own scripts stay untouched; relative to the working directory.
-    cost_parameters_file: str = ""
+    grid_feedin_tariff: float = 0.0   # negativ = Erloes; 0 = Einspeisung bringt nichts
 
     # Solver
     solver: str = "cbc"
@@ -522,31 +495,19 @@ class EnergySystemModel:
         wallboxes of the charging stations that belong to this GC (only used ones)."""
         periods = self.config.periods
 
-        # grid supply source — price per GC: time-varying from the scenario's grid
-        # operator signals when available, else the constant config fallback
-        price = gc.get("price_ct_kWh")
-        supply_costs = (_as_array(price, periods) if price is not None
-                        else self.config.grid_variable_costs)
+        # Bezugsquelle - ein fester Preis fuer alle Netzanschluesse und alle Schritte.
         supply = cmp.Source(
             label=f"grid_supply_{name}",
             outputs={b: flows.Flow(
                 nominal_value=float(gc.get("max_power", self.config.grid_supply_power_kW)),
-                variable_costs=supply_costs)},
+                variable_costs=self.config.grid_variable_costs)},
         )
         self.es.add(supply)
-        # feed-in tariffs per GC (negative = revenue), from the price sheet via the
-        # strategy when available, else the config fallback. IMPORTANT: they differ!
-        # PV export (excess sink) earns the PV remuneration; export from the HOME bus
-        # (battery/V2G) earns 0 by the sheet — paying the PV tariff there would let the
-        # LP buy cheap grid power and "feed it in" simultaneously for riskless profit.
-        # feedin_tariff_from_price_sheet = False ignoriert die Blattwerte und laesst
-        # config.grid_feedin_tariff fuer BEIDE Pfade gelten (siehe SystemConfig).
-        if self.config.feedin_tariff_from_price_sheet:
-            feedin_tariff = float(gc.get("feedin_tariff_ct_kWh", self.config.grid_feedin_tariff))
-            homebus_tariff = float(gc.get("homebus_feedin_tariff_ct_kWh",
-                                          self.config.grid_feedin_tariff))
-        else:
-            feedin_tariff = homebus_tariff = float(self.config.grid_feedin_tariff)
+        # Einspeisung: derselbe feste Wert fuer beide Wege - den PV-Ueberschuss und den
+        # Export vom Hausbus (Batterie/V2G). Wichtig ist nur, dass er nicht POSITIV verguetet
+        # wird, waehrend Bezug billiger ist: sonst kauft das LP Strom und speist ihn im selben
+        # Schritt gewinnbringend wieder ein.
+        feedin_tariff = homebus_tariff = float(self.config.grid_feedin_tariff)
         # Wie gross darf der Bonus sein? Viel kleiner als man denkt.
         # Er macht es lohnend, PV DURCH den Speicher ins Haus zu leiten statt direkt: dabei
         # gehen (1 - eff^2) der kWh verloren, die sonst eingespeist worden waere. Rentabel
@@ -1241,13 +1202,12 @@ class EnergySystemModel:
             for bid, series in pv_to_battery.items():
                 summary[f"pv_direct_battery_{bid}"] = series
 
-        # the price series ACTUALLY used in the objective, per GC (incl. retail markup and
-        # negative-price clipping) — the single source of truth for plots/verification
-        for gcid, bus in self._gc_bus.items():
-            p = self.grid_connectors.get(gcid, {}).get("price_ct_kWh")
-            summary[f"grid_price_ct_{bus.label}"] = (
-                _as_array(p, n) if p is not None
-                else np.full(n, float(self.config.grid_variable_costs)))
+        # Der Preis, mit dem die Zielfunktion wirklich gerechnet hat - eine Konstante, aber
+        # als Spalte mitgeschrieben, damit Plots und Pruefungen eine Quelle haben und nicht
+        # die cfg nachschlagen muessen.
+        for bus in self._gc_bus.values():
+            summary[f"grid_price_ct_{bus.label}"] = np.full(
+                n, float(self.config.grid_variable_costs))
 
         # --- per-battery plan: AC power at the GC bus (the link flows) ---
         # charge   = flow Home_<n> -> link (AC drawn to charge the battery)

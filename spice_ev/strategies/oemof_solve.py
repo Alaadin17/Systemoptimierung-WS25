@@ -21,8 +21,6 @@ Flow:
 '''
 
 
-import json
-import logging
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -30,7 +28,6 @@ import pandas as pd
 
 from spice_ev import events
 from spice_ev.strategy import Strategy
-from spice_ev.util import get_cost
 
 
 class OemofSolve(Strategy):
@@ -54,7 +51,6 @@ class OemofSolve(Strategy):
         self.interval = kwargs.get("interval")
         self.stop_time = kwargs.get("stop_time")
         self.start_time = start_time
-        self._price_sheet = None   # lazy-loaded JSON (price sheet, see below)
 
         # Output containers, populated later by prepare_inputs()
         self.time_index = None
@@ -83,13 +79,6 @@ class OemofSolve(Strategy):
         from spice_ev.oemof_model import SystemConfig
         self._oemof_cfg = SystemConfig.from_options(self.oemof_config)
         self._apply_min_power_override(self._oemof_cfg)
-
-        # Path to spice_ev's price sheet (source of the PV feed-in remuneration and the
-        # retail markup). It arrives as the oemof_cost_parameters_file cfg key, so that
-        # spice_ev's own scripts need no modification; a kwargs value still wins if some
-        # caller supplies one directly. Empty -> the config values stay the fallback.
-        self.cost_parameters_file = (kwargs.get("cost_parameters_file")
-                                     or self._oemof_cfg.cost_parameters_file or None)
 
     def _apply_min_power_override(self, config) -> None:
         """Optionally drop spice_ev's minimum charging power to zero.
@@ -704,22 +693,8 @@ class OemofSolve(Strategy):
             mp = getattr(gc, "max_power", None)
             if mp:
                 info["max_power"] = float(mp)
-            # values sourced from the scenario / price sheet (config stays the fallback):
-            price = self._grid_price_series(gcid, time_index)
-            if price is not None:
-                markup = self._retail_markup_ct(gcid)
-                if markup is not None:
-                    # retail price like the spice_ev cost calculation: net components
-                    # summed, VAT on top of everything (feed-in stays net there too)
-                    net_markup, vat_percent = markup
-                    price = (price + net_markup) * (1.0 + vat_percent / 100.0)
-                info["price_ct_kWh"] = price          # time-varying grid price
-            tariff = self._feedin_tariff_ct(gcid)
-            if tariff is not None:
-                info["feedin_tariff_ct_kWh"] = tariff  # PV feed-in remuneration (negative)
-            hb = self._homebus_feedin_tariff_ct(gcid)
-            if hb is not None:
-                info["homebus_feedin_tariff_ct_kWh"] = hb  # battery/V2G export (0 by sheet)
+            # Preise kommen NICHT aus dem Szenario: Bezug und Einspeisung stehen fest in der
+            # cfg (grid_variable_costs / grid_feedin_tariff). Siehe SystemConfig.
             kwp = self._pv_kwp(gcid)
             if kwp > 0:
                 info["pv_power_kW"] = kwp              # PV plant size -> converter limit
@@ -734,156 +709,11 @@ class OemofSolve(Strategy):
                 total = total.add(self._sample_event_list(ev_list, time_index), fill_value=0.0)
         return total.to_numpy()
 
-    def _grid_price_series(self, gcid, time_index) -> Optional[np.ndarray]:
-        """Time-varying grid price for one GC from the scenario's grid operator signals.
-
-        spice_ev carries prices as GridOperatorSignal events (a ``cost`` dict per GC,
-        evaluated with ``util.get_cost`` — the same mechanism every other strategy uses).
-        The LP receives them as a per-step array in ct/kWh (signals are EUR/kWh -> x100),
-        piecewise constant from each signal's ``start_time``. Returns None if the scenario
-        has no priced signals for this GC (-> the config value stays as fallback).
-        """
-        # Fester Preis statt Szenario-Signalen: eine konstante Reihe zurueckgeben, damit
-        # alles danach (Retail-Aufschlag, MwSt) unveraendert weiterlaeuft. Wuerden wir
-        # stattdessen None liefern, griffe im Modell zwar auch grid_variable_costs - aber
-        # OHNE Aufschlag, und fest und variabel waeren nicht mehr vergleichbar.
-        cfg = getattr(self, "_oemof_cfg", None)
-        if cfg is not None and not getattr(cfg, "grid_price_from_scenario", True):
-            return np.full(len(time_index), float(cfg.grid_variable_costs))
-
-        sigs = [s for s in getattr(self.events, "grid_operator_signals", []) or []
-                if getattr(s, "grid_connector_id", None) == gcid
-                and getattr(s, "cost", None)]
-        if not sigs:
-            return None
-        pairs = []
-        for s in sorted(sigs, key=lambda s: s.start_time):
-            t = pd.Timestamp(s.start_time)
-            if t.tzinfo is not None:
-                t = t.tz_localize(None)
-            pairs.append((t, float(get_cost(1, s.cost)) * 100.0))   # EUR/kWh -> ct/kWh
-        target = time_index
-        if target.tz is not None:
-            target = target.tz_localize(None)
-        starts = pd.DatetimeIndex([p[0] for p in pairs])
-        values = np.array([p[1] for p in pairs])
-        # NEGATIVE prices are clipped to 0 for the LP: a linear model cannot forbid
-        # "disposing" of energy (storage in+out cycling burns it), so being PAID to buy
-        # becomes a money pump — buy, burn, get paid to re-buy. Real households cannot
-        # destroy energy for profit. At 0 ct the LP still charges everything useful, only
-        # the destruction premium is gone. (Exact modelling would need binary variables.)
-        values = np.maximum(values, 0.0)
-        idx = np.searchsorted(starts, target, side="right") - 1
-        idx = np.clip(idx, 0, len(values) - 1)   # before the first signal: first value
-        return values[idx]
-
-    def tariff(self) -> str:
-        """Der gewaehlte Tarif, normalisiert auf "RLM" / "SLP" / "fixed".
-
-        Ein unbekannter Wert faellt NICHT still auf einen Zweig zurueck, sondern warnt und
-        nimmt den Default - sonst rechnet man unbemerkt mit einem anderen Tarif, als in der
-        cfg steht.
-        """
-        wert = str(getattr(getattr(self, "_oemof_cfg", None), "tariff", "RLM")).strip()
-        for gueltig in ("RLM", "SLP", "fixed"):
-            if wert.lower() == gueltig.lower():
-                return gueltig
-        logging.warning("oemof_tariff = '%s' ist unbekannt (RLM | SLP | fixed) - "
-                        "es wird RLM gerechnet", wert)
-        return "RLM"
-
-    def _retail_markup_ct(self, gcid) -> Optional[Tuple[float, float]]:
-        """Fixed per-kWh retail components + VAT rate from the price sheet.
-
-        Mirrors spice_ev's cost calculation (costs.py) so both worlds price identically:
-        grid fee commodity charge by tariff (SLP flat net price; RLM by the GC's
-        voltage_level in the <2500 h/a bracket — the same edge-condition constant costs.py
-        uses), plus all levies, the concession fee and the electricity tax. All values are
-        NET; VAT is applied by the caller on (spot + markup), exactly like costs.py applies
-        it to the total while leaving the feed-in remuneration untaxed.
-
-        Returns (markup_net_ct_per_kWh, vat_percent), or None when the tariff is "fixed"
-        (then grid_variable_costs IS the price), no price sheet is configured or the sheet
-        lacks the entries (-> spot price only).
-        """
-        cfg = getattr(self, "_oemof_cfg", None)
-        if cfg is None or self.tariff() == "fixed":
-            return None
-        if not self.cost_parameters_file:
-            return None
-        if self._price_sheet is None:
-            with open(self.cost_parameters_file, encoding="utf-8") as f:
-                self._price_sheet = json.load(f)
-        gc = self.world_state.grid_connectors.get(gcid)
-        operator = getattr(gc, "grid_operator", "default_grid_operator") or "default_grid_operator"
-        try:
-            sheet = self._price_sheet[operator]
-            if self.tariff() == "SLP":
-                commodity = float(sheet["grid_fee"]["SLP"]["commodity_charge_ct/kWh"]["net_price"])
-            else:   # RLM: by voltage level, <2500 h/a utilization bracket
-                voltage = getattr(gc, "voltage_level", None) or "MV"
-                commodity = float(
-                    sheet["grid_fee"]["RLM"]["<2500_h/a"]["commodity_charge_ct/kWh"][voltage])
-            levies = sum(v for v in sheet["levies"].values() if isinstance(v, (int, float)))
-            concession = float(sheet["concession_fee"]["charge"])
-            electricity_tax = float(sheet["taxes"]["tax_on_electricity"])
-            vat_percent = float(sheet["taxes"]["value_added_tax"])
-        except (KeyError, TypeError):
-            return None
-        return commodity + float(levies) + concession + electricity_tax, vat_percent
-
     def _pv_kwp(self, gcid) -> float:
         """Installed PV nominal power (kWp) at one grid connector, summed over its plants."""
         return sum(float(pv.nominal_power)
                    for pv in getattr(self.world_state, "photovoltaics", {}).values()
                    if getattr(pv, "parent", None) == gcid)
-
-    def _feedin_tariff_ct(self, gcid) -> Optional[float]:
-        """PV feed-in tariff for one GC from spice_ev's price sheet (negative = revenue).
-
-        Reads the SAME price sheet the spice_ev cost calculation uses
-        (``cost_parameters_file`` in simulate.cfg): ``feed-in_remuneration.PV`` maps plant
-        size steps (kWp) to a remuneration in ct/kWh. The step is chosen by the installed
-        PV power at this GC. Returns None if no sheet is configured or the GC has no PV
-        (-> the config value stays as fallback).
-        """
-        kwp = self._pv_kwp(gcid)
-        if not self.cost_parameters_file or kwp <= 0:
-            return None
-        if self._price_sheet is None:
-            with open(self.cost_parameters_file, encoding="utf-8") as f:
-                self._price_sheet = json.load(f)
-        operator = getattr(self.world_state.grid_connectors.get(gcid), "grid_operator",
-                           "default_grid_operator") or "default_grid_operator"
-        try:
-            fee = self._price_sheet[operator]["feed-in_remuneration"]["PV"]
-            steps, rems = fee["kWp"], fee["remuneration"]
-        except (KeyError, TypeError):
-            return None
-        i = int(np.searchsorted(np.asarray(steps, dtype=float), kwp, side="left"))
-        i = min(i, len(rems) - 1)
-        return -float(rems[i])   # negative = revenue (model convention)
-
-    def _homebus_feedin_tariff_ct(self, gcid) -> Optional[float]:
-        """Remuneration for exports from the HOME bus (battery / V2G), from the price sheet.
-
-        The sheet lists these separately from PV (``feed-in_remuneration.V2G`` and
-        ``.battery`` — both 0 in the default sheet): re-exported or battery energy earns
-        nothing, only PV does. Returns None without a sheet (-> config fallback).
-        """
-        if not self.cost_parameters_file:
-            return None
-        if self._price_sheet is None:
-            with open(self.cost_parameters_file, encoding="utf-8") as f:
-                self._price_sheet = json.load(f)
-        operator = getattr(self.world_state.grid_connectors.get(gcid), "grid_operator",
-                           "default_grid_operator") or "default_grid_operator"
-        try:
-            fee = self._price_sheet[operator]["feed-in_remuneration"]
-            value = max(float(fee.get("V2G", 0.0)), float(fee.get("battery", 0.0)))
-        except (KeyError, TypeError):
-            return None
-        return -value   # 0 in the default sheet -> exporting from the home bus earns nothing
 
     @staticmethod
     def _min_soc_series(ts, config) -> np.ndarray:
