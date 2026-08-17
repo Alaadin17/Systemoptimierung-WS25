@@ -252,11 +252,11 @@ def test_tariff_selects_the_price_build_up(caplog):
 
     RLM is the default because simulate.py bills every strategy outside
     greedy/balanced/distributed as RLM (its line 71), and oemof_solve is one of them. With
-    the previous SLP default the LP priced 7.48 ct/kWh of grid fee and no capacity charge
-    while the bill was written with 3.49 ct/kWh plus 41.06 EUR/(kW*a).
+    the previous SLP default the LP priced 7.48 ct/kWh of grid fee while the bill was
+    written with 3.49 ct/kWh. Only the COMMODITY charge is meant here — the capacity charge
+    stays what it always was: something spice_ev accounts for afterwards, outside the LP.
     """
     assert SystemConfig().tariff == "RLM"
-    assert SystemConfig().include_capacity_charge is False
     # die alten Felder gibt es nicht mehr
     felder = {f.name for f in dataclasses.fields(SystemConfig)}
     assert "fee_type" not in felder and "use_retail_markup" not in felder
@@ -1071,111 +1071,3 @@ def test_pv_direct_malus_has_no_effect():
     # the malus leaves it completely unused and costs exactly nothing
     assert malus._summary_df["pv_direct_battery_BAT1"].sum() == pytest.approx(0.0, abs=1e-6)
     assert malus._costs["objective"] == pytest.approx(neutral._costs["objective"], abs=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# Leistungspreis (nur bei Tarif RLM)
-# ---------------------------------------------------------------------------
-def _peak_scenario(capacity_charge=None, **kw):
-    """Eine einzelne Lastspitze, die die Batterie glaetten koennte - wenn es sich lohnt.
-
-    Ohne Leistungspreis lohnt es sich nicht: der Arbeitspreis ist konstant, das Umlagern
-    kostet nur den Wirkungsgrad. Genau daran laesst sich zeigen, dass der neue Term wirkt.
-    Die Batterie startet deshalb LEER - mit Startladung waere ihr Inhalt geschenkte Energie,
-    die das LP ohnehin sofort verbraucht, und die Spitze faellt schon ohne den Term.
-    """
-    idx = pd.date_range("2025-01-01", periods=8, freq="15min")
-    gc = {"max_power": 30.0, "load": [2, 2, 2, 10, 2, 2, 2, 2],
-          "price_ct_kWh": np.full(8, 30.0),
-          "feedin_tariff_ct_kWh": 0.0, "homebus_feedin_tariff_ct_kWh": 0.0}
-    if capacity_charge is not None:
-        gc["capacity_charge_eur_kW_a"] = capacity_charge
-    return EnergySystemModel(
-        config=SystemConfig(debug=False, should_dump_results=False, **kw),
-        time_index=idx,
-        grid_connectors={"GC1": gc},
-        charging_stations={},
-        battery_params={"BAT1": {"capacity_kWh": 10.0, "power_kW": 5.0, "parent": "GC1",
-                                 "initial_soc": 0.0}},
-        vehicle_params={},
-    )
-
-
-def test_capacity_charge_off_leaves_a_plain_power_limit():
-    """Default aus: der Bezugsfluss hat eine feste Groesse und keine Investitionsvariable."""
-    assert SystemConfig().include_capacity_charge is False
-    m = _peak_scenario()
-    _build_es(m)
-    assert _out_flow(_nodes(m)["grid_supply_Home_1"]).nominal_value == 30.0
-    assert m._capacity_charge == {}
-
-
-def test_capacity_charge_makes_the_connection_size_a_decision():
-    """Mit Leistungspreis wird aus der Anschlussgroesse eine Investition mit Preisschild.
-
-    ``ep_costs`` sind ct, das Preisblatt liefert EUR/(kW*a) - daher der Faktor 100. Und die
-    physische Anschlussgrenze bleibt als ``maximum`` erhalten, das Modell darf die Spitze
-    also nur senken, nie ueber den Anschluss hinaus wachsen.
-    """
-    m = _peak_scenario(capacity_charge=41.06)
-    _build_es(m)
-    invest = _out_flow(_nodes(m)["grid_supply_Home_1"]).investment
-    assert invest is not None
-    assert float(invest.ep_costs[0]) == pytest.approx(4106.0)
-    assert float(invest.maximum[0]) == pytest.approx(30.0)
-    assert m._capacity_charge["GC1"] == (41.06, 30.0, "Home_1")
-
-
-@pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
-def test_capacity_charge_shaves_the_peak_and_is_reported():
-    """Der Verhaltensnachweis: der Term senkt die Spitze, und er wird ausgewiesen.
-
-    Bei konstantem Arbeitspreis gibt es sonst keinen Grund, die Batterie zu bewegen - die
-    Spitze bleibt genau die Last. Erst der Leistungspreis macht das Glaetten lohnend.
-    """
-    ohne = _peak_scenario()
-    mit = _peak_scenario(capacity_charge=41.06)
-    ohne.run()
-    mit.run()
-    spitze_ohne = ohne._summary_df["grid_supply_Home_1"].max()
-    spitze_mit = mit._summary_df["grid_supply_Home_1"].max()
-    assert spitze_ohne == pytest.approx(10.0, abs=1e-6)      # ungeglaettet: die Last selbst
-    assert spitze_mit < spitze_ohne - 1e-3
-    # die Investitionsgroesse IST die Spitze, und der ausgewiesene Betrag passt dazu
-    assert mit._costs["netzspitze_kW_Home_1"] == pytest.approx(spitze_mit, abs=1e-6)
-    assert (mit._costs["leistungspreis_ct_Home_1"]
-            == pytest.approx(41.06 * 100.0 * spitze_mit, abs=1e-6))
-    # ... und dieser Betrag steckt wirklich im Ziel: ohne ihn waere der Plan teurer als der
-    # ungeglaettete, denn Glaetten kostet Wirkungsgrad
-    arbeit_mit = mit._costs["objective"] - mit._costs["leistungspreis_ct_Home_1"]
-    assert arbeit_mit > ohne._costs["objective"] - 1e-6
-    assert "netzspitze_kW_Home_1" not in ohne._costs
-
-
-def test_capacity_charge_only_exists_for_rlm(tmp_path, caplog):
-    """SLP und fixed bekommen keinen Leistungspreis - auch mit dem Schalter an.
-
-    Bei SLP ist der Grundpreis ein fester Jahresbetrag, der nicht an der Spitze haengt; im
-    Ziel waere er eine Konstante. Bei ``fixed`` gibt es ueberhaupt kein Preisblatt.
-    """
-    sheet = {"default_grid_operator": {"grid_fee": {"RLM": {"<2500_h/a": {
-        "capacity_charge_EUR/kW*a": {"MV": 41.06, "LV": 25.68}}}}}}
-    pfad = tmp_path / "price_sheet.json"
-    pfad.write_text(json.dumps(sheet), encoding="utf-8")
-
-    strat = OemofSolve.__new__(OemofSolve)
-    strat.cost_parameters_file = str(pfad)
-    strat.world_state = SimpleNamespace(grid_connectors={
-        "GC1": SimpleNamespace(grid_operator="default_grid_operator", voltage_level="MV")})
-
-    def preis(**kw):
-        strat._price_sheet = None
-        strat._oemof_cfg = SystemConfig(debug=False, **kw)
-        return strat._capacity_charge_eur("GC1")
-
-    assert preis(tariff="RLM", include_capacity_charge=True) == pytest.approx(41.06)
-    assert preis(tariff="RLM") is None                       # Schalter aus -> kein Term
-    with caplog.at_level(logging.INFO):
-        assert preis(tariff="SLP", include_capacity_charge=True) is None
-        assert preis(tariff="fixed", include_capacity_charge=True) is None
-    assert "SLP" in caplog.text and "fixed" in caplog.text

@@ -714,9 +714,6 @@ class OemofSolve(Strategy):
                     net_markup, vat_percent = markup
                     price = (price + net_markup) * (1.0 + vat_percent / 100.0)
                 info["price_ct_kWh"] = price          # time-varying grid price
-            leistungspreis = self._capacity_charge_eur(gcid)
-            if leistungspreis is not None:
-                info["capacity_charge_eur_kW_a"] = leistungspreis   # nur bei RLM
             tariff = self._feedin_tariff_ct(gcid)
             if tariff is not None:
                 info["feedin_tariff_ct_kWh"] = tariff  # PV feed-in remuneration (negative)
@@ -794,41 +791,6 @@ class OemofSolve(Strategy):
         logging.warning("oemof_tariff = '%s' ist unbekannt (RLM | SLP | fixed) - "
                         "es wird RLM gerechnet", wert)
         return "RLM"
-
-    def _capacity_charge_eur(self, gcid) -> Optional[float]:
-        """Leistungspreis in EUR/(kW*a) aus dem Preisblatt - nur beim Tarif RLM.
-
-        Dieselbe Quelle, die auch die spice_ev-Kostenrechnung nimmt (``find_prices`` in
-        costs.py): Staffel <2500 h/a, Wert je Spannungsebene des Netzanschlusses. Bei MV
-        sind das 41.06 EUR/(kW*a).
-
-        Gibt None zurueck, wenn der Leistungspreis nicht ins Ziel soll - also bei
-        ``include_capacity_charge = false``, bei SLP (dort ist es ein fester
-        Jahresgrundpreis, der nicht von der Spitze abhaengt) und bei ``fixed`` (kein
-        Preisblatt). Dann baut das Modell den Term nicht.
-        """
-        cfg = getattr(self, "_oemof_cfg", None)
-        if cfg is None or not getattr(cfg, "include_capacity_charge", False):
-            return None
-        if self.tariff() != "RLM":
-            logging.info("Leistungspreis uebersprungen: er existiert nur beim Tarif RLM "
-                         "(gewaehlt: %s)", self.tariff())
-            return None
-        if not self.cost_parameters_file:
-            return None
-        if self._price_sheet is None:
-            with open(self.cost_parameters_file, encoding="utf-8") as f:
-                self._price_sheet = json.load(f)
-        gc = self.world_state.grid_connectors.get(gcid)
-        operator = getattr(gc, "grid_operator", "default_grid_operator") or "default_grid_operator"
-        voltage = getattr(gc, "voltage_level", None) or "MV"
-        try:
-            return float(self._price_sheet[operator]["grid_fee"]["RLM"]["<2500_h/a"]
-                         ["capacity_charge_EUR/kW*a"][voltage])
-        except (KeyError, TypeError):
-            logging.warning("Leistungspreis nicht im Preisblatt gefunden (%s, %s)",
-                            operator, voltage)
-            return None
 
     def _retail_markup_ct(self, gcid) -> Optional[Tuple[float, float]]:
         """Fixed per-kWh retail components + VAT rate from the price sheet.
