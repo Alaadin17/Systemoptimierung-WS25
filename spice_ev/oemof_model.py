@@ -77,7 +77,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
-from oemof.solph import EnergySystem, Model, buses, components as cmp, flows
+from oemof.solph import EnergySystem, Investment, Model, buses, components as cmp, flows
 from oemof.solph import processing
 from pyomo.opt import SolverStatus, TerminationCondition
 
@@ -420,6 +420,9 @@ class EnergySystemModel:
         # storages that can charge AND discharge — the candidates for the binary
         # "not both at once" constraint (see _add_no_simultaneous_constraints)
         self._storage_pairs: list = []
+        # {gcid: (grid_supply-Knoten, Home-Bus, Leistungspreis EUR/(kW*a))} fuer den
+        # optionalen Leistungspreis-Term, gefuellt in _add_grid_connector
+        self._capacity_charge: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Pipeline orchestration
@@ -479,6 +482,7 @@ class EnergySystemModel:
         periods = self.config.periods
         # vor dem ersten Knoten leeren — die Fahrzeuge tragen sich gleich hier ein
         self._storage_pairs = []
+        self._capacity_charge = {}
 
         # 1) one bus + BEV per vehicle
         for vid, params in self.vehicle_params.items():
@@ -530,12 +534,20 @@ class EnergySystemModel:
         price = gc.get("price_ct_kWh")
         supply_costs = (_as_array(price, periods) if price is not None
                         else self.config.grid_variable_costs)
-        self.es.add(cmp.Source(
+        max_power = float(gc.get("max_power", self.config.grid_supply_power_kW))
+        # Leistungspreis: die Strategie liefert ihn nur, wenn er ins Ziel soll (Tarif RLM
+        # UND include_capacity_charge). Siehe _add_capacity_charge fuer das Warum.
+        leistungspreis = gc.get("capacity_charge_eur_kW_a")
+        if leistungspreis:
+            groesse = self._add_capacity_charge(float(leistungspreis), max_power)
+            self._capacity_charge[gcid] = (float(leistungspreis), max_power, name)
+        else:
+            groesse = max_power
+        supply = cmp.Source(
             label=f"grid_supply_{name}",
-            outputs={b: flows.Flow(
-                nominal_value=float(gc.get("max_power", self.config.grid_supply_power_kW)),
-                variable_costs=supply_costs)},
-        ))
+            outputs={b: flows.Flow(nominal_value=groesse, variable_costs=supply_costs)},
+        )
+        self.es.add(supply)
         # feed-in tariffs per GC (negative = revenue), from the price sheet via the
         # strategy when available, else the config fallback. IMPORTANT: they differ!
         # PV export (excess sink) earns the PV remuneration; export from the HOME bus
@@ -983,6 +995,43 @@ class EnergySystemModel:
             lp_path.parent.mkdir(parents=True, exist_ok=True)
             self.model.write(str(lp_path), io_options={"symbolic_solver_labels": True})
 
+    def _add_capacity_charge(self, leistungspreis: float, max_power: float):
+        """Die Netzanschlussgroesse zur Entscheidung machen, damit der Leistungspreis zaehlt.
+
+        Ohne diesen Term kennt das LP nur Arbeitspreise - und uebersieht damit meist den
+        groessten Posten der Rechnung: im April/Mai-Lauf von example_1 waren es 892.85 von
+        904.04 EUR Netzentgelt, ausgeloest von einer einzigen Viertelstunde.
+
+        Statt einer eigenen pyomo-Variablen uebernimmt das oemofs ``Investment``: die
+        Anschlussleistung wird zur Investitionsgroesse des Bezugsflusses. Der Block baut
+        daraus genau die gesuchte Formulierung
+
+            grid_supply[t]  <=  P_max        fuer alle t
+            Ziel += ep_costs * P_max
+
+        also eine Variable und n Zeilen je Netzanschluss - vernachlaessigbar, und es bleibt
+        ein reines LP. Der Umweg ueber ``Model`` und ``pyomo.environ`` waere zwar auch
+        moeglich, aber ``processing.results`` stolpert dann ueber eine Variable ohne
+        Zeitindex (sie erzeugt eine Ergebniszeile statt eines Zeitverlaufs). Mit
+        ``Investment`` faellt die Spitze als ``scalars['invest']`` mit ab.
+
+        ``ep_costs`` = Leistungspreis [EUR/(kW*a)] * 100, weil das Modell in ct rechnet.
+        ``maximum`` ist die physische Anschlussgrenze, die sonst ``nominal_value`` waere -
+        die Investition kann also nur kleiner werden, nie groesser.
+
+        WICHTIG - der Betrag ist der volle JAHRESpreis, nicht anteilig auf den Horizont.
+        Genau so rechnet auch spice_ev ab (costs.py, calculate_capacity_costs_rlm:
+        ``capacity_charge * max_power_grid_supply``, ohne Bezug zur Simulationsdauer), und
+        nur so stimmen LP-Ziel und ausgewiesene Rechnung ueberein. Auf einem kurzen Horizont
+        wiegt der Term deshalb sehr schwer: eine Woche Arbeitspreis kostet ein paar Euro,
+        1 kW weniger Spitze "spart" 41.06 EUR/a. Das LP glaettet die Spitze dann sehr
+        entschlossen - richtig fuer einen RLM-Kunden, aber beim Vergleich kurzer Laeufe im
+        Kopf behalten.
+        """
+        logging.info("Leistungspreis im Ziel: %.2f EUR/(kW*a), Anschluss bis %.2f kW",
+                     leistungspreis, max_power)
+        return Investment(ep_costs=leistungspreis * 100.0, maximum=max_power)
+
     def _add_no_simultaneous_constraints(self) -> None:
         """Verbiete jedem Speicher, im selben Zeitschritt zu laden UND zu entladen.
 
@@ -1308,6 +1357,15 @@ class EnergySystemModel:
             ) * step_hours
             self._costs["pv_bonus_ct"] = bonus_ct          # contribution to the objective (<= 0)
             self._costs["objective_ohne_bonus"] = objective - bonus_ct
+        # Leistungspreis: die gewaehlte Anschlussgroesse und was sie im Ziel kostet. Der Term
+        # ist ein voller Jahresbetrag (siehe _add_capacity_charge) und auf kurzen Horizonten
+        # damit der groesste Posten ueberhaupt - er gehoert ausgewiesen, sonst wundert man
+        # sich nur ueber das Ziel. Die Spitze faellt bei oemof als Investitionsgroesse an.
+        for gcid, (preis, _, name) in self._capacity_charge.items():
+            spitze = float(res[(self._node(f"grid_supply_{name}"),
+                                self._gc_bus[gcid])]["scalars"]["invest"])
+            self._costs[f"netzspitze_kW_{name}"] = spitze
+            self._costs[f"leistungspreis_ct_{name}"] = preis * 100.0 * spitze
 
     def _save_results(self) -> None:
         """Write the schedule, summary and cost as CSV into ``config.output_dir``."""
