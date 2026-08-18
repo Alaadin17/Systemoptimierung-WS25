@@ -204,17 +204,26 @@ class SystemConfig:
     forbid_simultaneous_storage: bool = False
 
     # --- Preise (ct/kWh) -------------------------------------------------------------
-    # Beide FEST ueber den ganzen Horizont. Das LP kennt keine Preiszeitreihe: weder die
-    # grid_operator_signals des Szenarios noch das Preisblatt werden gelesen, und es gibt
-    # keinen Tarif-Aufschlag (Netzentgelt, Umlagen, Konzessionsabgabe, Stromsteuer, MwSt).
-    # grid_variable_costs ist der KOMPLETTE Bezugspreis, so wie er auf der Stromrechnung
-    # steht, grid_feedin_tariff die komplette Einspeiseverguetung.
+    # grid_variable_costs ist der Bezugspreis, wenn das Szenario keinen mitbringt: der
+    # KOMPLETTE Preis, so wie er auf der Stromrechnung steht - kein Boersenpreis, auf den
+    # noch etwas addiert wird. Ein Preisblatt wird nicht gelesen, es gibt keinen
+    # Tarif-Aufschlag (Netzentgelt, Umlagen, Konzessionsabgabe, Stromsteuer, MwSt) und
+    # keinen Leistungspreis.
+    #
+    # Bringt das Szenario Preissignale mit - ``include_price_csv`` in der generate.cfg macht
+    # aus jeder CSV-Zeile ein GridOperatorSignal -, gilt STATTDESSEN diese Zeitreihe, je
+    # Zeitschritt, in genau der Form, die auch spice_evs eigene Strategien sehen (siehe
+    # OemofSolve._grid_price_series). grid_variable_costs ist dann wirkungslos.
+    #
+    # grid_feedin_tariff ist immer fest und gilt fuer BEIDE Exportwege (PV-Ueberschuss und
+    # Export vom Hausbus). Negativ = Erloes, 0 = keine Verguetung.
     #
     # WICHTIG - die spice_ev-Kostenrechnung geht ihren eigenen Weg: simulate.py wertet nach
-    # der Simulation costs.py aus, und das liest Preisblatt und Szenariosignale weiterhin.
-    # Die EUR/a in results.json entstehen also aus anderen Preisen als der Fahrplan. Sie
-    # beantworten "was haette das gekostet", der Fahrplan beantwortet "was ist bei 35 ct
-    # sinnvoll". Beide Zahlen sind fuer sich richtig, nur nicht dieselbe Rechnung.
+    # der Simulation costs.py aus, und das rechnet mit dem Preisblatt (Netzentgelt, Umlagen,
+    # Steuern, Leistungspreis). Die EUR/a in results.json entstehen also aus anderen Preisen
+    # als der Fahrplan - sie beantworten "was haette das gekostet", der Fahrplan beantwortet
+    # "was ist bei diesem Preis sinnvoll". Beide Zahlen sind fuer sich richtig, nur nicht
+    # dieselbe Rechnung.
     pv_variable_costs: float = 0.0
     grid_variable_costs: float = 35.0
     grid_feedin_tariff: float = 0.0   # negativ = Erloes; 0 = Einspeisung bringt nichts
@@ -495,12 +504,15 @@ class EnergySystemModel:
         wallboxes of the charging stations that belong to this GC (only used ones)."""
         periods = self.config.periods
 
-        # Bezugsquelle - ein fester Preis fuer alle Netzanschluesse und alle Schritte.
+        # Bezugsquelle. Liefert die Strategie eine Preisreihe aus dem Szenario
+        # (include_price_csv), gilt die je Zeitschritt - sonst der feste cfg-Wert.
+        preis = gc.get("price_ct_kWh")
         supply = cmp.Source(
             label=f"grid_supply_{name}",
             outputs={b: flows.Flow(
                 nominal_value=float(gc.get("max_power", self.config.grid_supply_power_kW)),
-                variable_costs=self.config.grid_variable_costs)},
+                variable_costs=(_as_array(preis, periods) if preis is not None
+                                else self.config.grid_variable_costs))},
         )
         self.es.add(supply)
         # Einspeisung: derselbe feste Wert fuer beide Wege - den PV-Ueberschuss und den
@@ -1202,12 +1214,14 @@ class EnergySystemModel:
             for bid, series in pv_to_battery.items():
                 summary[f"pv_direct_battery_{bid}"] = series
 
-        # Der Preis, mit dem die Zielfunktion wirklich gerechnet hat - eine Konstante, aber
-        # als Spalte mitgeschrieben, damit Plots und Pruefungen eine Quelle haben und nicht
-        # die cfg nachschlagen muessen.
-        for bus in self._gc_bus.values():
-            summary[f"grid_price_ct_{bus.label}"] = np.full(
-                n, float(self.config.grid_variable_costs))
+        # Der Preis, mit dem die Zielfunktion wirklich gerechnet hat - je nach Szenario eine
+        # Konstante oder die Stufenfunktion aus der Preis-CSV. So oder so mitgeschrieben,
+        # damit Plots und Pruefungen eine Quelle haben und nicht die cfg nachschlagen muessen.
+        for gcid, bus in self._gc_bus.items():
+            p = self.grid_connectors.get(gcid, {}).get("price_ct_kWh")
+            summary[f"grid_price_ct_{bus.label}"] = (
+                _as_array(p, n) if p is not None
+                else np.full(n, float(self.config.grid_variable_costs)))
 
         # --- per-battery plan: AC power at the GC bus (the link flows) ---
         # charge   = flow Home_<n> -> link (AC drawn to charge the battery)

@@ -28,6 +28,7 @@ import pandas as pd
 
 from spice_ev import events
 from spice_ev.strategy import Strategy
+from spice_ev.util import get_cost
 
 
 class OemofSolve(Strategy):
@@ -693,8 +694,11 @@ class OemofSolve(Strategy):
             mp = getattr(gc, "max_power", None)
             if mp:
                 info["max_power"] = float(mp)
-            # Preise kommen NICHT aus dem Szenario: Bezug und Einspeisung stehen fest in der
-            # cfg (grid_variable_costs / grid_feedin_tariff). Siehe SystemConfig.
+            # Bezugspreis: hat das Szenario Preissignale, gelten die - sonst der feste Wert
+            # aus der cfg. Die Einspeiseverguetung bleibt immer fest (grid_feedin_tariff).
+            preis = self._grid_price_series(gcid, time_index)
+            if preis is not None:
+                info["price_ct_kWh"] = preis
             kwp = self._pv_kwp(gcid)
             if kwp > 0:
                 info["pv_power_kW"] = kwp              # PV plant size -> converter limit
@@ -708,6 +712,49 @@ class OemofSolve(Strategy):
             if getattr(ev_list, "grid_connector_id", None) == gcid:
                 total = total.add(self._sample_event_list(ev_list, time_index), fill_value=0.0)
         return total.to_numpy()
+
+    def _grid_price_series(self, gcid, time_index) -> Optional[np.ndarray]:
+        """Der Bezugspreis je Zeitschritt - genau der, den spice_ev auch sieht.
+
+        spice_ev fuehrt Preise nicht als Zeitreihe, sondern als GridOperatorSignal-EVENTS:
+        je Ereignis ein ``cost``-Dict, gueltig ab ``start_time`` bis zum naechsten Signal.
+        ``include_price_csv`` in der generate.cfg macht aus JEDER CSV-Zeile ein solches
+        Ereignis. Diese Methode baut daraus die Stufenfunktion zurueck, die spice_ev in jedem
+        Schritt als ``gc.cost`` vor sich hat - mit demselben ``util.get_cost``, das auch
+        greedy, balanced und balanced_market benutzen. Preise stehen dort in EUR/kWh, das
+        Modell rechnet in ct/kWh, daher x100.
+
+        Kein Preisblatt, kein Tarif-Aufschlag: was hier herauskommt, ist der Wert aus der
+        CSV, nicht mehr. Hat das Szenario keine Preissignale (oder ist include_price_csv
+        auskommentiert), gibt die Methode None zurueck und es bleibt beim festen
+        grid_variable_costs aus der cfg.
+
+        EIN Unterschied zu spice_ev ist beabsichtigt: NEGATIVE Preise werden auf 0 gekappt.
+        Ein LP kann nicht verbieten, Energie loszuwerden - Laden und Entladen im selben
+        Schritt verbrennt sie ueber den Wirkungsgrad. Wird man fuers Beziehen BEZAHLT, ist
+        das eine Geldpumpe: kaufen, vernichten, erneut kassieren. Ein reales Haus kann das
+        nicht, spice_ev simuliert es auch nicht - nur das LP wuerde es finden. Bei 0 ct laedt
+        das Modell weiterhin alles, was ihm nuetzt; weg ist nur die Praemie fuers Vernichten.
+        """
+        signale = [s for s in getattr(self.events, "grid_operator_signals", []) or []
+                   if getattr(s, "grid_connector_id", None) == gcid
+                   and getattr(s, "cost", None)]
+        if not signale:
+            return None
+        paare = []
+        for s in sorted(signale, key=lambda s: s.start_time):
+            t = pd.Timestamp(s.start_time)
+            if t.tzinfo is not None:
+                t = t.tz_localize(None)
+            paare.append((t, float(get_cost(1, s.cost)) * 100.0))   # EUR/kWh -> ct/kWh
+        ziel = time_index
+        if ziel.tz is not None:
+            ziel = ziel.tz_localize(None)
+        starts = pd.DatetimeIndex([p[0] for p in paare])
+        werte = np.maximum(np.array([p[1] for p in paare]), 0.0)
+        idx = np.searchsorted(starts, ziel, side="right") - 1
+        idx = np.clip(idx, 0, len(werte) - 1)   # vor dem ersten Signal gilt dessen Wert
+        return werte[idx]
 
     def _pv_kwp(self, gcid) -> float:
         """Installed PV nominal power (kWp) at one grid connector, summed over its plants."""

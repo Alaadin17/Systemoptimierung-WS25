@@ -189,24 +189,23 @@ def test_solve_small_model(tmp_path, monkeypatch, caplog):
 # ---------------------------------------------------------------------------
 # Test 2a2 — feste Preise: die cfg ist die einzige Quelle
 # ---------------------------------------------------------------------------
-def test_prices_are_fixed_and_come_only_from_the_config():
-    """Ein Bezugspreis, eine Einspeiseverguetung, beide konstant.
+def test_prices_come_from_the_config_or_the_scenario_and_nowhere_else():
+    """Bezugspreis: Szenario, sonst cfg. Einspeiseverguetung: immer cfg.
 
     Frueher konnte ein Preis aus drei Quellen kommen - den grid_operator_signals des
     Szenarios, dem Preisblatt (Netzentgelt, Umlagen, Konzession, Stromsteuer, MwSt) und der
     cfg -, die sich gegenseitig ueberschrieben haben. Genau daraus sind zwei stille Fehler
     entstanden: das LP kalkulierte einen anderen Tarif als abgerechnet wurde, und
     ``oemof_grid_feedin_tariff = 0`` blieb wirkungslos, solange ein Preisblatt konfiguriert
-    war. Jetzt gibt es nur noch die cfg.
+    war. Das Preisblatt ist jetzt ganz raus.
     """
     idx = pd.date_range("2025-01-01", periods=4, freq="15min")
     m = EnergySystemModel(
         config=SystemConfig(debug=False, grid_variable_costs=35.0, grid_feedin_tariff=0.0),
         time_index=idx,
-        # Preis-Keys, wie die Strategie sie frueher mitgeliefert hat: sie muessen wirkungslos
-        # sein, sonst haette sich die alte Quelle nur versteckt
+        # Verguetungs-Keys, wie das Preisblatt sie frueher geliefert hat: sie muessen
+        # wirkungslos sein, sonst haette sich die alte Quelle nur versteckt
         grid_connectors={"GC1": {"max_power": 30.0, "load": [1, 1, 1, 1], "pv": [0, 3, 3, 0],
-                                 "price_ct_kWh": np.array([30.0, 5.0, 5.0, 30.0]),
                                  "feedin_tariff_ct_kWh": -6.24,
                                  "homebus_feedin_tariff_ct_kWh": -1.5,
                                  "pv_power_kW": 7.5}},
@@ -226,11 +225,11 @@ def test_prices_are_fixed_and_come_only_from_the_config():
                          "grid_price_from_scenario", "feedin_tariff_from_price_sheet"}
 
 
-def test_strategy_hands_the_model_physics_only():
-    """Die Strategie reicht Last, PV, Anschlussleistung und kWp durch - keine Preise.
+def test_strategy_hands_the_model_physics_and_the_scenario_price():
+    """Last, PV, Anschlussleistung, kWp - und der Bezugspreis, wenn das Szenario einen hat.
 
-    Das Szenario hier HAT Preissignale. Wuerden sie noch ausgewertet, taeuschte der feste
-    Preis in der cfg nur Ruhe vor.
+    Aufschlaege gibt es keine mehr: was aus der Preis-CSV kommt, kommt unveraendert an
+    (EUR/kWh x100). Die Einspeiseverguetung bleibt fest in der cfg.
     """
     idx = pd.date_range("2025-01-01", periods=4, freq="15min")
     strat = OemofSolve.__new__(OemofSolve)
@@ -245,12 +244,51 @@ def test_strategy_hands_the_model_physics_only():
         photovoltaics={"PV1": SimpleNamespace(parent="GC1", nominal_power=10.0)},
     )
     info = strat._grid_connectors(idx)["GC1"]
-    assert set(info) == {"load", "pv", "max_power", "pv_power_kW"}
+    assert set(info) == {"load", "pv", "max_power", "pv_power_kW", "price_ct_kWh"}
     assert info["pv_power_kW"] == 10.0
-    # die Preis-Methoden gibt es nicht mehr - kein toter Pfad, ueber den etwas zurueckkommt
-    for name in ("_grid_price_series", "_retail_markup_ct", "_feedin_tariff_ct",
-                 "_homebus_feedin_tariff_ct", "tariff"):
+    assert list(info["price_ct_kWh"]) == [30.0] * 4        # 0.30 EUR/kWh -> 30 ct/kWh
+    # ohne Preissignale bleibt der Schluessel weg -> das Modell nimmt die cfg
+    strat.events.grid_operator_signals = []
+    assert "price_ct_kWh" not in strat._grid_connectors(idx)["GC1"]
+    # die Preisblatt-Methoden gibt es nicht mehr - kein toter Pfad, ueber den etwas zurueckkommt
+    for name in ("_retail_markup_ct", "_feedin_tariff_ct", "_homebus_feedin_tariff_ct",
+                 "tariff"):
         assert not hasattr(OemofSolve, name), name
+
+
+def test_scenario_price_signals_become_a_step_function():
+    """Die Events werden zu genau der Stufenfunktion, die spice_ev auch vor sich hat.
+
+    Ein Signal gilt ab seiner ``start_time`` bis zum naechsten - so wertet spice_ev
+    ``gc.cost`` in jedem Schritt aus, und so muss es beim LP ankommen. Geprueft werden die
+    drei Faelle, die in der Praxis schiefgehen: die Einheit (EUR/kWh, nicht ct), fremde
+    Netzanschluesse, und negative Preise.
+    """
+    idx = pd.date_range("2025-01-01", periods=6, freq="15min")
+    strat = OemofSolve.__new__(OemofSolve)
+    strat.events = SimpleNamespace(grid_operator_signals=[
+        SimpleNamespace(grid_connector_id="GC1", start_time=idx[0],
+                        cost={"type": "fixed", "value": 0.30}),   # EUR/kWh!
+        SimpleNamespace(grid_connector_id="GC1", start_time=idx[2],
+                        cost={"type": "fixed", "value": 0.05}),
+        SimpleNamespace(grid_connector_id="GC1", start_time=idx[4],
+                        cost={"type": "fixed", "value": -0.04}),  # negativ -> gekappt
+        SimpleNamespace(grid_connector_id="GC2", start_time=idx[0],
+                        cost={"type": "fixed", "value": 0.99}),   # anderer GC -> ignoriert
+    ])
+    assert list(strat._grid_price_series("GC1", idx)) == [30.0, 30.0, 5.0, 5.0, 0.0, 0.0]
+    assert strat._grid_price_series("GC3", idx) is None       # keine Signale -> cfg-Wert
+
+    # ... und die Reihe landet als variable_costs im Modell, Schritt fuer Schritt
+    m = EnergySystemModel(
+        config=SystemConfig(debug=False, grid_variable_costs=35.0),
+        time_index=idx,
+        grid_connectors={"GC1": {"max_power": 30.0, "load": [1] * 6,
+                                 "price_ct_kWh": strat._grid_price_series("GC1", idx)}},
+    )
+    _build_es(m)
+    kosten = _out_flow(_nodes(m)["grid_supply_Home_1"]).variable_costs
+    assert [float(kosten[t]) for t in range(6)] == [30.0, 30.0, 5.0, 5.0, 0.0, 0.0]
 
 
 def test_from_options_coerces_cfg_types():
