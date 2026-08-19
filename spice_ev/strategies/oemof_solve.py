@@ -74,49 +74,9 @@ class OemofSolve(Strategy):
         # self._plan[<type>][<id>][self._oemof_step] and increments it afterwards.
         self._oemof_step = 0
 
-        # Optionally switch off spice_ev's minimum charging power (see the method's docstring).
-        # Done here, so it is guaranteed to happen before the first simulation step. The
-        # config object is kept — step() needs it for the V2G discharge floor.
+        # step() braucht die Config spaeter fuer den V2G-Entladeboden.
         from spice_ev.oemof_model import SystemConfig
         self._oemof_cfg = SystemConfig.from_options(self.oemof_config)
-        self._apply_min_power_override(self._oemof_cfg)
-
-    def _apply_min_power_override(self, config) -> None:
-        """Optionally drop spice_ev's minimum charging power to zero.
-
-        ``clamp_power`` (spice_ev/util.py) sets any charging power below ``cs.min_power`` or
-        ``vehicle_type.min_charging_power`` to ZERO. Other strategies call it to turn a
-        computed power into a command; the oemof model does not know that rule (it would
-        need binary variables) and plans such small powers anyway — e.g. to use a little PV
-        surplus. That energy then silently never reaches the battery.
-
-        NOTE: since ``step()`` applies the planned SOC (``Battery.load(target_soc=...)``)
-        instead of a commanded power, it does NOT call ``clamp_power`` — so on this path the
-        flag currently has no effect. It is kept because it belongs to the scenario, not to
-        the strategy: it stays correct if a power-based command path is ever reintroduced.
-
-        With ``config.ignore_min_charging_power`` both limits are set to 0.
-        ``min_charging_power`` is an optional VehicleType field defaulting to 0.0 anyway, so
-        this is a regular value.
-
-        Stationary batteries (``Battery.min_charging_power``) are deliberately NOT touched:
-        they are not driven by the oemof charging plan.
-
-        Args:
-            config: SystemConfig carrying the ``ignore_min_charging_power`` flag.
-        """
-        if not getattr(config, "ignore_min_charging_power", False):
-            return
-        # VehicleType objects are shared between vehicles of the same type -> covers all types
-        for vehicle in self.world_state.vehicles.values():
-            vehicle.vehicle_type.min_charging_power = 0.0
-        for cs in self.world_state.charging_stations.values():
-            cs.min_power = 0.0
-
-
-###########################################################################
-########## 1) Preprocessing: raw data -> structured DataFrames #########
-############################################################################
 
     def prepare_inputs(self) -> Dict[str, Any]:
         """Run the full preprocessing pipeline and store the result frames.

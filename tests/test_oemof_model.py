@@ -2,11 +2,11 @@
 
 Autor: Alaa Alsleman, GitHub: Alaadin17
 
-Four tests need no solver: they build the EnergySystem (or call a helper) and check the
-per-GC pruning / naming / wiring, that load and PV are grouped per grid connector, and
-that the min-charging-power override works. The remaining three need CBC (they are
-skipped without it) and actually solve: the debug mode, the per-step SOC floor from
-``desired_soc``, and a full ``run()`` including the result dumps.
+Die Tests ohne Solver bauen nur das EnergySystem (oder rufen einen Helfer) und pruefen
+Zuschnitt und Verdrahtung je Netzanschluss, die Zuordnung von Last und PV, die Preisquelle
+und die Typumwandlung der cfg-Werte. Die uebrigen brauchen CBC (ohne ihn werden sie
+uebersprungen) und rechnen wirklich: Debug-Modus, SOC-Boden aus ``desired_soc``,
+PV-Direktzweige, Speicher-Bustrennung und ein vollstaendiger ``run()`` samt Dumps.
 """
 import dataclasses
 import json
@@ -311,38 +311,6 @@ def test_from_options_coerces_cfg_types():
     assert c.solver == "cbc"          # Strings bleiben unangetastet
     # echte JSON-Werte gehen unveraendert durch
     assert SystemConfig.from_options({"oemof_enable_v2h": False}).enable_v2h is False
-
-
-# ---------------------------------------------------------------------------
-# Test 2b — switching spice_ev's minimum charging power off
-# ---------------------------------------------------------------------------
-def _fake_world(min_charging_power=0.2, cs_min_power=0.5):
-    """world_state stand-in with one vehicle type shared by two vehicles."""
-    vtype = SimpleNamespace(min_charging_power=min_charging_power)
-    return SimpleNamespace(
-        vehicles={"v1": SimpleNamespace(vehicle_type=vtype),
-                  "v2": SimpleNamespace(vehicle_type=vtype)},      # same (shared) type object
-        charging_stations={"CS1": SimpleNamespace(min_power=cs_min_power)},
-    )
-
-
-def test_ignore_min_charging_power_clears_both_limits():
-    strat = OemofSolve.__new__(OemofSolve)          # bypass __init__
-    strat.world_state = _fake_world()
-    strat._apply_min_power_override(SystemConfig(ignore_min_charging_power=True))
-
-    assert strat.world_state.vehicles["v1"].vehicle_type.min_charging_power == 0.0
-    assert strat.world_state.vehicles["v2"].vehicle_type.min_charging_power == 0.0
-    assert strat.world_state.charging_stations["CS1"].min_power == 0.0
-
-
-def test_min_charging_power_untouched_by_default():
-    strat = OemofSolve.__new__(OemofSolve)
-    strat.world_state = _fake_world()
-    strat._apply_min_power_override(SystemConfig())   # default: flag off
-
-    assert strat.world_state.vehicles["v1"].vehicle_type.min_charging_power == 0.2
-    assert strat.world_state.charging_stations["CS1"].min_power == 0.5
 
 
 # ---------------------------------------------------------------------------

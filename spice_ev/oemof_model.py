@@ -158,13 +158,6 @@ class SystemConfig:
     prefer_late_charging: bool = False
     late_charging_penalty: float = 0.001   # ct/kWh im ersten Zeitschritt, fallend auf 0
 
-    # Configures SPICE_EV behaviour (not the oemof model): spice_ev's clamp_power() drops any
-    # charging power below cs.min_power / vehicle_type.min_charging_power to ZERO. The LP does
-    # not know that rule and happily plans such small powers (e.g. to use a little PV surplus),
-    # so that energy silently vanishes and the simulated SOC drifts below the planned one.
-    # True -> set both limits to 0 so every planned power is applied. False -> leave as is.
-    ignore_min_charging_power: bool = False
-
     # Tiny anti-degeneracy cost (ct/kWh) on storage charging and V2H feed-back. Without it
     # the LP may cycle energy pointlessly (storage out -> in, or wallbox charge+discharge in
     # the same step) because that changes the objective by exactly zero — the SOC series then
