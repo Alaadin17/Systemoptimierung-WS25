@@ -605,37 +605,6 @@ class OemofSolve(Strategy):
         aligned.index = time_index
         return aligned
 
-    def _aggregate_event_lists(self, event_lists, time_index: pd.DatetimeIndex) -> pd.Series:
-        """
-        Sum several EnergyValuesLists (e.g. multiple PV plants) onto the grid.
-        
-        Args:
-            event_lists: Dict[plant_id, EnergyValuesList] with values and step_duration_s.
-            time_index: target time index for the output (DatetimeIndex).
-        
-        Returns:
-            pd.Series with index=time_index, values = sum of all event_lists (piecewise constant) and 0 outside the event_list times.
-
-        example: if the scenario contains multiple PV plants, we need to sum their outputs onto the simulation time grid.
-        """
-        total = pd.Series(0.0, index=time_index)
-        for ev_list in (event_lists or {}).values():
-            total = total.add(self._sample_event_list(ev_list, time_index), fill_value=0.0)
-        return total
-
-    def _grid_power(self) -> Optional[float]:
-        """
-        Sum of the grid connection powers (max_power) of the grid connectors.
-        Args:
-                world_state.grid_connectors: Dict[connector_id, GridConnector] with possible max_power attributes.
-        Returns:
-                - Float: the sum of max_power across all grid connectors, 
-                - None: if no max_power is defined.
-        """
-        powers = [gc.max_power for gc in self.world_state.grid_connectors.values()
-                  if getattr(gc, "max_power", None)]
-        return float(sum(powers)) if powers else None
-
     def _grid_connectors(self, time_index) -> Dict[str, Dict[str, Any]]:
         """Per grid connector: max_power + its OWN household load and PV timeseries.
 
@@ -806,8 +775,7 @@ class OemofSolve(Strategy):
         Returns a dict with: config (SystemConfig from the oemof_* cfg keys), time_index,
         grid_connectors (per GC: max_power + its own load/pv), charging_stations (max_power
         + parent GC), vehicle_params (capacity/SOC/v2g/efficiency + consumption,
-        connected_cs and min_soc_series), battery_params, plus the legacy timeseries_df and
-        grid_power (kept for standalone use, not read by the model).
+        connected_cs and min_soc_series) und battery_params.
         """
         if not self._prepared:
             raise ValueError("Inputs must be prepared before building Oemof inputs")
@@ -815,14 +783,6 @@ class OemofSolve(Strategy):
         from spice_ev.oemof_model import SystemConfig
 
         config = SystemConfig.from_options(self.oemof_config)
-
-        # Bring global PV/load from the events onto the time grid
-        pv = self._aggregate_event_lists(
-            getattr(self.events, "local_generation_lists", {}), self.time_index)
-        load = self._aggregate_event_lists(
-            getattr(self.events, "fixed_load_lists", {}), self.time_index)
-        timeseries_df = pd.DataFrame(
-            {"PV_kW": pv.to_numpy(), "Load_kW": load.to_numpy()}, index=self.time_index)
 
         # Vehicle master data (capacity/SOC/v2g/discharge_limit) per vehicle
         vehicles_df = self.input_frames["vehicles"].set_index("vehicle_id")
@@ -878,10 +838,8 @@ class OemofSolve(Strategy):
 
         return {
             "config": config,
-            "timeseries_df": timeseries_df,
             "time_index": self.time_index,
             "vehicle_params": vehicle_params,
-            "grid_power": self._grid_power(),
             "grid_connectors": self._grid_connectors(self.time_index),
             "battery_params": self._battery_params(config),
             "charging_stations": charging_stations,
@@ -901,10 +859,8 @@ class OemofSolve(Strategy):
 
         model = EnergySystemModel(
             config=oemof_inputs["config"],
-            timeseries_df=oemof_inputs["timeseries_df"],
             time_index=oemof_inputs["time_index"],
             vehicle_params=oemof_inputs["vehicle_params"],
-            grid_power=oemof_inputs.get("grid_power"),
             grid_connectors=oemof_inputs.get("grid_connectors"),
             battery_params=oemof_inputs.get("battery_params"),
             charging_stations=oemof_inputs.get("charging_stations"),
@@ -1064,5 +1020,3 @@ class OemofSolve(Strategy):
 
         self._oemof_step += 1
         return {"current_time": self.current_time, "commands": commands}
-
-

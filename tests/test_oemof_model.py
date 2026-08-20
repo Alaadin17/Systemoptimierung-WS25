@@ -28,7 +28,6 @@ from spice_ev.strategies.oemof_solve import OemofSolve
 # ---------------------------------------------------------------------------
 def _build_es(m):
     """Run the four build stages (no solver) and return the set of node labels."""
-    m._load_data()
     m._create_time_index()
     m._create_energy_system()
     m._create_components()
@@ -173,7 +172,6 @@ def test_solve_small_model(tmp_path, monkeypatch, caplog):
         vehicle_params={"v1": {"capacity_kWh": 50.0,
                                "connected_cs": ["CS1"] * 4, "consumption": [0, 0, 0, 0]}},
     )
-    m._load_data()
     m._create_time_index()
     m._create_energy_system()
     m._create_components()
@@ -541,7 +539,6 @@ def test_min_soc_series_forces_desired_soc_before_departure():
                                "connected_cs": ["CS1"] * 4 + [None] * 4,
                                "consumption": [0, 0, 0, 0, 4, 4, 4, 4]}},
     )
-    m._load_data()
     m._create_time_index()
     m._create_energy_system()
     m._create_components()
@@ -945,7 +942,6 @@ def test_forbid_simultaneous_storage_is_off_and_lp_stays_an_lp():
     """Default off — and with it off no binary variable is created at all."""
     assert SystemConfig().forbid_simultaneous_storage is False
     m = _split_scenario(_pv_direct_config())
-    m._load_data()
     m._create_time_index()
     m._create_energy_system()
     m._create_components()
