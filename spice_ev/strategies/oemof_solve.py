@@ -681,8 +681,14 @@ class OemofSolve(Strategy):
         ``include_price_csv`` in der generate.cfg macht aus JEDER CSV-Zeile ein solches
         Ereignis. Diese Methode baut daraus die Stufenfunktion zurueck, die spice_ev in jedem
         Schritt als ``gc.cost`` vor sich hat - mit demselben ``util.get_cost``, das auch
-        greedy, balanced und balanced_market benutzen. Preise stehen dort in EUR/kWh, das
-        Modell rechnet in ct/kWh, daher x100.
+        greedy, balanced und balanced_market benutzen.
+
+        Die Werte werden UNVERAENDERT uebernommen, denn spice_ev fuehrt gc.cost in ct/kWh:
+        scenario.py und costs.py teilen beide durch 100, um auf EUR zu kommen, und der
+        Standard-Spaltenname in generate.py heisst "price [ct/kWh]". Die Einheit der CSV ist
+        also ct/kWh - wer dort EUR/kWh eintraegt, rechnet um den Faktor 100 daneben. Die
+        Gegenprobe steht in der erzeugten timeseries.csv, Spalte "price [ct/kWh]": dort muss
+        derselbe Wert stehen wie in grid_price_ct_<GC> im dump_summary.csv.
 
         Kein Preisblatt, kein Tarif-Aufschlag: was hier herauskommt, ist der Wert aus der
         CSV, nicht mehr. Hat das Szenario keine Preissignale (oder ist include_price_csv
@@ -706,7 +712,7 @@ class OemofSolve(Strategy):
             t = pd.Timestamp(s.start_time)
             if t.tzinfo is not None:
                 t = t.tz_localize(None)
-            paare.append((t, float(get_cost(1, s.cost)) * 100.0))   # EUR/kWh -> ct/kWh
+            paare.append((t, float(get_cost(1, s.cost))))          # ct/kWh, wie spice_ev
         ziel = time_index
         if ziel.tz is not None:
             ziel = ziel.tz_localize(None)

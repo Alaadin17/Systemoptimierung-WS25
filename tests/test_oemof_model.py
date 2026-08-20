@@ -228,8 +228,8 @@ def test_prices_come_from_the_config_or_the_scenario_and_nowhere_else():
 def test_strategy_hands_the_model_physics_and_the_scenario_price():
     """Last, PV, Anschlussleistung, kWp - und der Bezugspreis, wenn das Szenario einen hat.
 
-    Aufschlaege gibt es keine mehr: was aus der Preis-CSV kommt, kommt unveraendert an
-    (EUR/kWh x100). Die Einspeiseverguetung bleibt fest in der cfg.
+    Aufschlaege gibt es keine mehr, und auch keine Umrechnung: spice_ev fuehrt gc.cost in
+    ct/kWh, also kommt der CSV-Wert unveraendert an. Die Einspeiseverguetung bleibt fest.
     """
     idx = pd.date_range("2025-01-01", periods=4, freq="15min")
     strat = OemofSolve.__new__(OemofSolve)
@@ -237,7 +237,7 @@ def test_strategy_hands_the_model_physics_and_the_scenario_price():
         fixed_load_lists={"L1": _ev([1, 1, 1, 1], idx[0], "GC1")},
         local_generation_lists={"PV1": _ev([0, 3, 3, 0], idx[0], "GC1")},
         grid_operator_signals=[SimpleNamespace(grid_connector_id="GC1", start_time=idx[0],
-                                               cost={"type": "fixed", "value": 0.30})],
+                                               cost={"type": "fixed", "value": 30.0})],
     )
     strat.world_state = SimpleNamespace(
         grid_connectors={"GC1": SimpleNamespace(max_power=30.0)},
@@ -246,7 +246,7 @@ def test_strategy_hands_the_model_physics_and_the_scenario_price():
     info = strat._grid_connectors(idx)["GC1"]
     assert set(info) == {"load", "pv", "max_power", "pv_power_kW", "price_ct_kWh"}
     assert info["pv_power_kW"] == 10.0
-    assert list(info["price_ct_kWh"]) == [30.0] * 4        # 0.30 EUR/kWh -> 30 ct/kWh
+    assert list(info["price_ct_kWh"]) == [30.0] * 4        # ct/kWh, unveraendert
     # ohne Preissignale bleibt der Schluessel weg -> das Modell nimmt die cfg
     strat.events.grid_operator_signals = []
     assert "price_ct_kWh" not in strat._grid_connectors(idx)["GC1"]
@@ -261,20 +261,21 @@ def test_scenario_price_signals_become_a_step_function():
 
     Ein Signal gilt ab seiner ``start_time`` bis zum naechsten - so wertet spice_ev
     ``gc.cost`` in jedem Schritt aus, und so muss es beim LP ankommen. Geprueft werden die
-    drei Faelle, die in der Praxis schiefgehen: die Einheit (EUR/kWh, nicht ct), fremde
-    Netzanschluesse, und negative Preise.
+    drei Faelle, die in der Praxis schiefgehen: die Einheit (ct/kWh - spice_ev teilt in
+    scenario.py und costs.py durch 100, und generate.py nennt die Spalte per Default
+    "price [ct/kWh]"), fremde Netzanschluesse, und negative Preise.
     """
     idx = pd.date_range("2025-01-01", periods=6, freq="15min")
     strat = OemofSolve.__new__(OemofSolve)
     strat.events = SimpleNamespace(grid_operator_signals=[
         SimpleNamespace(grid_connector_id="GC1", start_time=idx[0],
-                        cost={"type": "fixed", "value": 0.30}),   # EUR/kWh!
+                        cost={"type": "fixed", "value": 30.0}),   # ct/kWh, nicht EUR!
         SimpleNamespace(grid_connector_id="GC1", start_time=idx[2],
-                        cost={"type": "fixed", "value": 0.05}),
+                        cost={"type": "fixed", "value": 5.0}),
         SimpleNamespace(grid_connector_id="GC1", start_time=idx[4],
-                        cost={"type": "fixed", "value": -0.04}),  # negativ -> gekappt
+                        cost={"type": "fixed", "value": -4.0}),   # negativ -> gekappt
         SimpleNamespace(grid_connector_id="GC2", start_time=idx[0],
-                        cost={"type": "fixed", "value": 0.99}),   # anderer GC -> ignoriert
+                        cost={"type": "fixed", "value": 99.0}),   # anderer GC -> ignoriert
     ])
     assert list(strat._grid_price_series("GC1", idx)) == [30.0, 30.0, 5.0, 5.0, 0.0, 0.0]
     assert strat._grid_price_series("GC3", idx) is None       # keine Signale -> cfg-Wert
