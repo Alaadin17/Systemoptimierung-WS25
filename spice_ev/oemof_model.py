@@ -25,9 +25,9 @@ Zwei Entscheidungen, die den Fahrplan mit spice_ev deckungsgleich halten:
 - Wallboxen und Links sind VERLUSTFREI, sie begrenzen nur die Leistung. Ein Verlust dort
   wuerde doppelt zaehlen und den geplanten SOC vom simulierten wegdriften lassen.
 
-Mit ``pv_direct_to_storage`` kommen benannte PV-Zweige dazu (bus_pvac_<n> -> Haus,
-Wallbox, Batterie) und die Speicher bekommen getrennte Zu- und Abflussbusse. Siehe
-``_add_pv`` und ``_add_battery``.
+Mit ``pv_direct_to_storage`` kommen benannte PV-Zweige dazu: bus_pvac_<n> -> Haus und
+bus_pvac_<n> -> Wallbox. Nur der Weg ins FAHRZEUG ist so zurechenbar - der Zweig in die
+Hausbatterie ist bewusst entfernt (siehe ``_add_battery``). Siehe ``_add_pv``.
 
 Eingaben (__init__)
 -------------------
@@ -140,24 +140,24 @@ class SystemConfig:
     # Am Hausbus sind PV-kWh und Netz-kWh nicht mehr unterscheidbar - ein Bonus auf
     # "Home_n -> wallbox_charge" wuerde also auch Netzstrom belohnen und jede Kennzahl
     # "so viel PV ging ins Auto" waere wertlos. Deshalb bekommt die PV hinter dem
-    # Wechselrichter einen eigenen AC-Bus (bus_pvac_<name>), von dem je ein BENANNTER Zweig
-    # direkt zur Wallbox-Klemme und in die Hausbatterie fuehrt. Weil bus_pv_<name> nur von
-    # der fix=-PV-Quelle gespeist wird und keine Kante zurueckfuehrt, kann dort keine
-    # Netz-kWh den Bonus einsammeln - der Anreiz ist strukturell nicht manipulierbar und
-    # die Flusssumme ist eine echte, berichtbare Groesse.
+    # Wechselrichter einen eigenen AC-Bus (bus_pvac_<name>), von dem ein BENANNTER Zweig
+    # direkt zur Wallbox-Klemme fuehrt. Weil bus_pv_<name> nur von der fix=-PV-Quelle
+    # gespeist wird und keine Kante zurueckfuehrt, kann dort keine Netz-kWh den Bonus
+    # einsammeln - der Anreiz ist strukturell nicht manipulierbar.
+    #
+    # Nur zum FAHRZEUG. Den Zweig in die Hausbatterie gab es einmal; er hat den Fahrplan
+    # nachweislich nicht veraendert (example_2 gegen example_3: identische Energie), aber
+    # den Kreislauf ermoeglicht - PV in die Batterie, Bonus kassieren, im selben Schritt
+    # zurueck ins Haus. Ein Fahrzeug ohne V2H kann das nicht.
     # Default AUS: ohne den Schalter ist das Modell unveraendert.
     pv_direct_to_storage: bool = False
     # Bonus in ct/kWh (positiv angeben, landet als NEGATIVE variable_costs im Modell).
-    # Die Aufteilung Auto<->Hausbatterie haengt an der DIFFERENZ der beiden Werte, die
-    # Entscheidung Speichern<->Einspeisen am MAXIMUM. Im Beispielszenario:
-    #   0.01 / 0.01 -> reine MESSUNG: Fahrplan praktisch unveraendert, aber die Zuordnung
-    #                  wird eindeutig (ohne Bonus ist sie entartet und CBC wuerfelt).
-    #   6.0  / 0.0  -> anstupsen, exportneutral (<= Einspeiseverguetung 6.24 ct/kWh).
-    #   8.0  / 0.0  -> kippt die Aufteilung (Differenz > 7.5 ct/kWh), kostet aber echtes Geld.
-    # NUR POSITIVE Boni wirken: ein Malus macht den Direktpfad einfach ungenutzt, die PV
-    # fliesst dann ueber conv_pvac_to_home -> Home_n -> link und umgeht ihn.
+    # Er entscheidet, ob PV lieber ins Auto als in die Einspeisung geht - und taugt als
+    # Tie-Breaker, damit die Zuordnung eindeutig wird (ohne ihn wuerfelt CBC zwischen
+    # gleich teuren Loesungen). Obergrenze siehe unten bei der Kreislauf-Schwelle.
+    # NUR POSITIVE Werte wirken: ein Malus macht den Direktpfad einfach ungenutzt, die PV
+    # fliesst dann ueber conv_pvac_to_home -> Home_n -> Wallbox und umgeht ihn.
     pv_charge_bonus_vehicle_ct_kWh: float = 0.0
-    pv_charge_bonus_battery_ct_kWh: float = 0.0
     # Verbietet einem Speicher, im SELBEN Zeitschritt zu laden und zu entladen. Ohne das
     # kann ein Bonus das LP dazu bringen, PV durch den Speicher ins Haus zu leiten statt
     # direkt - physikalisch erlaubt, aber sinnlos, und die Kennzahl pv_direct_* meldet dann
@@ -433,26 +433,20 @@ class EnergySystemModel:
         # Haus zu leiten statt direkt; dabei gehen (1 - eff^2) der kWh verloren, die sonst
         # eingespeist worden waeren. Lohnend wird das ab
         #     bonus > (1 - eff^2) * |Einspeiseverguetung|
-        # also z. B. 0.0975 * 6.24 = 0.61 ct/kWh - weit UNTER der Verguetung selbst.
-        # Darueber kreist das LP Energie, und pv_direct_* misst dann nicht mehr "PV
-        # gespeichert", sondern "PV hat den Speicherbus beruehrt". In example_1 nachgemessen:
-        # 0.5 ct/kWh = kein einziger Kreislaufschritt, 1.0 ct/kWh = 2478 Schritte und
-        # +403 ct echte Mehrkosten. Betroffen ist nur, wer auch zurueck ins Haus kann - die
-        # Hausbatterie immer, das Fahrzeug nur mit V2H.
+        # also z. B. 0.0975 * 6.24 = 0.61 ct/kWh - weit UNTER der Verguetung selbst. Bei
+        # einer Verguetung von 0 ist die Schwelle 0: dann kreist JEDER positive Bonus.
+        # Betroffen ist nur, wer auch zurueck ins Haus kann. Seit der PV-Zweig zur
+        # Hausbatterie weg ist, ist das nur noch das Fahrzeug mit V2H.
         eff = float(self.config.battery_efficiency)
         cycle_bound = (1.0 - eff ** 2) * abs(feedin_tariff)
-        riskant = {"Hausbatterie": float(self.config.pv_charge_bonus_battery_ct_kWh)}
-        if self.config.enable_v2h:
-            riskant["Fahrzeug (V2H aktiv)"] = float(self.config.pv_charge_bonus_vehicle_ct_kWh)
-        if self.config.pv_direct_to_storage:
-            for wer, bonus in riskant.items():
-                if bonus > cycle_bound:
-                    logging.warning(
-                        "PV-Ladebonus %s %.3f ct/kWh liegt ueber der Kreislauf-Schwelle "
-                        "%.3f ct/kWh ((1-eff^2)*Einspeiseverguetung, %s): das LP kann Energie "
-                        "durch den Speicher zirkulieren, um ihn einzusammeln. pv_direct_* "
-                        "meldet dann MEHR als wirklich gespeichert wird, und "
-                        "objective_ohne_bonus steigt.", wer, bonus, cycle_bound, name)
+        bonus = float(self.config.pv_charge_bonus_vehicle_ct_kWh)
+        if self.config.pv_direct_to_storage and self.config.enable_v2h and bonus > cycle_bound:
+            logging.warning(
+                "PV-Ladebonus Fahrzeug %.3f ct/kWh liegt ueber der Kreislauf-Schwelle "
+                "%.3f ct/kWh ((1-eff^2)*Einspeiseverguetung, %s): mit V2H kann das LP "
+                "Energie durch den Speicher zirkulieren, um ihn einzusammeln. "
+                "pv_direct_wallbox_* meldet dann MEHR als wirklich geladen wird, und "
+                "objective_ohne_bonus steigt.", bonus, cycle_bound, name)
         # grid feed-in sink (export from the home bus; battery/V2G)
         if self.config.enable_grid_feedin:
             self.es.add(cmp.Sink(
@@ -477,7 +471,7 @@ class EnergySystemModel:
         # stationary batteries whose parent is this GC
         for bid, bp in self.battery_params.items():
             if bp.get("parent") == gcid:
-                self._add_battery(bid, bp, b, b_pvac)
+                self._add_battery(bid, bp, b)
         # wallboxes of this GC's used charging stations
         for csid, users in cs_users.items():
             if self.charging_stations[csid].get("parent") == gcid:
@@ -487,8 +481,8 @@ class EnergySystemModel:
         """PV an einem Netzanschluss: PV-Bus, Quelle, Ueberschuss-Senke, Wechselrichter.
 
         Mit ``pv_direct_to_storage`` speist der Wechselrichter nicht mehr direkt ins Haus,
-        sondern auf einen AC-PV-Bus ``bus_pvac_<name>``, von dem benannte Zweige zu Haus,
-        Wallbox und Batterie abgehen. Alles bleibt damit HINTER dem einen Wechselrichter,
+        sondern auf einen AC-PV-Bus ``bus_pvac_<name>``, von dem benannte Zweige zu Haus und
+        Wallbox abgehen. Alles bleibt damit HINTER dem einen Wechselrichter,
         der ``nominal_value = converter_power_kW`` traegt - seine Grenze wirkt also auf die
         SUMME aller PV-Wege, ohne zusaetzliche Nebenbedingung. Nicht akademisch: das
         Jahresprofil von example_1 erreicht 9.77 kW bei 10 kW Nennleistung.
@@ -535,8 +529,15 @@ class EnergySystemModel:
             ))
         return b_pvac
 
-    def _add_battery(self, bid, bp, b_home, b_pvac=None) -> None:
+    def _add_battery(self, bid, bp, b_home) -> None:
         """Eine Hausbatterie: Bus, Speicher, AC/DC-Link. Je Eintrag einmal aufgerufen.
+
+        Erreichbar nur ueber den Link vom Hausbus - einen PV-Direktzweig gibt es hier
+        bewusst nicht mehr. Er haette die PV zwar zurechenbar gemacht, aber am Fahrplan
+        nichts geaendert und im Gegenzug den Kreislauf ermoeglicht: PV in die Batterie,
+        Bonus kassieren, im selben Schritt wieder ins Haus entladen. Fuer das FAHRZEUG
+        gibt es den Zweig weiterhin - ohne V2H kann es nicht zurueckspeisen, dort ist der
+        Bonus also unkritisch.
 
         Der Verlust sitzt IM SPEICHER (inflow/outflow_conversion_factor), genau wie in
         spice_evs ``Battery``: eff beim Laden, eff beim Entladen, Round-Trip eff^2. Der Link
@@ -551,19 +552,12 @@ class EnergySystemModel:
         init = min(max(init, self.config.battery_min_soc), self.config.battery_max_soc)
         efficiency = float(bp.get("efficiency", self.config.battery_efficiency))
 
-        # Normally ONE bus carries both directions. With the PV direct branches the storage
-        # gets a pure INFLOW side (bus_batin) and a pure OUTFLOW side (bus_batout): a PV kWh
-        # arriving on a shared bus could otherwise walk straight back out through the link
-        # into the house — collecting the storage bonus WITHOUT ever being stored. Splitting
-        # makes that pass-through impossible instead of merely expensive, because the only
-        # exit from bus_batin is the storage itself.
-        if self.config.pv_direct_to_storage:
-            b_bat_in = buses.Bus(label=f"bus_batin_{bid}")
-            b_bat_out = buses.Bus(label=f"bus_batout_{bid}")
-            self.es.add(b_bat_in, b_bat_out)
-        else:
-            b_bat_in = b_bat_out = buses.Bus(label=f"bus_battery_{bid}")
-            self.es.add(b_bat_in)
+        # EIN Bus traegt beide Richtungen. Eine Trennung in Zu- und Abflussseite braucht es
+        # nur, wenn ein zweiter Weg IN den Speicher fuehrt, der sich sonst am Speicher vorbei
+        # durch den Link zurueck ins Haus stehlen koennte. Den gab es mit dem PV-Direktzweig
+        # zur Batterie; seit der weg ist, ist der Link der einzige Zugang.
+        b_bat_in = b_bat_out = buses.Bus(label=f"bus_battery_{bid}")
+        self.es.add(b_bat_in)
 
         # lossless DC/AC link between this GC's bus and the battery — it only
         # limits the power; the losses live in the storage below (like spice_ev)
@@ -586,10 +580,7 @@ class EnergySystemModel:
         # the storage carries the losses: eff on charge, eff on discharge (round trip eff²)
         storage = cmp.GenericStorage(
             label=f"home_battery_{bid}",
-            # tiny penalty on BOTH directions kills free storage-cycling degeneracy.
-            # The inflow cap is ALSO the joint power limit for the AC and the PV-direct
-            # path, because both arrive on bus_batin and this is its only exit — that is
-            # what keeps the plan executable for spice_ev's Battery.load(target_soc=...).
+            # tiny penalty on BOTH directions kills free storage-cycling degeneracy
             inputs={b_bat_in: flows.Flow(nominal_value=power,
                                          variable_costs=self.config.storage_cycle_penalty)},
             outputs={b_bat_out: flows.Flow(nominal_value=discharge_power,
@@ -604,26 +595,13 @@ class EnergySystemModel:
             balanced=False,
         )
         self.es.add(storage)
-        # the two storage flows are where "charging" and "discharging" are unambiguous:
-        # every path — AC via the link and PV direct — passes through them
+        # an den beiden Speicherfluessen ist "laden" und "entladen" eindeutig - hier setzt
+        # forbid_simultaneous_storage an, falls es gebraucht wird
         self._storage_pairs.append({
             "label": f"home_battery_{bid}", "storage": storage,
             "in_bus": b_bat_in, "out_bus": b_bat_out,
             "p_in": power, "p_out": discharge_power,
         })
-
-        # PV straight into the battery, bypassing the house bus. The bonus (negative cost)
-        # sits here and nowhere else: bus_pv is fed only by the fix= PV source and has no
-        # edge leading back into it, so no grid kWh can ever collect it.
-        if b_pvac is not None:
-            self.es.add(cmp.Converter(
-                label=f"conv_pv_to_battery_{bid}",
-                inputs={b_pvac: flows.Flow(
-                    nominal_value=power,
-                    variable_costs=-float(self.config.pv_charge_bonus_battery_ct_kWh))},
-                outputs={b_bat_in: flows.Flow()},
-                conversion_factors={b_bat_in: 1.0},
-            ))
 
     def _loss_factor(self) -> float:
         """kWh/step -> kW factor: oemof multiplies fixed_losses_absolute by the step
@@ -633,6 +611,27 @@ class EnergySystemModel:
         else:
             step_hours = 0.25
         return 1.0 / step_hours
+
+    def _pv_direct_erreichbar(self, connected_cs) -> bool:
+        """Kann ueberhaupt ein PV-Direktzweig bei diesem Fahrzeug ankommen?
+
+        Drei Dinge muessen zusammenkommen: der Schalter, ein Wechselrichter ins Haus
+        (ohne ``enable_pv_to_home`` endet die PV in der Einspeisung und es gibt kein
+        ``bus_pvac``), und mindestens ein Netzanschluss MIT PV, an dem das Fahrzeug laedt.
+        Fehlt eines davon, ist die Bustrennung nur ein Knoten ohne Aufgabe.
+        """
+        if not (self.config.pv_direct_to_storage and self.config.enable_pv_to_home):
+            return False
+        periods = self.config.periods
+        # KEIN "connected_cs or []": die Strategie liefert hier ein numpy-Array, und dessen
+        # Wahrheitswert ist mehrdeutig - das wirft, statt eine leere Liste zu ergeben.
+        stationen = [] if connected_cs is None else list(connected_cs)
+        for csid in {c for c in stationen if c is not None}:
+            gcid = (self.charging_stations.get(csid) or {}).get("parent")
+            pv = (self.grid_connectors.get(gcid) or {}).get("pv")
+            if pv is not None and float(np.sum(_as_array(pv, periods))) > 0.0:
+                return True
+        return False
 
     def _add_vehicle(self, vid, params) -> None:
         """Ein Fahrzeug: Mobilitaetsbus + Speicher. Die Wallboxen baut ``_add_wallbox``.
@@ -687,7 +686,10 @@ class EnergySystemModel:
         # house: with V2H the chain wallbox_charge -> bus_mobility -> wallbox_discharge is
         # lossless, so a bonused PV kWh could pass straight through without being stored.
         # Without V2H the storage inflow is the bus's only consumer anyway — no extra bus.
-        if self.config.pv_direct_to_storage and can_discharge:
+        # Die Fahrzeuge entstehen VOR den Netzanschluessen, b_pvac gibt es hier also noch
+        # nicht - _pv_direct_erreichbar prueft stattdessen, ob ueberhaupt ein PV-Zweig zu
+        # diesem Fahrzeug fuehren kann.
+        if self._pv_direct_erreichbar(params.get("connected_cs", [])) and can_discharge:
             b_mob_in = buses.Bus(label=f"bus_mobin_{vid}")
             self.es.add(b_mob_in)
         else:
@@ -986,7 +988,6 @@ class EnergySystemModel:
         # direct branches are built). Keyed like the schedules, so it can be reported and
         # added to the battery plan below.
         pv_to_vehicle = {vid: np.zeros(n) for vid in self.vehicle_params}
-        pv_to_battery: Dict[str, np.ndarray] = {}
         wbin_vid: Dict[str, str] = {}     # wallbox terminal bus label -> vid
         pv_wallbox_nodes = []             # resolved after the loop, once wbin_vid is filled
         for node in self.es.nodes:
@@ -996,10 +997,6 @@ class EnergySystemModel:
                 # the label is csid_vid and cannot be split unambiguously — resolve the
                 # vehicle through the terminal bus instead
                 pv_wallbox_nodes.append(node)
-                continue
-            if node.label.startswith("conv_pv_to_battery_"):
-                bid = node.label[len("conv_pv_to_battery_"):]
-                pv_to_battery[bid] = self._flow(res, list(node.inputs)[0], node, n)
                 continue
             if node.label.startswith("wallbox_charge_"):
                 # source is the GC bus, or the wallbox terminal when the PV branches exist —
@@ -1078,8 +1075,6 @@ class EnergySystemModel:
         if self.config.pv_direct_to_storage:
             for vid, series in pv_to_vehicle.items():
                 summary[f"pv_direct_wallbox_{vid}"] = series
-            for bid, series in pv_to_battery.items():
-                summary[f"pv_direct_battery_{bid}"] = series
 
         # Der Preis, mit dem die Zielfunktion wirklich gerechnet hat - je nach Szenario eine
         # Konstante oder die Stufenfunktion aus der Preis-CSV. So oder so mitgeschrieben,
@@ -1102,10 +1097,8 @@ class EnergySystemModel:
                 capacity = float(self.battery_params.get(bid, {}).get(
                     "capacity_kWh", self.config.battery_capacity_kWh))
                 battery_schedule[bid] = pd.DataFrame({
-                    # charging arrives from the house bus AND, when built, straight from PV;
-                    # both must be counted or the plan silently under-reports the power
-                    "charge_kW": (self._flow(res, home_bus, node, n)
-                                  + pv_to_battery.get(bid, 0.0)),
+                    # der Link vom Hausbus ist der einzige Zugang zur Batterie
+                    "charge_kW": self._flow(res, home_bus, node, n),
                     "discharge_kW": self._flow(res, node, home_bus, n),
                     # SOC (0..1) at the END of the step — the target step() steers to
                     "soc_end": (self._storage_soc_end(res, storage, n, capacity)
@@ -1139,12 +1132,8 @@ class EnergySystemModel:
         self._costs = {"objective": objective}
         if self.config.pv_direct_to_storage:
             step_hours = 1.0 / self._loss_factor()
-            bonus_ct = -(
-                float(self.config.pv_charge_bonus_vehicle_ct_kWh)
-                * float(sum(np.sum(s) for s in pv_to_vehicle.values()))
-                + float(self.config.pv_charge_bonus_battery_ct_kWh)
-                * float(sum(np.sum(s) for s in pv_to_battery.values()))
-            ) * step_hours
+            bonus_ct = -(float(self.config.pv_charge_bonus_vehicle_ct_kWh)
+                         * float(sum(np.sum(s) for s in pv_to_vehicle.values()))) * step_hours
             self._costs["pv_bonus_ct"] = bonus_ct          # contribution to the objective (<= 0)
             self._costs["objective_ohne_bonus"] = objective - bonus_ct
 
@@ -1209,7 +1198,7 @@ class EnergySystemModel:
         }
 
         def kind(n):
-            if str(n.label).startswith(("conv_pv_to_wallbox_", "conv_pv_to_battery_")):
+            if str(n.label).startswith("conv_pv_to_wallbox_"):
                 return "pv_direct"
             if isinstance(n, buses.Bus):
                 return "bus"

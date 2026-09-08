@@ -658,35 +658,74 @@ def _split_scenario(config):
 
 @pytest.mark.parametrize("v2h", [False, True])
 def test_storage_bus_split_builds_the_expected_nodes(v2h):
-    """pv_direct_to_storage splits each storage into a pure inflow and outflow side.
+    """Nur das FAHRZEUG bekommt getrennte Zu- und Abflussbusse, und nur mit V2H.
 
-    The vehicle only needs it when V2H exists — without a way back into the house the
-    mobility bus has the storage as its only consumer and cannot be passed through.
+    Die Trennung verhindert, dass eine bonusberechtigte PV-kWh durch den Speicher
+    hindurchrutscht, statt gespeichert zu werden. Sie braucht also zweierlei: einen
+    PV-Direktzweig, der ankommt, UND einen Weg zurueck ins Haus. Ohne V2H ist der Speicher
+    der einzige Abnehmer des Mobilitaetsbusses, da geht nichts hindurch.
+
+    Die Hausbatterie hat beides nicht mehr: ihr PV-Direktzweig ist entfernt, der Link vom
+    Hausbus ist ihr einziger Zugang. Sie behaelt deshalb immer den gemeinsamen Bus.
     """
     off = _split_scenario(SystemConfig(debug=False, enable_v2h=v2h))
     on = _split_scenario(SystemConfig(debug=False, enable_v2h=v2h, pv_direct_to_storage=True))
     labels_off, labels_on = _build_es(off), _build_es(on)
 
-    assert "bus_battery_BAT1" in labels_off
-    assert {"bus_batin_BAT1", "bus_batout_BAT1"} & labels_off == set()
-    assert {"bus_batin_BAT1", "bus_batout_BAT1"} <= labels_on
-    assert "bus_battery_BAT1" not in labels_on
-    # the vehicle bus is split only when there is a V2H path back into the house
+    # die Batterie haengt in beiden Faellen an einem gemeinsamen Bus
+    for labels in (labels_off, labels_on):
+        assert "bus_battery_BAT1" in labels
+        assert {"bus_batin_BAT1", "bus_batout_BAT1", "conv_pv_to_battery_BAT1"} & labels == set()
+
+    # der Fahrzeugbus wird nur getrennt, wenn es einen V2H-Rueckweg gibt
     assert "bus_mobin_v1" not in labels_off
     assert ("bus_mobin_v1" in labels_on) is v2h
 
-    # wiring: charging arrives on the inflow side, discharging leaves from the outflow side
     n = _nodes(on)
     storage = n["home_battery_BAT1"]
-    assert list(storage.inputs)[0].label == "bus_batin_BAT1"
-    assert list(storage.outputs)[0].label == "bus_batout_BAT1"
+    assert list(storage.inputs)[0].label == "bus_battery_BAT1"
+    assert list(storage.outputs)[0].label == "bus_battery_BAT1"
     assert list(n["wallbox_charge_CS1_v1"].outputs)[0].label == \
         ("bus_mobin_v1" if v2h else "bus_mobility_v1")
     if v2h:
-        # V2H still feeds back from the OUTflow side, so no pass-through exists
+        # V2H speist weiterhin von der ABflussseite zurueck, ein Durchgang existiert nicht
         assert list(n["wallbox_discharge_CS1_v1"].inputs)[0].label == "bus_mobility_v1"
         assert list(n["bev_battery_v1"].inputs)[0].label == "bus_mobin_v1"
         assert list(n["bev_battery_v1"].outputs)[0].label == "bus_mobility_v1"
+
+
+@pytest.mark.parametrize("v2h", [False, True])
+def test_pv_direct_needs_a_branch_that_can_actually_arrive(v2h):
+    """Ohne erreichbaren PV-Zweig entsteht auch keine Bustrennung.
+
+    Die Trennung existiert nur, damit eine bonusberechtigte PV-kWh nicht durch den Speicher
+    hindurchrutschen kann. Gibt es gar keinen PV-Direktzweig, hat der Speicher ohnehin nur
+    den Link als Zugang - die getrennten Busse waeren dann Knoten ohne Aufgabe.
+
+    Zwei Wege, wie der Zweig ausfaellt, obwohl der Schalter an ist: kein Wechselrichter ins
+    Haus (dann endet die PV in der Einspeisung und es gibt kein bus_pvac), oder schlicht
+    keine PV am Netzanschluss.
+    """
+    ohne_wr = _build_es(_split_scenario(SystemConfig(
+        debug=False, enable_v2h=v2h, pv_direct_to_storage=True, enable_pv_to_home=False)))
+    # kein Wechselrichter -> kein Zweig UND keine Trennung
+    assert {"bus_pvac_Home_1", "conv_pv_to_wallbox_CS1_v1",
+            "bus_wbin_CS1_v1", "bus_mobin_v1"} & ohne_wr == set()
+    assert "excess_Home_1" in ohne_wr             # die PV speist weiterhin ein
+
+    # dasselbe Bild, wenn der Netzanschluss gar keine PV hat
+    ohne_pv = _split_scenario(SystemConfig(debug=False, enable_v2h=v2h,
+                                           pv_direct_to_storage=True))
+    ohne_pv.grid_connectors["GC1"]["pv"] = [0] * 8
+    labels = _build_es(ohne_pv)
+    assert {"bus_pvac_Home_1", "bus_mobin_v1"} & labels == set()
+
+    # connected_cs kommt aus der Strategie als numpy-ARRAY, nicht als Liste. Ein "or []"
+    # darauf wirft (mehrdeutiger Wahrheitswert) - der Lauf brach damit ab, waehrend die
+    # Tests mit ihren Listen gruen blieben. Deshalb hier beide Formen.
+    m = _split_scenario(SystemConfig(debug=False, pv_direct_to_storage=True))
+    for form in (["CS1", None], np.array(["CS1", None], dtype=object), None, []):
+        assert m._pv_direct_erreichbar(form) is (form is not None and len(form) > 0)
 
 
 @pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
@@ -700,11 +739,10 @@ def test_storage_bus_split_is_cost_neutral(v2h):
     would test CBC's pivoting, not the model. What the physics does pin down is how much
     energy has to flow in total and where the storages end up, and that must not change.
 
-    Net power, never charge and discharge separately: the split also removes the degenerate
-    cycles the shared bus allows (``Home -> link -> bus_battery -> link -> Home``, and
-    charge+discharge in the same step with V2H). Those are lossless, so the solver may or
-    may not include them — they inflate both directions equally and cancel in the net.
-    Removing them is the point of the split, not a side effect.
+    Net power, never charge and discharge separately: the vehicle's split removes the
+    degenerate charge+discharge-in-one-step that V2H allows. Those cycles are lossless, so
+    the solver may or may not include them — they inflate both directions equally and cancel
+    in the net. Removing them is the point of the split, not a side effect.
     """
     off = _split_scenario(SystemConfig(debug=False, enable_v2h=v2h, should_dump_results=False))
     on = _split_scenario(SystemConfig(debug=False, enable_v2h=v2h, should_dump_results=False,
@@ -726,8 +764,7 @@ def test_storage_bus_split_is_cost_neutral(v2h):
         assert off._summary_df[spalte].sum() == pytest.approx(
             on._summary_df[spalte].sum(), abs=1e-6), spalte
 
-    # and the split really does forbid the pointless cycling: never both directions at once
-    assert (np.minimum(bat_on["charge_kW"], bat_on["discharge_kW"]) < 1e-6).all()
+    # und die Trennung verbietet das sinnlose Kreisen des Fahrzeugs wirklich
     sched_on = on.get_wallbox_schedule()["v1"]
     assert (np.minimum(sched_on["charge_kW"], sched_on["discharge_kW"]) < 1e-6).all()
 
@@ -741,19 +778,21 @@ def _pv_direct_config(**kw):
 
 
 def test_pv_direct_branch_wiring():
-    """The branches start at the PV-AC bus and end on the storages' inflow sides."""
+    """Der Zweig beginnt am PV-AC-Bus und endet an der Wallbox-Klemme.
+
+    Zur Hausbatterie fuehrt bewusst KEIN Zweig mehr - sie haengt allein am Link vom Hausbus.
+    """
     m = _split_scenario(_pv_direct_config())
     labels = _build_es(m)
     assert {"bus_pvac_Home_1", "conv_pvac_to_home_Home_1",
-            "conv_pv_to_wallbox_CS1_v1", "conv_pv_to_battery_BAT1",
-            "bus_wbin_CS1_v1"} <= labels
+            "conv_pv_to_wallbox_CS1_v1", "bus_wbin_CS1_v1"} <= labels
+    assert "conv_pv_to_battery_BAT1" not in labels
     n = _nodes(m)
     # the inverter rating sits on the ONE converter everything hangs behind
     pv_conv = n["converter_pv_to_home_Home_1"]
     assert list(pv_conv.inputs.values())[0].nominal_value == 10.0
     assert list(pv_conv.outputs)[0].label == "bus_pvac_Home_1"
-    for lbl in ("conv_pvac_to_home_Home_1", "conv_pv_to_wallbox_CS1_v1",
-                "conv_pv_to_battery_BAT1"):
+    for lbl in ("conv_pvac_to_home_Home_1", "conv_pv_to_wallbox_CS1_v1"):
         assert list(n[lbl].inputs)[0].label == "bus_pvac_Home_1"
     # both wallbox paths meet on the terminal, whose only exit carries the station rating
     assert list(n["conv_home_to_wallbox_CS1_v1"].outputs)[0].label == "bus_wbin_CS1_v1"
@@ -761,17 +800,16 @@ def test_pv_direct_branch_wiring():
     wb = n["wallbox_charge_CS1_v1"]
     assert list(wb.inputs)[0].label == "bus_wbin_CS1_v1"
     assert list(wb.inputs.values())[0].nominal_value == 11.0
-    # PV into the battery lands on the inflow side, never on the shared/outflow bus
-    assert list(n["conv_pv_to_battery_BAT1"].outputs)[0].label == "bus_batin_BAT1"
+    # die Batterie erreicht man nur ueber den Link, ihr Bus traegt beide Richtungen
+    link = n["link_home_battery_BAT1"]
+    assert {b.label for b in link.inputs} == {"Home_1", "bus_battery_BAT1"}
 
 
 def test_pv_direct_branches_carry_the_bonus_as_negative_cost():
-    m = _split_scenario(_pv_direct_config(pv_charge_bonus_vehicle_ct_kWh=8.0,
-                                          pv_charge_bonus_battery_ct_kWh=2.0))
+    m = _split_scenario(_pv_direct_config(pv_charge_bonus_vehicle_ct_kWh=8.0))
     _build_es(m)
     n = _nodes(m)
     assert float(list(n["conv_pv_to_wallbox_CS1_v1"].inputs.values())[0].variable_costs[0]) == -8.0
-    assert float(list(n["conv_pv_to_battery_BAT1"].inputs.values())[0].variable_costs[0]) == -2.0
     # the plain household branch stays free, and the grid path keeps the late-charging ramp
     assert float(list(n["conv_pvac_to_home_Home_1"].inputs.values())[0].variable_costs[0]) == 0.0
 
@@ -792,7 +830,7 @@ def test_pv_direct_skipped_without_pv():
     assert list(_nodes(m)["wallbox_charge_CS1_v1"].inputs)[0].label == "Home_1"
 
 
-def _pv_rich_scenario(config, pv_power_kW=10.0, pv=(0, 0, 20, 20, 20, 20, 0, 0)):
+def _pv_rich_scenario(config, pv_power_kW=10.0, pv=(0, 0, 20, 20, 20, 20, 0, 0), v2g=False):
     """PV surplus with the car plugged in the whole time — the situation the bonus targets.
 
     The household load must be big enough that the grid is actually needed: with a small
@@ -811,6 +849,7 @@ def _pv_rich_scenario(config, pv_power_kW=10.0, pv=(0, 0, 20, 20, 20, 20, 0, 0))
         charging_stations={"CS1": {"max_power": 11.0, "parent": "GC1"}},
         battery_params={"BAT1": {"capacity_kWh": 20.0, "power_kW": 5.0, "parent": "GC1"}},
         vehicle_params={"v1": {"capacity_kWh": 80.0, "initial_soc": 0.2, "min_soc": 0.1,
+                               "v2g": v2g, "discharge_limit": 0.1,
                                "connected_cs": ["CS1"] * 8, "consumption": [0] * 8}},
     )
 
@@ -844,53 +883,48 @@ def test_pv_direct_respects_the_station_rating():
 
 @pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
 def test_pv_direct_respects_the_inverter_rating():
-    """All three PV destinations together stay within the inverter rating."""
-    m = _pv_rich_scenario(_pv_direct_config(pv_charge_bonus_vehicle_ct_kWh=100.0,
-                                            pv_charge_bonus_battery_ct_kWh=100.0),
+    """Beide PV-Ziele zusammen bleiben unter der Wechselrichterleistung."""
+    m = _pv_rich_scenario(_pv_direct_config(pv_charge_bonus_vehicle_ct_kWh=100.0),
                           pv_power_kW=6.0, pv=(30,) * 8)
     m.run()
     s = m._summary_df
-    total = (s["pv_to_home_Home_1"] + s["pv_direct_wallbox_v1"]
-             + s["pv_direct_battery_BAT1"]).to_numpy()
+    total = (s["pv_to_home_Home_1"] + s["pv_direct_wallbox_v1"]).to_numpy()
     assert np.all(total <= 6.0 + 1e-6)
     assert total.max() == pytest.approx(6.0, abs=1e-6)        # and it is actually binding
 
 
 @pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
-def test_pv_direct_cannot_bypass_the_battery():
-    """Everything that reaches the battery bus goes INTO the storage — no pass-through.
+def test_battery_is_reachable_only_through_the_link():
+    """Die Batterie hat genau einen Zugang - den Link vom Hausbus.
 
-    Without the inflow/outflow split a bonused PV kWh could enter bus_battery, walk straight
-    back out through the link into the house and collect the bonus without ever being
-    stored. Here the storage inflow is the only exit, so the two arrivals must add up to it
-    exactly. This assertion is the reason the split exists.
+    Deshalb braucht sie keine getrennten Busse: was hineingeht, kann nur ueber denselben
+    Link wieder heraus, und der geplante charge_kW ist genau dieser eine Fluss. Frueher gab
+    es hier einen PV-Direktzweig; er machte die PV zurechenbar, ermoeglichte aber das
+    Kreisen (PV hinein, Bonus, im selben Schritt wieder ins Haus).
     """
-    m = _pv_rich_scenario(_pv_direct_config(pv_charge_bonus_battery_ct_kWh=100.0))
+    m = _pv_rich_scenario(_pv_direct_config(pv_charge_bonus_vehicle_ct_kWh=1.0))
     m.run()
-    pv_in = _flow_between(m, "bus_pvac_Home_1", "conv_pv_to_battery_BAT1")
+    speicher = _nodes(m)["home_battery_BAT1"]
+    assert {b.label for b in speicher.inputs} == {"bus_battery_BAT1"}
     link_in = _flow_between(m, "Home_1", "link_home_battery_BAT1")
-    storage_in = _flow_between(m, "bus_batin_BAT1", "home_battery_BAT1")
-    assert np.allclose(pv_in + link_in, storage_in, atol=1e-6)
+    storage_in = _flow_between(m, "bus_battery_BAT1", "home_battery_BAT1")
+    assert np.allclose(link_in, storage_in, atol=1e-6)
     assert np.all(storage_in <= 5.0 + 1e-6)                   # the battery's power limit
-    assert pv_in.sum() > 0                                    # the branch is actually used
+    assert np.allclose(m.get_plan()["batteries"]["BAT1"]["charge_kW"], link_in, atol=1e-6)
 
 
 @pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
 def test_pv_direct_energy_balance_and_reporting():
-    """Generation splits exactly into export + the three self-use branches."""
-    m = _pv_rich_scenario(_pv_direct_config(pv_charge_bonus_vehicle_ct_kWh=1.0,
-                                            pv_charge_bonus_battery_ct_kWh=1.0))
+    """Die Erzeugung teilt sich exakt in Export und die beiden Eigenverbrauchszweige."""
+    m = _pv_rich_scenario(_pv_direct_config(pv_charge_bonus_vehicle_ct_kWh=1.0))
     m.run()
     s = m._summary_df
-    branches = (s["pv_to_home_Home_1"] + s["pv_direct_wallbox_v1"]
-                + s["pv_direct_battery_BAT1"])
+    branches = s["pv_to_home_Home_1"] + s["pv_direct_wallbox_v1"]
     assert np.allclose(s["pv_selfuse_Home_1"], branches, atol=1e-6)
     assert np.allclose(s["pv_Home_1"] - s["pv_feedin_Home_1"], s["pv_selfuse_Home_1"], atol=1e-6)
-    # the battery plan must count the direct inflow too, or the CSV under-reports the power
+    assert "pv_direct_battery_BAT1" not in s.columns
     assert np.allclose(m.get_plan()["batteries"]["BAT1"]["charge_kW"],
                        s["battery_charge_BAT1"], atol=1e-6)
-    assert np.allclose(s["battery_charge_BAT1"],
-                       _flow_between(m, "bus_batin_BAT1", "home_battery_BAT1"), atol=1e-6)
 
 
 @pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
@@ -915,27 +949,32 @@ def test_pv_direct_bonus_moves_pv_into_the_car():
 
 @pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
 def test_forbid_simultaneous_storage_stops_the_circulation():
-    """The binary "charge XOR discharge" removes the circulation a large bonus induces.
+    """Die Binaervariable "laden XOR entladen" beendet das Kreisen, das ein Bonus ausloest.
 
-    Without it a bonus above (1 - eff^2) * feed-in tariff makes it profitable to route PV
-    *through* the storage into the house: every single flow is legal, together they only
-    burn the round-trip efficiency while collecting the full bonus. That is an
-    either/or statement, which a pure LP cannot express — hence one binary per storage and
-    step. This test pins both halves: the circulation exists, and the switch removes it.
+    Ohne sie lohnt es sich ab bonus > (1 - eff^2) * Einspeiseverguetung, die PV *durch* den
+    Speicher ins Haus zu leiten: jeder Fluss fuer sich ist erlaubt, zusammen kostet es nur
+    den Round-Trip, waehrend der Bonus voll kassiert wird. Das ist eine Entweder-oder-Aussage,
+    die ein reines LP nicht ausdruecken kann.
+
+    Betroffen ist nur, wer zurueck ins Haus kann - seit der Batteriezweig weg ist, also das
+    FAHRZEUG mit V2G und aktivem enable_v2h.
     """
-    frei = _pv_rich_scenario(_pv_direct_config(pv_charge_bonus_battery_ct_kWh=100.0))
-    fest = _pv_rich_scenario(_pv_direct_config(pv_charge_bonus_battery_ct_kWh=100.0,
-                                               forbid_simultaneous_storage=True))
+    frei = _pv_rich_scenario(_pv_direct_config(pv_charge_bonus_vehicle_ct_kWh=100.0,
+                                               enable_v2h=True), v2g=True)
+    fest = _pv_rich_scenario(_pv_direct_config(pv_charge_bonus_vehicle_ct_kWh=100.0,
+                                               enable_v2h=True,
+                                               forbid_simultaneous_storage=True), v2g=True)
     frei.run()
     fest.run()
-    b_frei = frei.get_plan()["batteries"]["BAT1"]
-    b_fest = fest.get_plan()["batteries"]["BAT1"]
-    assert np.minimum(b_frei["charge_kW"], b_frei["discharge_kW"]).max() > 1e-6
-    assert np.minimum(b_fest["charge_kW"], b_fest["discharge_kW"]).max() < 1e-6
-    # and the reported PV-into-storage now really is stored: no more than the SOC can hold
-    soc = fest._summary_df["home_battery_BAT1_soc_kWh"].to_numpy()
+    s_frei = frei.get_wallbox_schedule()["v1"]
+    s_fest = fest.get_wallbox_schedule()["v1"]
+    assert np.minimum(s_frei["charge_kW"], s_frei["discharge_kW"]).max() > 1e-6
+    assert np.minimum(s_fest["charge_kW"], s_fest["discharge_kW"]).max() < 1e-6
+    # und die gemeldete PV ins Auto ist jetzt wirklich geladen: nicht mehr, als der SOC haelt
+    soc = fest._summary_df["bev_battery_v1_soc_kWh"].to_numpy() \
+        if "bev_battery_v1_soc_kWh" in fest._summary_df else s_fest["soc_kWh"].to_numpy()
     gespeichert = np.maximum(np.diff(soc, prepend=soc[0]), 0.0).sum()
-    assert fest._summary_df["pv_direct_battery_BAT1"].sum() * 0.25 <= gespeichert / 0.95 + 1e-6
+    assert fest._summary_df["pv_direct_wallbox_v1"].sum() * 0.25 <= gespeichert / 0.95 + 1e-6
 
 
 def test_forbid_simultaneous_storage_is_off_and_lp_stays_an_lp():
@@ -953,21 +992,19 @@ def test_forbid_simultaneous_storage_is_off_and_lp_stays_an_lp():
 
 @pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
 def test_pv_direct_malus_has_no_effect():
-    """Only POSITIVE bonuses act: a malus just leaves the direct branch unused.
+    """Nur POSITIVE Boni wirken - ein Malus laesst den Direktzweig einfach ungenutzt.
 
-    The branch is optional — with a penalty on it the LP simply routes the PV the long way
-    round (conv_pvac_to_home -> Home_1 -> link) and reaches the same battery at the same
-    cost. Worth pinning down, because it means one cannot make the car win by punishing the
-    house battery; the car's bonus has to carry the whole difference.
+    Der Zweig ist optional: mit einem Aufschlag darauf nimmt das LP schlicht den langen Weg
+    (conv_pvac_to_home -> Home_1 -> Wallbox) und erreicht dasselbe Auto zum selben Preis.
     """
     neutral = _pv_rich_scenario(_pv_direct_config())
-    bonus = _pv_rich_scenario(_pv_direct_config(pv_charge_bonus_battery_ct_kWh=1.0))
-    malus = _pv_rich_scenario(_pv_direct_config(pv_charge_bonus_battery_ct_kWh=-5.0))
+    bonus = _pv_rich_scenario(_pv_direct_config(pv_charge_bonus_vehicle_ct_kWh=1.0))
+    malus = _pv_rich_scenario(_pv_direct_config(pv_charge_bonus_vehicle_ct_kWh=-5.0))
     for m in (neutral, bonus, malus):
         m.run()
-    # a positive bonus DOES pull PV onto the direct branch — without this the test below
-    # would pass vacuously
-    assert bonus._summary_df["pv_direct_battery_BAT1"].sum() > 0
-    # the malus leaves it completely unused and costs exactly nothing
-    assert malus._summary_df["pv_direct_battery_BAT1"].sum() == pytest.approx(0.0, abs=1e-6)
+    # ein positiver Bonus zieht die PV WIRKLICH auf den Direktzweig - ohne diese Zeile
+    # ginge die naechste leer durch
+    assert bonus._summary_df["pv_direct_wallbox_v1"].sum() > 0
+    # der Malus laesst ihn voellig ungenutzt und kostet exakt nichts
+    assert malus._summary_df["pv_direct_wallbox_v1"].sum() == pytest.approx(0.0, abs=1e-6)
     assert malus._costs["objective"] == pytest.approx(neutral._costs["objective"], abs=1e-6)
