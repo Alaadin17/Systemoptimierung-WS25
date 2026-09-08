@@ -76,13 +76,14 @@ class SystemConfig:
     periods: int = 96  # 15-minute steps (96 = 1 day for debug)
     freq: str = "15min"
 
-    # Feature toggles (force a component off even if its data is present)
-    enable_pv: bool = True
-    enable_pv_to_home: bool = True  # build the PV->home converter (else PV only feeds in)
-    enable_battery: bool = True
-    enable_grid_feedin: bool = True  # allow home/BEV surplus to be exported to the grid
-    # (there is deliberately no enable_vehicles: _create_components builds a bus + BEV
-    #  storage for every entry in vehicle_params, so the switch would have been a lie)
+    # Schalter fuer Wege, die das Szenario nicht ausdruecken kann. Was es ausdruecken KANN -
+    # ob ein Netzanschluss PV hat, ob eine Batterie existiert, ob es Fahrzeuge gibt - wird
+    # nicht doppelt geschaltet: PV und Speicher entstehen genau dann, wenn das Szenario sie
+    # mitbringt. (Frueher gab es dafuer enable_pv und enable_battery; sie standen immer auf
+    # true und haben die Szenario-Information nur wiederholt.)
+    enable_pv_to_home: bool = True    # ohne den Wechselrichter kann PV NUR einspeisen -
+    #                                   das ist im Szenario nicht darstellbar
+    enable_grid_feedin: bool = True   # Export vom Hausbus (Batterie/V2G) erlauben
 
     # System parameters
     grid_supply_power_kW: float = 30.0
@@ -392,8 +393,8 @@ class EnergySystemModel:
         self._gc_bus = {}
         n = 0
         for gcid, gc in self.grid_connectors.items():
-            has_pv = self.config.enable_pv and nonzero(gc.get("pv"))
-            has_bat = self.config.enable_battery and gc_has_battery(gcid)
+            has_pv = nonzero(gc.get("pv"))
+            has_bat = gc_has_battery(gcid)
             if not (gc_used_cs(gcid) or nonzero(gc.get("load")) or has_pv or has_bat):
                 continue  # GC carries nothing -> exclude it entirely
             n += 1
@@ -469,15 +470,14 @@ class EnergySystemModel:
         # Built FIRST so the batteries and wallboxes below can branch off its AC bus.
         b_pvac = None
         pv = gc.get("pv")
-        if self.config.enable_pv and pv is not None and float(np.sum(_as_array(pv, periods))) > 0.0:
+        if pv is not None and float(np.sum(_as_array(pv, periods))) > 0.0:
             b_pvac = self._add_pv(
                 b, name, _as_array(pv, periods), feedin_tariff,
                 float(gc.get("pv_power_kW", self.config.converter_pv_to_home_power_kW)))
         # stationary batteries whose parent is this GC
-        if self.config.enable_battery:
-            for bid, bp in self.battery_params.items():
-                if bp.get("parent") == gcid:
-                    self._add_battery(bid, bp, b, b_pvac)
+        for bid, bp in self.battery_params.items():
+            if bp.get("parent") == gcid:
+                self._add_battery(bid, bp, b, b_pvac)
         # wallboxes of this GC's used charging stations
         for csid, users in cs_users.items():
             if self.charging_stations[csid].get("parent") == gcid:
