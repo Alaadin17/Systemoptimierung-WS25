@@ -817,6 +817,15 @@ class OemofSolve(Strategy):
             veh = self.world_state.vehicles.get(vid)
             eff = float(getattr(getattr(veh, "battery", None), "efficiency", 0.95) or 0.95)
 
+            # V2G entlaedt NICHT mit der Ladeleistung: spice_ev skaliert die Ladekurve mit
+            # vehicle_type.v2g_power_factor (Default 0.5) zur discharge_curve, und
+            # Battery.unload begrenzt darauf. Ohne diesen Wert plant das LP bis zur vollen
+            # Stationsleistung, die Simulation liefert die Haelfte, und der geplante SOC
+            # laeuft weg - in example_5 waren das 5.27 kW Abweichung je Schritt.
+            entladeleistung = getattr(
+                getattr(getattr(veh, "battery", None), "unloading_curve", None),
+                "max_power", None)
+
             vehicle_params[vid] = {
                 "capacity_kWh": capacity,
                 "min_soc": config.bev_min_soc,
@@ -828,6 +837,8 @@ class OemofSolve(Strategy):
                 "connected_cs": connected_cs,
                 "min_soc_series": self._min_soc_series(ts, config),
                 "efficiency": eff,   # spice_ev Battery.efficiency -> storage in/outflow
+                "discharge_power_kW": (float(entladeleistung)
+                                       if entladeleistung is not None else None),
             }
 
         # Charging stations (one wallbox per CS in the oemof model): power + parent GC

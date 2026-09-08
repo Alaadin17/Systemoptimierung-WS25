@@ -658,6 +658,11 @@ class EnergySystemModel:
         # discharge possible only if v2g and globally enabled; then raise the SOC floor
         # to discharge_limit so V2H/V2G cannot drain below it (Option A).
         can_discharge = self.config.enable_v2h and v2g
+        # V2G entlaedt mit der discharge_curve, die spice_ev aus der Ladekurve mal
+        # v2g_power_factor bildet - typisch die Haelfte. Ohne diese Grenze plant das LP mit
+        # der vollen Stationsleistung und der geplante SOC laeuft vom simulierten weg.
+        p_entladen = params.get("discharge_power_kW")
+        p_entladen = float(p_entladen) if p_entladen else None
         discharge_limit = float(params.get("discharge_limit", self.config.bev_discharge_limit))
         floor = max(min_soc, discharge_limit) if can_discharge else min_soc
 
@@ -726,20 +731,23 @@ class EnergySystemModel:
             # Only a V2H vehicle can charge and discharge at once. Its storage inflow has no
             # nominal_value of its own (the wallbox limits it), so the big-M comes from the
             # strongest station this vehicle ever plugs into.
-            used = {c for c in params.get("connected_cs", []) or [] if c}
+            # kein "or []": connected_cs ist ein numpy-Array, dessen Wahrheitswert wirft
+            angeschlossen = params.get("connected_cs")
+            used = {c for c in ([] if angeschlossen is None else list(angeschlossen)) if c}
             p_in = max((float(self.charging_stations.get(c, {}).get(
                 "max_power", self.config.wallbox_power_kW)) for c in used),
                 default=self.config.wallbox_power_kW)
             self._storage_pairs.append({
                 "label": f"bev_battery_{vid}", "storage": bev,
                 "in_bus": b_mob_in, "out_bus": b_mobility,
-                "p_in": p_in, "p_out": p_in,
+                "p_in": p_in, "p_out": min(p_in, p_entladen or p_in),
             })
 
         self._vehicle_nodes[vid] = {
             "bus": b_mobility,      # V2H feed-back leaves from here
             "bus_in": b_mob_in,     # wallbox charging arrives here (same bus unless split)
             "can_discharge": can_discharge,
+            "p_discharge": p_entladen,   # None = nur die Stationsleistung begrenzt
             "connected_cs": list(params.get("connected_cs", [])),
         }
 
@@ -804,13 +812,18 @@ class EnergySystemModel:
             )
             self.es.add(wb_charge)
             if node["can_discharge"]:
+                # Die Entladeleistung ist NICHT die Ladeleistung: spice_ev begrenzt sie auf
+                # die discharge_curve (Ladekurve mal v2g_power_factor). Wer hier die volle
+                # Stationsleistung zulaesst, plant mehr Rueckspeisung, als die Simulation
+                # liefern kann - der SOC laeuft dann auseinander.
+                p_ab = min(power, node["p_discharge"]) if node["p_discharge"] else power
                 wb_discharge = cmp.Converter(
                     label=f"wallbox_discharge_{csid}_{vid}",
                     inputs={b_mob: flows.Flow()},
                     # the tiny penalty also prevents simultaneous charge+discharge (a free
                     # cycle through the two lossless wallbox converters)
                     outputs={gc_bus: flows.Flow(
-                        max=mask, nominal_value=power,
+                        max=mask, nominal_value=p_ab,
                         variable_costs=self.config.storage_cycle_penalty)},
                     conversion_factors={gc_bus: self.config.wallbox_efficiency_discharge},
                 )
