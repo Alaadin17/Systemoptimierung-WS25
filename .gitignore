@@ -25,4 +25,3 @@ systemoptimierung/examples/**/generate.homeoffice.cfg
 /results/
 # das Test-Notebook vorerst nicht tracken
 systemoptimierung/examples/**/test_run.ipynb
-examples/configs/generate_from_statistics.cfg
