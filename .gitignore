@@ -14,14 +14,22 @@ scenarios/
 # systemoptimierung/: track ONLY examples/, ignore everything else
 systemoptimierung/*
 !systemoptimierung/examples/
-# abgeleitete Notebook-Artefakte (Vorlage + Overrides) — nicht committen
+# derived notebook artefacts (template + overrides)
 systemoptimierung/examples/**/*.effective.cfg
-# Bonus-Sweep / Variantenlaeufe der Notebooks und das erzeugte Homeoffice-Szenario
+# notebook sweeps / variant runs and the generated home-office scenario
 systemoptimierung/examples/**/pv_sweep/
 systemoptimierung/examples/**/varianten/
 systemoptimierung/examples/**/scenario_homeoffice.json
 systemoptimierung/examples/**/generate.homeoffice.cfg
-# Default-Ausgabeordner, falls simulate.py ohne oemof_output_dir laeuft
-/results/
-# das Test-Notebook vorerst nicht tracken
 systemoptimierung/examples/**/test_run.ipynb
+# run outputs: results/ of every example; in laeufe/<strategy>/ everything but its sim.cfg
+systemoptimierung/examples/**/results/
+systemoptimierung/examples/**/laeufe/*/*
+!systemoptimierung/examples/**/laeufe/*/sim.cfg
+# not part of the handover
+systemoptimierung/examples/**/zwischenschritt/
+systemoptimierung/examples/dokumentation/
+systemoptimierung/examples/example_1/input_timeseries.csv
+systemoptimierung/examples/**/__pycache__/
+# default output folder when simulate.py runs without oemof_output_dir
+/results/
