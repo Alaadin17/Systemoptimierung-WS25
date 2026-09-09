@@ -1,46 +1,52 @@
 """
-oemof-Energiesystem - das LP hinter der spice_ev-Strategie ``oemof_solve``.
+oemof energy system - the LP behind the spice_ev strategy ``oemof_solve``.
 
-Autor: Alaa Alsleman, GitHub: Alaadin17
+Author: Alaa Alsleman, GitHub: Alaadin17
 
-Baut aus einem spice_ev-Szenario ein oemof.solph-Energiesystem, loest es EINMAL ueber den
-ganzen Horizont und gibt den Fahrplan an spice_ev zurueck.
+Builds an oemof.solph energy system from a spice_ev scenario, solves it ONCE over the whole
+horizon and hands the schedule back to spice_ev.
 
-Topologie - ein Bus je Netzanschluss
-------------------------------------
-Alles wird BEDINGT gebaut: ein Netzanschluss entsteht nur, wenn er etwas traegt (genutzte
-Ladestation, Last, PV oder Batterie), eine Wallbox nur, wenn ein Fahrzeug sie wirklich
-nutzt. Siehe ``_create_components``.
+Topology - one bus per grid connector
+-------------------------------------
+Everything is built CONDITIONALLY: a grid connector exists only if it carries something (a
+used charging station, a load, PV or a battery), a wallbox only if a vehicle actually uses
+it. See ``_create_components``. Labels as they appear in the dumps, for Home_1:
 
-    Home_<n>            AC-Bus je aktivem Netzanschluss   {gcid: bus} in self._gc_bus
-      grid_supply_<n>     Netzbezug            grid_feedin_<n>   Export (enable_grid_feedin)
-      household_demand    feste Last           bus_pv_<n>        PV-Bus mit pv_/excess_
+    Home_1                          AC bus per active grid connector; {gcid: bus} in _gc_bus
+      grid_supply_Home_1            purchase from the grid
+      grid_feedin_Home_1            export from the house bus (only with enable_grid_feedin)
+      household_demand_Home_1       fixed load
+      bus_pv_Home_1                 DC side of the PV: pv_Home_1 (source), excess_Home_1
+                                    (feed-in sink), converter_pv_to_home_Home_1 (inverter,
+                                    only with enable_pv_to_home)
       link_home_battery_<bid> <-> bus_battery_<bid> <-> home_battery_<bid>
       wallbox_charge_<csid>_<vid> -> bus_mobility_<vid> -> bev_battery_<vid>
-      wallbox_discharge_<csid>_<vid>  nur fuer v2g-Fahrzeuge mit enable_v2h
+      wallbox_discharge_<csid>_<vid>  only for v2g vehicles with enable_v2h
 
-Zwei Entscheidungen, die den Fahrplan mit spice_ev deckungsgleich halten:
-- Der Lade-/Entladeverlust sitzt IM SPEICHER (inflow/outflow_conversion_factor), nicht im
-  Link und nicht in der Wallbox - genau wie in spice_evs ``Battery``. Round-Trip eff^2.
-- Wallboxen und Links sind VERLUSTFREI, sie begrenzen nur die Leistung. Ein Verlust dort
-  wuerde doppelt zaehlen und den geplanten SOC vom simulierten wegdriften lassen.
+Two decisions keep the schedule congruent with spice_ev:
+- The charging/discharging loss sits IN THE STORAGE (inflow/outflow_conversion_factor),
+  not in the link and not in the wallbox - exactly like spice_ev's ``Battery``. Round trip
+  eff^2.
+- Wallboxes and links are LOSSLESS, they only limit the power. A loss there would count
+  twice and let the planned SOC drift away from the simulated one.
 
-Die PV speist ueber ihren Wechselrichter auf den Hausbus, alles Uebrige geht ueber
-``excess_<n>`` in die Einspeisung. Ab dem Hausbus ist eine PV-kWh nicht mehr von einer
-Netz-kWh zu unterscheiden - eine Zuordnung "so viel PV ging ins Auto" gibt es deshalb
-nicht. Benannte Direktzweige samt PV-Ladebonus gab es einmal; sie sind entfernt, weil sie
-den Fahrplan nicht veraendert haben und ihre Kennzahl ohne den Bonus entartet war.
+The PV feeds the house bus through its inverter, everything else goes to the grid via
+``excess_<n>``. From the house bus on, a PV kWh is indistinguishable from a grid kWh, so
+there is no attribution "this much PV went into the car". Named direct branches with a PV
+charging bonus once provided one; they were removed because they never changed the
+schedule.
 
-Eingaben (__init__)
--------------------
-Im Produktivpfad baut ``OemofSolve.build_oemof_inputs`` sie aus dem spice_ev-Szenario:
-config (SystemConfig), time_index (= die spice_ev-Schritte), grid_connectors (Last, PV,
-max_power, optional Preisreihe), charging_stations, vehicle_params, battery_params.
+Inputs (__init__)
+-----------------
+``OemofSolve.build_oemof_inputs`` builds them from the spice_ev scenario (the tests build
+them directly): config (SystemConfig), time_index (= the spice_ev steps), grid_connectors
+(load, PV, max_power, optional price series and installed kWp), charging_stations,
+vehicle_params, battery_params.
 
-Ablauf
-------
-``run()``: Zeitraster -> Energiesystem -> Komponenten -> [Graph] -> LP -> loesen ->
-auslesen -> CSV. ``get_plan()`` / ``get_wallbox_schedule()`` liefern das Ergebnis zurueck.
+Flow
+----
+``run()``: time grid -> energy system -> components -> [graph] -> LP -> solve -> extract
+-> CSV. ``get_plan()`` / ``get_wallbox_schedule()`` return the result.
 """
 
 import logging
@@ -60,17 +66,16 @@ from pyomo.opt import SolverStatus, TerminationCondition
 ###########################################################################
 # Configuration
 ###########################################################################
-# We collect all settings in one typed object, SystemConfig. It can be filled
-# two ways:
-#   - from a flat dict  -> comes from the OemofSolve strategy (oemof_config)
-#   - from a cfg file   -> for standalone runs
+# Every setting lives in one typed object, SystemConfig. It is filled from the flat
+# dict of oemof_* keys the OemofSolve strategy receives (from_options); nothing else
+# feeds it.
 @dataclass
 class SystemConfig:
-    """Alle Einstellungen des Modells an einer Stelle.
+    """Every setting of the model in one place.
 
-    Gefuellt aus den ``oemof_``-Schluesseln der simulate.cfg (``from_options``). Was das
-    Szenario je Komponente mitbringt - max_power, Kapazitaet, SOC, Wirkungsgrad - schlaegt
-    diese Werte; die Felder hier sind der Rueckfall.
+    Filled from the ``oemof_`` keys of simulate.cfg (``from_options``). Whatever the
+    scenario brings per component - max_power, capacity, SOC, efficiency - beats these
+    values; the fields here are the fallback for what the strategy does not pass.
     """
 
     # Time parameters
@@ -78,14 +83,12 @@ class SystemConfig:
     periods: int = 96  # 15-minute steps (96 = 1 day for debug)
     freq: str = "15min"
 
-    # Schalter fuer Wege, die das Szenario nicht ausdruecken kann. Was es ausdruecken KANN -
-    # ob ein Netzanschluss PV hat, ob eine Batterie existiert, ob es Fahrzeuge gibt - wird
-    # nicht doppelt geschaltet: PV und Speicher entstehen genau dann, wenn das Szenario sie
-    # mitbringt. (Frueher gab es dafuer enable_pv und enable_battery; sie standen immer auf
-    # true und haben die Szenario-Information nur wiederholt.)
-    enable_pv_to_home: bool = True    # ohne den Wechselrichter kann PV NUR einspeisen -
-    #                                   das ist im Szenario nicht darstellbar
-    enable_grid_feedin: bool = True   # Export vom Hausbus (Batterie/V2G) erlauben
+    # Switches for paths the scenario cannot express. What it CAN express - whether a
+    # grid connector has PV, whether a battery exists, whether there are vehicles - is not
+    # switched twice: PV and storages exist exactly when the scenario brings them.
+    enable_pv_to_home: bool = True    # without the inverter PV can ONLY feed in -
+    #                                   the scenario has no way to say that
+    enable_grid_feedin: bool = True   # allow export from the house bus (battery/V2G)
 
     # System parameters
     grid_supply_power_kW: float = 30.0
@@ -122,14 +125,14 @@ class SystemConfig:
     wallbox_efficiency_charge: float = 1.0
     wallbox_efficiency_discharge: float = 1.0
     enable_v2h: bool = True
-    # Bei KONSTANTEM Preis ist es dem LP egal, wann es vor der Abfahrt laedt - es gibt dann
-    # unendlich viele gleich teure Loesungen und der Solver greift willkuerlich eine heraus
-    # (im Plot sieht das nach zufaelligen Ladebloecken mitten in der Nacht aus). Mit diesem
-    # Schalter bekommt frueheres Laden einen winzigen Aufschlag, sodass bei Gleichstand
-    # moeglichst SPAET geladen wird - also nah an der Abfahrt und damit naeher an der
-    # Morgen-PV. Der Betrag ist so klein, dass er echte Preisunterschiede nie ueberstimmt.
+    # At a CONSTANT price the LP does not care when it charges before departure - there
+    # are infinitely many equally cheap solutions and the solver picks one arbitrarily
+    # (in a plot that looks like random charging blocks in the middle of the night). With
+    # this switch earlier charging gets a tiny surcharge, so that on a tie the model
+    # charges as LATE as possible - close to departure and thus closer to the morning PV.
+    # The amount is so small that it never overrides a real price difference.
     prefer_late_charging: bool = False
-    late_charging_penalty: float = 0.001   # ct/kWh im ersten Zeitschritt, fallend auf 0
+    late_charging_penalty: float = 0.001   # ct/kWh in the first step, falling to 0
 
     # Tiny anti-degeneracy cost (ct/kWh) on storage charging and V2H feed-back. Without it
     # the LP may cycle energy pointlessly (storage out -> in, or wallbox charge+discharge in
@@ -138,40 +141,29 @@ class SystemConfig:
     # genuine decisions; it only makes useless cycling strictly worse than doing nothing.
     storage_cycle_penalty: float = 0.001
 
-    # Verbietet einem Speicher, im SELBEN Zeitschritt zu laden und zu entladen. Kostet je
-    # Speicher und Zeitschritt eine BINAERVARIABLE: aus dem LP wird ein MILP, die Loesezeit
-    # steigt deutlich.
-    #
-    # Gebraucht wurde das gegen den PV-Ladebonus, der es lohnend machen konnte, PV DURCH
-    # einen Speicher ins Haus zu leiten. Diesen Bonus gibt es nicht mehr, und ohne ihn ist
-    # das Kreisen schon durch storage_cycle_penalty teurer als Nichtstun. Der Schalter
-    # bleibt fuer eigene Experimente - im Normalbetrieb braucht ihn niemand.
+    # Forbids a storage to charge and discharge in the SAME time step. Costs one BINARY
+    # variable per storage and step: the LP becomes a MILP and solve time rises sharply.
+    # Off by default and kept for experiments only - why it once mattered is told in
+    # _add_no_simultaneous_constraints.
     forbid_simultaneous_storage: bool = False
 
-    # --- Preise (ct/kWh) -------------------------------------------------------------
-    # grid_variable_costs ist der Bezugspreis, wenn das Szenario keinen mitbringt: der
-    # KOMPLETTE Preis, so wie er auf der Stromrechnung steht - kein Boersenpreis, auf den
-    # noch etwas addiert wird. Ein Preisblatt wird nicht gelesen, es gibt keinen
-    # Tarif-Aufschlag (Netzentgelt, Umlagen, Konzessionsabgabe, Stromsteuer, MwSt) und
-    # keinen Leistungspreis.
+    # --- Prices (ct/kWh) -------------------------------------------------------------
+    # grid_variable_costs is the purchase price when the scenario brings none: the
+    # COMPLETE price as it stands on the bill - no price sheet, no markup, no capacity
+    # charge. If the scenario carries price signals (include_price_csv in generate.cfg),
+    # that series applies INSTEAD, per step, exactly as spice_ev's own strategies see it
+    # (see OemofSolve._grid_price_series); grid_variable_costs is then without effect.
+    # grid_feedin_tariff is always fixed and applies to BOTH export paths (PV surplus and
+    # export from the house bus). Negative = revenue, 0 = no remuneration.
     #
-    # Bringt das Szenario Preissignale mit - ``include_price_csv`` in der generate.cfg macht
-    # aus jeder CSV-Zeile ein GridOperatorSignal -, gilt STATTDESSEN diese Zeitreihe, je
-    # Zeitschritt, in genau der Form, die auch spice_evs eigene Strategien sehen (siehe
-    # OemofSolve._grid_price_series). grid_variable_costs ist dann wirkungslos.
-    #
-    # grid_feedin_tariff ist immer fest und gilt fuer BEIDE Exportwege (PV-Ueberschuss und
-    # Export vom Hausbus). Negativ = Erloes, 0 = keine Verguetung.
-    #
-    # WICHTIG - die spice_ev-Kostenrechnung geht ihren eigenen Weg: simulate.py wertet nach
-    # der Simulation costs.py aus, und das rechnet mit dem Preisblatt (Netzentgelt, Umlagen,
-    # Steuern, Leistungspreis). Die EUR/a in results.json entstehen also aus anderen Preisen
-    # als der Fahrplan - sie beantworten "was haette das gekostet", der Fahrplan beantwortet
-    # "was ist bei diesem Preis sinnvoll". Beide Zahlen sind fuer sich richtig, nur nicht
-    # dieselbe Rechnung.
+    # NOTE - spice_ev's own cost calculation goes its own way: simulate.py evaluates
+    # costs.py after the simulation with the price sheet (grid fees, levies, taxes,
+    # capacity charge). The EUR/a in results.json therefore come from other prices than
+    # the schedule did - both numbers are right, they are just not the same calculation.
+    # The full price semantics are documented in examples/configs/simulate_with_oemof.cfg.
     pv_variable_costs: float = 0.0
     grid_variable_costs: float = 35.0
-    grid_feedin_tariff: float = 0.0   # negativ = Erloes; 0 = Einspeisung bringt nichts
+    grid_feedin_tariff: float = 0.0   # negative = revenue; 0 = feeding in earns nothing
 
     # Solver
     solver: str = "cbc"
@@ -188,9 +180,12 @@ class SystemConfig:
 
     @classmethod
     def from_options(cls, options: Optional[Dict[str, Any]] = None) -> "SystemConfig":
-        """Aus dem cfg-Dict der Strategie. ``oemof_`` faellt weg, Unbekanntes warnt."""
+        """From the strategy's cfg dict; unknown keys warn, wrong types are coerced.
+
+        A leading ``oemof_`` is stripped - spice_ev's util.py already does that on the
+        live path, so this only matters for direct calls (tests)."""
         config = cls()                                  # start with all defaults
-        typ = {f.name: f.type for f in fields(cls)}     # Feldname -> deklarierter Typ
+        typ = {f.name: f.type for f in fields(cls)}     # field name -> declared type
         for key, value in (options or {}).items():
             name = key.removeprefix("oemof_")           # "oemof_solver" -> "solver"
             if name not in typ:
@@ -201,10 +196,10 @@ class SystemConfig:
 
 
 def _as_array(values, n):
-    """Skalar/Liste/Series -> float-Reihe der Laenge n.
+    """Scalar/list/Series -> float array of length n.
 
-    Ein Skalar wird gestreckt, eine zu lange Reihe abgeschnitten. ACHTUNG: eine zu kurze
-    wird still mit Nullen aufgefuellt - ein zu kurzes PV-Profil heisst dann "keine Sonne".
+    A scalar is stretched, a series that is too long is cut. CAUTION: one that is too short
+    is silently padded with zeros - a PV profile that is too short then means "no sun".
     """
     if np.isscalar(values):
         return np.full(n, float(values))
@@ -215,11 +210,11 @@ def _as_array(values, n):
 
 
 def _nonzero(values, n):
-    """Traegt diese Reihe ueberhaupt Energie? Entscheidet, ob ein Knoten entsteht.
+    """Does this series carry any energy at all? Decides whether a node is built.
 
-    Muss an allen Aufrufstellen dasselbe sagen: sonst kaeme ein Netzanschluss wegen einer
-    Last herein, fuer die anschliessend keine Senke gebaut wird. Die Summe (statt ``.any()``)
-    ist Absicht - eine Reihe, die sich zu 0 aufhebt, traegt nichts.
+    Must say the same thing at every call site: otherwise a grid connector could be admitted
+    for a load that then gets no sink. The sum (instead of ``.any()``) is deliberate - a
+    series that cancels to 0 carries nothing.
     """
     return values is not None and float(np.sum(_as_array(values, n))) > 0.0
 
@@ -229,11 +224,11 @@ _FALSCH = {"false", "no", "off", "0"}
 
 
 def _coerce(name, value, typ):
-    """Einen cfg-Wert auf den deklarierten Feldtyp bringen.
+    """Bring a cfg value to the declared field type.
 
-    Die cfg wird per ``json.loads`` gelesen, und JSON kennt nur kleines ``true``/``false``.
-    ``oemof_enable_v2h = False`` bleibt deshalb der STRING "False" - und der ist in Python
-    wahr, der Schalter waere still AN. Genau das ist schon einmal passiert.
+    The cfg is read with ``json.loads``, and JSON only knows lowercase ``true``/``false``.
+    ``oemof_enable_v2h = False`` therefore stays the STRING "False" - which is truthy in
+    Python, so the switch would silently be ON. That has happened once.
     """
     ziel = str(typ)
     if "bool" in ziel:
@@ -259,11 +254,11 @@ def _coerce(name, value, typ):
 
 
 def _vid_from_bus(label) -> str:
-    """Fahrzeug-ID aus seinem Busnamen ``bus_mobility_<vid>``.
+    """Vehicle id from its bus label ``bus_mobility_<vid>``.
 
-    Der Umweg ueber den Bus statt ueber das Wallbox-Label ist noetig, weil
-    ``wallbox_charge_<csid>_<vid>`` nicht eindeutig zerlegbar ist - beide Teile duerfen
-    Unterstriche enthalten.
+    Going through the bus instead of the wallbox label is necessary because
+    ``wallbox_charge_<csid>_<vid>`` cannot be split unambiguously - both parts may contain
+    underscores.
     """
     label = str(label)
     prefix = "bus_mobility_"
@@ -274,8 +269,8 @@ def _vid_from_bus(label) -> str:
 # Main class
 ###########################################################################
 class EnergySystemModel:
-    """Baut das Energiesystem, loest es einmal ueber den ganzen Horizont und liest den
-    Fahrplan aus. Topologie siehe Modulkopf, Reihenfolge siehe ``run()``."""
+    """Builds the energy system, solves it once over the whole horizon and extracts the
+    schedule. Topology: see the module docstring; order of stages: see ``run()``."""
 
     def __init__(
         self,
@@ -291,7 +286,8 @@ class EnergySystemModel:
         self.config = config or SystemConfig()
         self._time_index_input = time_index
         self.vehicle_params: Dict[str, Dict[str, Any]] = dict(vehicle_params or {})
-        # {gcid: {"load", "pv", "max_power"(optional)}} — each ACTIVE GC becomes one Home_<n> bus
+        # {gcid: {"load", "pv", "max_power", "price_ct_kWh", "pv_power_kW"}} - the last three
+        # optional; each ACTIVE GC becomes one Home_<n> bus
         self.grid_connectors: Dict[str, Dict[str, Any]] = dict(grid_connectors or {})
         self.battery_params: Dict[str, Dict[str, Any]] = dict(battery_params or {})
         # {csid: {"max_power", "parent"}} — one wallbox per CS, but only for the vehicles
@@ -318,7 +314,7 @@ class EnergySystemModel:
     # Pipeline orchestration
     # ------------------------------------------------------------------
     def run(self) -> None:
-        """Die ganze Pipeline: Zeitraster -> Topologie -> LP -> loesen -> auslesen -> CSV."""
+        """The whole pipeline: time grid -> topology -> [graph] -> LP -> solve -> extract -> CSV."""
         self._create_time_index()
         self._create_energy_system()
         self._create_components()
@@ -349,15 +345,15 @@ class EnergySystemModel:
         self.es = EnergySystem(timeindex=self.time_index, infer_last_interval=True)
 
     def _create_components(self) -> None:
-        """Die Topologie je Netzanschluss - hier faellt die Entscheidung, was gebaut wird.
+        """The topology per grid connector - this is where it is decided what gets built.
 
-        Erst je Fahrzeug ein Bus und ein Speicher, dann die Ladestationen (nur genutzte, und
-        nur zu den Fahrzeugen, die sie wirklich nutzen), dann je aktivem Netzanschluss ein
-        Bus ``Home_<n>`` mit allem, was daran haengt. Aktiv heisst: genutzte Wallbox ODER
-        Last ODER PV ODER Batterie - sonst entsteht der Anschluss gar nicht.
+        First one bus and one storage per vehicle, then the charging stations (only the used
+        ones, and only linked to the vehicles that really use them), then per active grid
+        connector one bus ``Home_<n>`` with everything attached to it. Active means: a used
+        wallbox OR a load OR PV OR a battery - otherwise the connector is not built at all.
         """
         periods = self.config.periods
-        # vor dem ersten Knoten leeren — die Fahrzeuge tragen sich gleich hier ein
+        # clear before the first node - the vehicles register themselves right here
         self._storage_pairs = []
 
         # 1) one bus + BEV per vehicle
@@ -403,8 +399,8 @@ class EnergySystemModel:
         wallboxes of the charging stations that belong to this GC (only used ones)."""
         periods = self.config.periods
 
-        # Bezugsquelle. Liefert die Strategie eine Preisreihe aus dem Szenario
-        # (include_price_csv), gilt die je Zeitschritt - sonst der feste cfg-Wert.
+        # Supply source. If the strategy hands over a price series from the scenario
+        # (include_price_csv) it applies per step - otherwise the fixed cfg value.
         preis = gc.get("price_ct_kWh")
         supply = cmp.Source(
             label=f"grid_supply_{name}",
@@ -414,10 +410,10 @@ class EnergySystemModel:
                                 else self.config.grid_variable_costs))},
         )
         self.es.add(supply)
-        # Einspeisung: derselbe feste Wert fuer beide Wege - den PV-Ueberschuss und den
-        # Export vom Hausbus (Batterie/V2G). Wichtig ist nur, dass er nicht POSITIV verguetet
-        # wird, waehrend Bezug billiger ist: sonst kauft das LP Strom und speist ihn im selben
-        # Schritt gewinnbringend wieder ein.
+        # Feed-in: the same fixed value for both paths - the PV surplus and the export
+        # from the house bus (battery/V2G). All that matters is that it is not remunerated
+        # POSITIVELY while purchase is cheaper: the LP would then buy power and feed it back
+        # in the same step at a profit.
         feedin_tariff = float(self.config.grid_feedin_tariff)
         # grid feed-in sink (export from the home bus; battery/V2G)
         if self.config.enable_grid_feedin:
@@ -448,15 +444,13 @@ class EnergySystemModel:
                 self._add_wallbox(csid, users, b)
 
     def _add_pv(self, gc_bus, name, pv_series, feedin_tariff, converter_power_kW) -> None:
-        """PV an einem Netzanschluss: PV-Bus, Quelle, Ueberschuss-Senke, Wechselrichter.
+        """PV at one grid connector: PV bus, source, surplus sink and - only with
+        ``enable_pv_to_home`` - the inverter.
 
-        Der Wechselrichter traegt ``nominal_value = converter_power_kW`` und speist auf den
-        Hausbus. Was dort nicht gebraucht wird, geht ueber ``excess_<name>`` in die
-        Einspeisung. Ab dem Hausbus ist eine PV-kWh nicht mehr von einer Netz-kWh zu
-        unterscheiden - eine Zuordnung "so viel PV ging ins Auto" gibt es deshalb nicht.
-        Dafuer existierten einmal benannte Direktzweige; sie sind entfernt, weil sie den
-        Fahrplan nicht veraendert haben und ihre Kennzahl ohne einen Bonus, der sie
-        eindeutig macht, entartet war.
+        The inverter carries ``nominal_value = converter_power_kW`` on its DC input and feeds
+        the house bus. Whatever is not needed there leaves through ``excess_<name>`` as
+        feed-in. From the house bus on, a PV kWh is indistinguishable from a grid kWh, so
+        there is no attribution "this much PV went into the car".
         """
         b_pv = buses.Bus(label=f"bus_pv_{name}")
         self.es.add(b_pv)
@@ -481,18 +475,15 @@ class EnergySystemModel:
         ))
 
     def _add_battery(self, bid, bp, b_home) -> None:
-        """Eine Hausbatterie: Bus, Speicher, AC/DC-Link. Je Eintrag einmal aufgerufen.
+        """One stationary battery: bus, storage, AC/DC link. Called once per entry.
 
-        Erreichbar nur ueber den Link vom Hausbus - einen PV-Direktzweig gibt es hier
-        nicht mehr. Er haette die PV zwar zurechenbar gemacht, aber am Fahrplan nichts
-        geaendert und im Gegenzug den Kreislauf ermoeglicht: PV in die Batterie, Bonus
-        kassieren, im selben Schritt wieder ins Haus entladen.
+        Reachable only through the link from the house bus - that link is the only way in.
 
-        Der Verlust sitzt IM SPEICHER (inflow/outflow_conversion_factor), genau wie in
-        spice_evs ``Battery``: eff beim Laden, eff beim Entladen, Round-Trip eff^2. Der Link
-        ist verlustfrei und begrenzt nur die Leistung. Die frueher hier verwendete Variante
-        mit sqrt(eff) je Linkrichtung ergab einen Round-Trip von nur eff - die LP-Batterie
-        war damit ~5 % besser als die simulierte, und geplante Entladungen liefen leer.
+        The loss sits IN THE STORAGE (inflow/outflow_conversion_factor), exactly like
+        spice_ev's ``Battery``: eff when charging, eff when discharging, round trip eff^2.
+        The link is lossless and only limits the power. An earlier variant with sqrt(eff)
+        per link direction gave a round trip of only eff - the LP battery was ~5 % better
+        than the simulated one, and planned discharges ran empty.
         """
         capacity = float(bp.get("capacity_kWh", self.config.battery_capacity_kWh))
         power = float(bp.get("power_kW", self.config.battery_max_power_kW))
@@ -501,10 +492,7 @@ class EnergySystemModel:
         init = min(max(init, self.config.battery_min_soc), self.config.battery_max_soc)
         efficiency = float(bp.get("efficiency", self.config.battery_efficiency))
 
-        # EIN Bus traegt beide Richtungen. Eine Trennung in Zu- und Abflussseite braucht es
-        # nur, wenn ein zweiter Weg IN den Speicher fuehrt, der sich sonst am Speicher vorbei
-        # durch den Link zurueck ins Haus stehlen koennte. Den gab es mit dem PV-Direktzweig
-        # zur Batterie; seit der weg ist, ist der Link der einzige Zugang.
+        # ONE bus carries both directions; the link from the house bus is the only way in.
         b_battery = buses.Bus(label=f"bus_battery_{bid}")
         self.es.add(b_battery)
 
@@ -544,8 +532,8 @@ class EnergySystemModel:
             balanced=False,
         )
         self.es.add(storage)
-        # an den beiden Speicherfluessen ist "laden" und "entladen" eindeutig - hier setzt
-        # forbid_simultaneous_storage an, falls es gebraucht wird
+        # at the two storage flows "charge" and "discharge" are unambiguous - this is where
+        # forbid_simultaneous_storage attaches, if it is used
         self._storage_pairs.append({
             "label": f"home_battery_{bid}", "storage": storage,
             "in_bus": b_battery, "out_bus": b_battery,
@@ -562,17 +550,17 @@ class EnergySystemModel:
         return 1.0 / step_hours
 
     def _add_vehicle(self, vid, params) -> None:
-        """Ein Fahrzeug: Mobilitaetsbus + Speicher. Die Wallboxen baut ``_add_wallbox``.
+        """One vehicle: mobility bus + storage. The wallboxes are built by ``_add_wallbox``.
 
-        - consumption ist der Fahrbedarf als ``fixed_losses_absolute`` - er wird dem Speicher
-          auch abgezogen, waehrend das Auto weg ist.
-        - Der SOC-Boden ist ``min_soc``, bei V2H/V2G-faehigen Fahrzeugen
+        - consumption is the driving demand as ``fixed_losses_absolute`` - it is taken from
+          the storage even while the car is away.
+        - The SOC floor is ``min_soc``, for V2H/V2G-capable vehicles
           ``max(min_soc, discharge_limit)``.
-        - min_soc_series hebt diesen Boden SCHRITTWEISE auf den ``desired_soc`` aus dem
-          Szenario, jeweils im Schritt vor der Abfahrt - damit das Auto so voll ist, wie
-          spice_ev es erwartet. Gedeckelt auf ``max_soc``, sonst waere der Speicher unloesbar.
+        - min_soc_series raises that floor PER STEP to the ``desired_soc`` from the scenario,
+          in the step before each departure - so the car is as full as spice_ev expects.
+          Capped at ``max_soc``, otherwise the storage would be infeasible.
 
-        Busse und Flags landen in ``self._vehicle_nodes[vid]``, damit die Wallboxen sie finden.
+        Bus and flags go to ``self._vehicle_nodes[vid]`` so the wallboxes can find them.
         """
         periods = self.config.periods
         consumption = _as_array(params.get("consumption", 0.0), periods)
@@ -584,11 +572,11 @@ class EnergySystemModel:
         v2g = bool(params.get("v2g", False))
 
         # discharge possible only if v2g and globally enabled; then raise the SOC floor
-        # to discharge_limit so V2H/V2G cannot drain below it (Option A).
+        # to discharge_limit so V2H/V2G cannot drain below it.
         can_discharge = self.config.enable_v2h and v2g
-        # V2G entlaedt mit der discharge_curve, die spice_ev aus der Ladekurve mal
-        # v2g_power_factor bildet - typisch die Haelfte. Ohne diese Grenze plant das LP mit
-        # der vollen Stationsleistung und der geplante SOC laeuft vom simulierten weg.
+        # V2G discharges with the discharge_curve that spice_ev derives from the charging
+        # curve times v2g_power_factor - typically half. Without this limit the LP plans
+        # with the full station power and the planned SOC drifts away from the simulated one.
         p_entladen = params.get("discharge_power_kW")
         p_entladen = float(p_entladen) if p_entladen else None
         discharge_limit = float(params.get("discharge_limit", self.config.bev_discharge_limit))
@@ -612,10 +600,7 @@ class EnergySystemModel:
         # (Battery.efficiency). The wallbox itself is lossless there, it only limits power.
         efficiency = float(params.get("efficiency", self.config.bev_efficiency))
 
-        # EIN Bus traegt beide Richtungen. Eine Trennung in Zu- und Abflussseite gab es, als
-        # ein bonusberechtigter PV-Direktzweig hier ankam und sonst durch den Speicher
-        # hindurch ins Haus haette rutschen koennen. Ohne diesen Zweig fuehrt jeder Weg ins
-        # Fahrzeug ueber die Wallbox, und die Kosten machen den Durchgang unattraktiv.
+        # ONE bus carries both directions; the wallbox is the only way into the vehicle.
         b_mobility = buses.Bus(label=f"bus_mobility_{vid}")
         self.es.add(b_mobility)
 
@@ -638,8 +623,8 @@ class EnergySystemModel:
             min_storage_level=storage_min,
             max_storage_level=max_soc,
             initial_storage_level=init_soc,
-            inflow_conversion_factor=efficiency,    # AC in  -> stored  (x0.95)
-            outflow_conversion_factor=efficiency,   # stored -> V2H out (x0.95)
+            inflow_conversion_factor=efficiency,    # AC in  -> stored  (x eff)
+            outflow_conversion_factor=efficiency,   # stored -> V2H out (x eff)
             loss_rate=0.0,
             fixed_losses_absolute=consumption * loss_factor,
             balanced=False,
@@ -650,7 +635,7 @@ class EnergySystemModel:
             # Only a V2H vehicle can charge and discharge at once. Its storage inflow has no
             # nominal_value of its own (the wallbox limits it), so the big-M comes from the
             # strongest station this vehicle ever plugs into.
-            # kein "or []": connected_cs ist ein numpy-Array, dessen Wahrheitswert wirft
+            # no "or []": connected_cs is a numpy array, whose truth value raises
             angeschlossen = params.get("connected_cs")
             used = {c for c in ([] if angeschlossen is None else list(angeschlossen)) if c}
             p_in = max((float(self.charging_stations.get(c, {}).get(
@@ -663,27 +648,27 @@ class EnergySystemModel:
             })
 
         self._vehicle_nodes[vid] = {
-            "bus": b_mobility,      # Laden kommt hier an, V2H geht hier weg
+            "bus": b_mobility,      # charging arrives here, V2H leaves here
             "can_discharge": can_discharge,
-            "p_discharge": p_entladen,   # None = nur die Stationsleistung begrenzt
+            "p_discharge": p_entladen,   # None = only the station power limits
             "connected_cs": list(params.get("connected_cs", [])),
         }
 
     def _add_wallbox(self, csid, users, gc_bus) -> None:
-        """Eine Ladestation, verbunden mit den Fahrzeugen, die sie wirklich nutzen.
+        """One charging station, linked to the vehicles that really use it.
 
-        Je Fahrzeug ein maskierter Converter: ``max`` ist 1 genau in den Schritten, in denen
-        das Auto an DIESER Station steckt, sonst 0. Fuer v2g-Fahrzeuge mit ``enable_v2h``
-        zusaetzlich der Rueckweg ins Haus.
+        One masked converter per vehicle: ``max`` is 1 exactly in the steps in which the car
+        is plugged into THIS station, 0 otherwise. For v2g vehicles with ``enable_v2h`` also
+        the way back into the house.
 
-        Die Wallbox ist VERLUSTFREI und begrenzt nur die Leistung - wie in spice_ev. Der
-        Lade-/Entladeverlust steckt in der Fahrzeugbatterie; ein Verlust auch hier wuerde
-        doppelt zaehlen und den geplanten SOC vom simulierten wegdriften lassen.
+        The wallbox is LOSSLESS and only limits the power - as in spice_ev. The
+        charging/discharging loss sits in the vehicle battery; a loss here as well would
+        count twice and let the planned SOC drift away from the simulated one.
         """
         periods = self.config.periods
         power = float(self.charging_stations[csid].get("max_power", self.config.wallbox_power_kW))
-        # Optionaler, mit der Zeit fallender Mini-Aufschlag: loest die Degeneriertheit bei
-        # konstantem Preis auf, indem spaeteres Laden minimal guenstiger ist (siehe Config).
+        # Optional tiny surcharge falling over time: resolves the degeneracy at a constant
+        # price by making later charging marginally cheaper (see SystemConfig).
         late_costs = 0
         if self.config.prefer_late_charging and periods > 1:
             late_costs = (self.config.late_charging_penalty
@@ -704,10 +689,10 @@ class EnergySystemModel:
             )
             self.es.add(wb_charge)
             if node["can_discharge"]:
-                # Die Entladeleistung ist NICHT die Ladeleistung: spice_ev begrenzt sie auf
-                # die discharge_curve (Ladekurve mal v2g_power_factor). Wer hier die volle
-                # Stationsleistung zulaesst, plant mehr Rueckspeisung, als die Simulation
-                # liefern kann - der SOC laeuft dann auseinander.
+                # The discharge power is NOT the charging power: spice_ev limits it to the
+                # discharge_curve (charging curve times v2g_power_factor). Allowing the full
+                # station power here plans more feed-back than the simulation can deliver -
+                # the SOC then diverges.
                 p_ab = min(power, node["p_discharge"]) if node["p_discharge"] else power
                 wb_discharge = cmp.Converter(
                     label=f"wallbox_discharge_{csid}_{vid}",
@@ -729,36 +714,36 @@ class EnergySystemModel:
                          for i in range(n)], dtype=float)
 
     def _optimize(self) -> None:
-        """Aus dem Energiesystem das LP bauen: Busbilanzen, Leistungsgrenzen,
-        Speichergleichungen und die Zielfunktion. Mit ``debug`` faellt eine lesbare
-        ``.lp``-Datei ab."""
+        """Build the LP from the energy system: bus balances, power limits, storage
+        equations and the objective. With ``debug`` a readable ``.lp`` file is written."""
         self.model = Model(self.es)
-        self._add_no_simultaneous_constraints()   # optional, macht aus dem LP ein MILP
+        self._add_no_simultaneous_constraints()   # optional, turns the LP into a MILP
         if self.config.debug:
             lp_path = Path(self.config.output_dir) / f"{self.config.dump_filename}_debug.lp"
             lp_path.parent.mkdir(parents=True, exist_ok=True)
             self.model.write(str(lp_path), io_options={"symbolic_solver_labels": True})
 
     def _add_no_simultaneous_constraints(self) -> None:
-        """Verbiete jedem Speicher, im selben Schritt zu laden UND zu entladen.
+        """Forbid every storage to charge AND discharge in the same step.
 
-        "Entweder A oder B" ist keine lineare Aussage, es braucht je Speicher und Schritt
-        eine Binaervariable:
+        "Either A or B" is not a linear statement; it needs one binary variable per storage
+        and step:
 
-            zufluss[t]  <=  P_laden    * y[t]
-            abfluss[t]  <=  P_entladen * (1 - y[t])          y[t] in {0, 1}
+            inflow[t]   <=  P_charge    * y[t]
+            outflow[t]  <=  P_discharge * (1 - y[t])          y[t] in {0, 1}
 
-        Big-M ist jeweils die ohnehin vorhandene Leistungsgrenze - je enger, desto schneller
-        das MILP. Angesetzt an den STORAGE-Fluessen, weil dort jeder Weg zusammenlaeuft.
+        Big-M is the power limit that exists anyway - the tighter, the faster the MILP.
+        Attached at the STORAGE flows, because every path converges there.
 
-        Gebraucht wurde das gegen den PV-Ladebonus: er machte es lohnend, PV *durch* den
-        Speicher ins Haus zu leiten, weil jeder Fluss fuer sich erlaubt war und der Umweg
-        nur den Round-Trip kostete, waehrend der Bonus voll kassiert wurde. Den Bonus gibt
-        es nicht mehr, damit auch den Anreiz nicht - storage_cycle_penalty macht das Kreisen
-        ohnehin teurer als Nichtstun. Default AUS; der Schalter bleibt fuer Experimente.
+        History: this was needed against a PV charging bonus that made it profitable to
+        route PV *through* a storage into the house - each flow was allowed on its own, the
+        detour only cost the round trip, and the bonus was collected in full. That bonus and
+        its branches are gone, and with them the incentive: storage_cycle_penalty already
+        makes cycling more expensive than doing nothing. Off by default; the switch stays
+        for experiments.
 
-        Preis: aus dem LP wird ein MILP. 5856 Schritte sind 5856 Binaervariablen je Speicher,
-        die Loesezeit steigt um Groessenordnungen.
+        Price: the LP becomes a MILP. One binary per storage and step - 5856 for a
+        two-month horizon - and solve time rises by orders of magnitude.
         """
         if not self.config.forbid_simultaneous_storage or not self._storage_pairs:
             return
@@ -770,7 +755,7 @@ class EnergySystemModel:
             zufluss = (pair["in_bus"], pair["storage"])
             abfluss = (pair["storage"], pair["out_bus"])
             for t in steps:
-                # nur bauen, wo beide Richtungen ueberhaupt existieren
+                # only build where both directions exist at all
                 if (zufluss[0], zufluss[1], t) in m.flow and (abfluss[0], abfluss[1], t) in m.flow:
                     rows[(pair["label"], t)] = (zufluss, abfluss,
                                                 float(pair["p_in"]), float(pair["p_out"]))
@@ -795,11 +780,11 @@ class EnergySystemModel:
                      ", ".join(sorted({lbl for lbl, _ in idx})))
 
     def _solve(self) -> None:
-        """LP loesen und die Optimalitaet pruefen.
+        """Solve the LP and check optimality.
 
-        Ein nicht-optimales Ergebnis wirft ``RuntimeError``, statt still mit Unsinn
-        weiterzurechnen. Mit ``debug`` zeigt der Solver seine Konsole und eine Zeile mit
-        Dauer, Status und Zielwert geht ins Log.
+        A non-optimal result raises ``RuntimeError`` instead of silently carrying on with
+        nonsense. With ``debug`` the solver shows its console and one line with duration,
+        status and objective goes to the log.
         """
         solver_options = {}
         if self.config.solver == "cbc":
@@ -853,11 +838,11 @@ class EnergySystemModel:
         return self._fit(data["sequences"]["flow"].to_numpy(), n)
 
     def _storage_soc_end(self, res, node, n, capacity) -> np.ndarray:
-        """Der SOC, den jeder Speicher am ENDE jedes Schritts erreicht.
+        """The SOC every storage reaches at the END of each step.
 
-        oemof indiziert ``storage_content`` ueber n+1 Zeitpunkte: t ist der Stand zu BEGINN
-        von Schritt t. Hier zaehlen die Enden (1..n) - genau der Wert, auf den ``step()``
-        die simulierte Batterie mit ``Battery.load(target_soc=...)`` fahren laesst.
+        oemof indexes ``storage_content`` over n+1 points in time: t is the level at the
+        START of step t. Here the ends count (1..n) - exactly the value ``step()`` steers
+        the simulated battery to with ``Battery.load(target_soc=...)``.
         """
         data = res.get((node, None))
         if data is None or not capacity:
@@ -877,11 +862,16 @@ class EnergySystemModel:
         return self._fit(seq[col].to_numpy(), n)
 
     def _extract_results(self) -> None:
-        """Das geloeste Modell in Fahrplan, Zusammenfassung und Kosten uebersetzen.
+        """Translate the solved model into schedule, summary and cost.
 
-        Alle Leistungen sind AC am Netzanschlussbus - das ist, was spice_ev anwendet.
-        Es entstehen ``_wallbox_schedule`` je Fahrzeug, ``_summary_df`` je Netzanschluss
-        (Bezug, Einspeisung, PV, Last, SOC) und ``_costs``.
+        All powers are AC at the grid-connector bus - that is what spice_ev applies. Built
+        here: ``_wallbox_schedule`` per vehicle (charge/discharge/net kW, soc_kWh, soc_end,
+        consumption), ``_battery_schedule`` per stationary battery (charge/discharge kW,
+        soc_end), ``_grid_schedule`` per grid connector (supply/feedin kW, verification
+        only), ``_summary_df`` with one column family per node type (grid_supply_*,
+        grid_feedin_*, pv_*, pv_feedin_*, pv_selfuse_*, household_demand_*,
+        home_battery_<bid>_soc_kWh, wallbox_charge/discharge_<vid>,
+        battery_charge/discharge_<bid>, grid_price_ct_*) and ``_costs``.
         """
         res = processing.results(self.model)
         self._results_main = res
@@ -895,8 +885,8 @@ class EnergySystemModel:
             if not isinstance(node, cmp.Converter):
                 continue
             if node.label.startswith("wallbox_charge_"):
-                # dieser Fluss ist die GESAMTE AC-Leistung der Station - genau das, was
-                # step() am Netzanschluss verbucht
+                # this flow is the TOTAL AC power of the station - exactly what step()
+                # books at the grid connector
                 gc_bus = list(node.inputs)[0]
                 vid = _vid_from_bus(list(node.outputs)[0].label)
                 charge[vid] = charge[vid] + self._flow(res, gc_bus, node, n)
@@ -927,8 +917,8 @@ class EnergySystemModel:
             }, index=idx)
         self._wallbox_schedule = schedule
 
-        # --- Zusammenfassung je GC: Netzbezug/-einspeisung, PV, PV-Einspeisung,
-        #     Haushaltslast und der SOC jeder Batterie ---
+        # --- summary per GC: grid purchase/feed-in, PV, PV feed-in, household load and
+        #     the SOC of every battery ---
         summary: Dict[str, np.ndarray] = {}
         for node in self.es.nodes:
             lbl = node.label
@@ -942,9 +932,9 @@ class EnergySystemModel:
                 summary[f"pv_feedin_{lbl[len('excess_'):]}"] = self._flow(
                     res, list(node.inputs)[0], node, n)
             elif lbl.startswith("converter_pv_to_home_"):
-                # die gesamte PV-Eigennutzung: alles, was nicht exportiert wird, laeuft ueber
-                # diesen Wechselrichter. Damit gilt pv - pv_feedin == pv_selfuse. WOHIN die
-                # kWh danach geht, ist am Hausbus nicht mehr unterscheidbar.
+                # the whole PV self-use: everything that is not exported passes through this
+                # inverter, so pv - pv_feedin == pv_selfuse. WHERE the kWh goes afterwards
+                # is no longer distinguishable at the house bus.
                 summary[f"pv_selfuse_{lbl[len('converter_pv_to_home_'):]}"] = \
                     self._flow(res, node, list(node.outputs)[0], n)
             elif lbl.startswith("household_demand_"):
@@ -956,9 +946,9 @@ class EnergySystemModel:
             summary[f"wallbox_charge_{vid}"] = charge[vid]
             summary[f"wallbox_discharge_{vid}"] = discharge[vid]
 
-        # Der Preis, mit dem die Zielfunktion wirklich gerechnet hat - je nach Szenario eine
-        # Konstante oder die Stufenfunktion aus der Preis-CSV. So oder so mitgeschrieben,
-        # damit Plots und Pruefungen eine Quelle haben und nicht die cfg nachschlagen muessen.
+        # The price the objective really used - a constant or the step function from the
+        # price CSV, depending on the scenario. Written out either way so plots and checks
+        # have one source and need not look up the cfg.
         for gcid, bus in self._gc_bus.items():
             p = self.grid_connectors.get(gcid, {}).get("price_ct_kWh")
             summary[f"grid_price_ct_{bus.label}"] = (
@@ -977,7 +967,7 @@ class EnergySystemModel:
                 capacity = float(self.battery_params.get(bid, {}).get(
                     "capacity_kWh", self.config.battery_capacity_kWh))
                 battery_schedule[bid] = pd.DataFrame({
-                    # der Link vom Hausbus ist der einzige Zugang zur Batterie
+                    # the link from the house bus is the only way into the battery
                     "charge_kW": self._flow(res, home_bus, node, n),
                     "discharge_kW": self._flow(res, node, home_bus, n),
                     # SOC (0..1) at the END of the step — the target step() steers to
@@ -1001,12 +991,11 @@ class EnergySystemModel:
             }, index=idx)
         self._grid_schedule = grid_schedule
 
-        # --- Kosten ---
-        # Der Zielwert in ct. Er enthaelt nur echte Preise: Bezug, Einspeisung und die
-        # winzigen Tie-Breaker (storage_cycle_penalty, late_charging_penalty). Kuenstliche
-        # Anreize gibt es keine mehr - der frueher hier verrechnete PV-Ladebonus ist samt
-        # seiner Zweige entfernt. Die EUR/a in results.json entstehen ohnehin getrennt
-        # davon, nach der Simulation aus der physikalischen Zeitreihe.
+        # --- cost ---
+        # The objective in ct: purchase, feed-in and the two tiny tie-breakers
+        # (storage_cycle_penalty, late_charging_penalty), nothing else. The EUR/a in
+        # results.json are computed separately anyway, after the simulation from the
+        # physical timeseries.
         self._costs = {"objective": float(self.model.objective())}
 
     def _save_results(self) -> None:
@@ -1031,19 +1020,19 @@ class EnergySystemModel:
         return None
 
     def get_wallbox_schedule(self) -> Dict[str, pd.DataFrame]:
-        """Der Fahrplan je Fahrzeug. ``charge_kW``/``discharge_kW`` sind der Vertrag mit
-        ``OemofSolve.commands_from_oemof``, der Rest ist Zugabe."""
+        """The schedule per vehicle. ``charge_kW``/``discharge_kW``/``soc_end`` are the
+        contract with ``OemofSolve.commands_from_oemof``, the rest is extra."""
         if self._wallbox_schedule is None:
             raise RuntimeError("get_wallbox_schedule() called before _extract_results()")
         return self._wallbox_schedule
 
     def get_plan(self) -> Dict[str, Dict[str, pd.DataFrame]]:
-        """Der ganze Fahrplan, nach Komponententyp gruppiert. Zeile k ist Simulations-
-        schritt k, die Strategie kann also direkt nachschlagen.
+        """The whole schedule, grouped by component type. Row k is simulation step k, so
+        the strategy can look it up directly.
 
-        - ``vehicles``  je Fahrzeug, wird von ``step()`` angewendet
-        - ``batteries`` je Hausbatterie, wird ebenfalls angewendet
-        - ``grid``      geplanter Netzaustausch - NICHT angewendet, dient der Kontrolle
+        - ``vehicles``  per vehicle, applied by ``step()``
+        - ``batteries`` per stationary battery, applied as well
+        - ``grid``      planned grid exchange - NOT applied, kept for verification
         """
         if self._wallbox_schedule is None:
             raise RuntimeError("get_plan() called before _extract_results()")
@@ -1054,8 +1043,8 @@ class EnergySystemModel:
         }
 
     def _export_graph(self) -> None:
-        """Die Topologie als SVG zeichnen (nur mit ``export_graph``), nach Knotentyp
-        eingefaerbt. Ohne Graphviz auf dem PATH entsteht nur die .dot-Datei."""
+        """Draw the topology as SVG (only with ``export_graph``), coloured by node type.
+        Without Graphviz on the PATH only the .dot file is written."""
         import shutil
         import subprocess
         from oemof.network.graph import create_nx_graph
