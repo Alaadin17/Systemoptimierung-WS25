@@ -37,6 +37,11 @@ def _nodes(m):
     return {n.label: n for n in m.es.nodes}
 
 
+# Diese Tests loesen wirklich - ohne Solver haben sie nichts zu sagen.
+requires_cbc = pytest.mark.skipif(shutil.which("cbc") is None,
+                                  reason="CBC solver not installed")
+
+
 def _out_flow(node):
     return list(node.outputs.values())[0]
 
@@ -159,7 +164,7 @@ def test_per_gc_load_pv_from_events():
 # ---------------------------------------------------------------------------
 # Test 3 — solve a tiny feasible model with CBC (debug mode on)
 # ---------------------------------------------------------------------------
-@pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
+@requires_cbc
 def test_solve_small_model(tmp_path, monkeypatch, caplog):
     monkeypatch.chdir(tmp_path)   # keep the debug LP dump inside the tmp dir
     idx = pd.date_range("2025-01-01", periods=4, freq="15min")
@@ -171,9 +176,7 @@ def test_solve_small_model(tmp_path, monkeypatch, caplog):
         vehicle_params={"v1": {"capacity_kWh": 50.0,
                                "connected_cs": ["CS1"] * 4, "consumption": [0, 0, 0, 0]}},
     )
-    m._create_time_index()
-    m._create_energy_system()
-    m._create_components()
+    _build_es(m)
     m._optimize()
     with caplog.at_level(logging.INFO):
         m._solve()             # raises RuntimeError if not optimal
@@ -373,7 +376,6 @@ def _fake_step_strategy():
     strat.current_time = "t0"
     strat.interval = timedelta(minutes=15)
     strat.EPS = 1e-5          # instance attribute of Strategy.__init__, bypassed here
-    strat._oemof_cfg = SystemConfig()
     vtype = SimpleNamespace(min_charging_power=0.0, v2g=False)
     vtype_v2g = SimpleNamespace(min_charging_power=0.0, v2g=True, discharge_limit=0.5)
     strat.world_state = SimpleNamespace(
@@ -523,7 +525,7 @@ def test_step_ignores_missing_soc_target():
 # ---------------------------------------------------------------------------
 # Test 3b — per-step SOC floor from the scenario (desired_soc before departure)
 # ---------------------------------------------------------------------------
-@pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
+@requires_cbc
 def test_min_soc_series_forces_desired_soc_before_departure():
     idx = pd.date_range("2025-01-01", periods=8, freq="15min")
     # plugged in for steps 0-3, drives 4-7; spice_ev wants desired_soc=0.8 when it leaves
@@ -538,9 +540,7 @@ def test_min_soc_series_forces_desired_soc_before_departure():
                                "connected_cs": ["CS1"] * 4 + [None] * 4,
                                "consumption": [0, 0, 0, 0, 4, 4, 4, 4]}},
     )
-    m._create_time_index()
-    m._create_energy_system()
-    m._create_components()
+    _build_es(m)
     m._optimize()
     m._solve()
     m._extract_results()
@@ -555,7 +555,7 @@ def test_min_soc_series_forces_desired_soc_before_departure():
 # ---------------------------------------------------------------------------
 # Test 4 — full run() extracts a per-vehicle schedule and dumps CSVs (CBC)
 # ---------------------------------------------------------------------------
-@pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
+@requires_cbc
 def test_full_run_extracts_schedule(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     idx = pd.date_range("2025-01-01", periods=8, freq="15min")
@@ -694,7 +694,7 @@ def test_no_artificial_incentives_are_left():
                          "pv_charge_bonus_battery_ct_kWh"}
 
 
-@pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
+@requires_cbc
 def test_inverter_and_station_ratings_hold():
     """Zwei Grenzen, die der Fahrplan einhalten MUSS, damit step() ihn ausfuehren kann.
 
@@ -712,7 +712,7 @@ def test_inverter_and_station_ratings_hold():
     assert eigen.max() == pytest.approx(6.0, abs=1e-6)      # und sie greift wirklich
 
 
-@pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
+@requires_cbc
 def test_pv_splits_into_selfuse_and_export():
     """Die Erzeugung geht vollstaendig in Eigenverbrauch oder Einspeisung - nichts geht weg."""
     m = _pv_scenario(SystemConfig(debug=False, should_dump_results=False))
@@ -725,7 +725,7 @@ def test_pv_splits_into_selfuse_and_export():
     assert not any(c.startswith("pv_direct") for c in s.columns)
 
 
-@pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
+@requires_cbc
 def test_battery_is_reachable_only_through_the_link():
     """Die Batterie hat genau einen Zugang - den Link vom Hausbus.
 
@@ -753,7 +753,6 @@ def test_v2g_discharge_is_capped_by_the_vehicles_own_curve():
     """
     m = _pv_scenario(SystemConfig(debug=False, enable_v2h=True), v2g=True)
     m.vehicle_params["v1"]["discharge_power_kW"] = 4.0      # Station kann 11
-    n = _nodes(m) if m.es is not None else None
     _build_es(m)
     n = _nodes(m)
     ab = list(n["wallbox_discharge_CS1_v1"].outputs.values())[0]
@@ -765,7 +764,7 @@ def test_v2g_discharge_is_capped_by_the_vehicles_own_curve():
     assert ab2.nominal_value == 11.0
 
 
-@pytest.mark.skipif(shutil.which("cbc") is None, reason="CBC solver not installed")
+@requires_cbc
 def test_forbid_simultaneous_storage_creates_binaries():
     """Der Schalter macht aus dem LP ein MILP - eine Binaervariable je Speicher und Schritt.
 

@@ -35,8 +35,8 @@ class OemofSolve(Strategy):
     """Charging strategy that follows a plan optimized with oemof.
 
     Prepares the inputs from the spice_ev scenario, builds and solves the oemof model once
-    over the full horizon (``_ensure_solved``) and caches the resulting per-vehicle plan in
-    ``self._schedule``. ``step()`` then applies that plan step by step.
+    over the full horizon (``_ensure_solved``) and caches the resulting plan in
+    ``self._plan``. ``step()`` then applies that plan step by step.
     """
 
     def __init__(self, components, start_time, **kwargs):
@@ -45,10 +45,8 @@ class OemofSolve(Strategy):
         
         # Inputs from kwargs
         self.events = kwargs.get("events")
-        self.cfg = kwargs.get("cfg")
         # Flat dict with oemof_* parameters (from simulate.cfg, prefix removed)
         self.oemof_config = kwargs.get("oemof_config", {}) or {}
-        self.vehicles = self.world_state.vehicles
         self.interval = kwargs.get("interval")
         self.stop_time = kwargs.get("stop_time")
         self.start_time = start_time
@@ -68,15 +66,9 @@ class OemofSolve(Strategy):
         # One tuple per simulation step. step() applies soc_end (the SOC the optimization
         # reaches at the END of that step); the powers are for reporting and verification.
         self._plan: Dict[str, Dict[str, list]] = {}
-        # Alias to self._plan["vehicles"], kept for existing references.
-        self._schedule: Dict[str, list] = {}
         # Index of the CURRENT simulation step = position in the lists above; step() reads
         # self._plan[<type>][<id>][self._oemof_step] and increments it afterwards.
         self._oemof_step = 0
-
-        # step() braucht die Config spaeter fuer den V2G-Entladeboden.
-        from spice_ev.oemof_model import SystemConfig
-        self._oemof_cfg = SystemConfig.from_options(self.oemof_config)
 
     def prepare_inputs(self) -> Dict[str, Any]:
         """Run the full preprocessing pipeline and store the result frames.
@@ -741,7 +733,12 @@ class OemofSolve(Strategy):
             Dict[battery_id, infos] – empty dict if there is no (valid) battery.
             infos per battery:
               capacity_kWh, power_kW (charging), discharge_power_kW (discharging),
-              initial_soc, efficiency, min_power_kW, loss_rate (dict), parent (GC).
+              initial_soc, efficiency, parent (GC).
+
+        Nicht uebergeben wird die Selbstentladung: ``StationaryBattery.loss_rate`` wendet
+        spice_ev nach jedem Schritt an (strategy.py: ``apply_battery_losses``), das LP
+        rechnet mit ``loss_rate=0.0``. Solange in den Szenarien keine Verlustrate steht,
+        faellt das nicht auf; wer eine setzt, muss sie im Modell nachziehen.
         """
         result: Dict[str, Dict[str, Any]] = {}
         for bid, bat in getattr(self.world_state, "batteries", {}).items():
@@ -763,8 +760,6 @@ class OemofSolve(Strategy):
                 "discharge_power_kW": discharge_power,
                 "initial_soc": float(getattr(bat, "soc", config.battery_initial_soc)),
                 "efficiency": float(getattr(bat, "efficiency", config.battery_efficiency)),
-                "min_power_kW": float(getattr(bat, "min_charging_power", 0.0) or 0.0),
-                "loss_rate": dict(getattr(bat, "loss_rate", {}) or {}),
                 "parent": getattr(bat, "parent", None),
             }
         return result
@@ -927,7 +922,6 @@ class OemofSolve(Strategy):
         oemof_inputs = self.build_oemof_inputs()
         results = self.run_oemof_model(oemof_inputs)
         self._plan = self.commands_from_oemof(results)
-        self._schedule = self._plan["vehicles"]   # alias, kept for existing references
         self._solved = True
         self._oemof_step = 0
 

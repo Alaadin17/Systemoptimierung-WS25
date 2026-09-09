@@ -214,6 +214,16 @@ def _as_array(values, n):
     return arr[:n]
 
 
+def _nonzero(values, n):
+    """Traegt diese Reihe ueberhaupt Energie? Entscheidet, ob ein Knoten entsteht.
+
+    Muss an allen Aufrufstellen dasselbe sagen: sonst kaeme ein Netzanschluss wegen einer
+    Last herein, fuer die anschliessend keine Senke gebaut wird. Die Summe (statt ``.any()``)
+    ist Absicht - eine Reihe, die sich zu 0 aufhebt, traegt nichts.
+    """
+    return values is not None and float(np.sum(_as_array(values, n))) > 0.0
+
+
 _WAHR = {"true", "yes", "on", "1"}
 _FALSCH = {"false", "no", "off", "0"}
 
@@ -292,7 +302,6 @@ class EnergySystemModel:
         self.time_index: Optional[pd.DatetimeIndex] = None
         self.es = None              # oemof EnergySystem (_create_energy_system)
         self.model = None           # oemof Model (_optimize)
-        self.df_timeseries: Optional[pd.DataFrame] = None   # legacy copy, not used by the model
         self._results_main = None   # processing.results(model) (_extract_results)
         self._wallbox_schedule: Optional[Dict[str, pd.DataFrame]] = None  # per vehicle
         self._battery_schedule: Optional[Dict[str, pd.DataFrame]] = None  # per stationary battery
@@ -369,16 +378,14 @@ class EnergySystemModel:
         def gc_has_battery(gcid):
             return any(bp.get("parent") == gcid for bp in self.battery_params.values())
 
-        def nonzero(arr):
-            return arr is not None and float(np.sum(_as_array(arr, periods))) > 0.0
-
         # 3) active grid connectors -> named Home_1, Home_2, ...
         self._gc_bus = {}
         n = 0
         for gcid, gc in self.grid_connectors.items():
-            has_pv = nonzero(gc.get("pv"))
+            has_pv = _nonzero(gc.get("pv"), periods)
             has_bat = gc_has_battery(gcid)
-            if not (gc_used_cs(gcid) or nonzero(gc.get("load")) or has_pv or has_bat):
+            if not (gc_used_cs(gcid) or _nonzero(gc.get("load"), periods)
+                    or has_pv or has_bat):
                 continue  # GC carries nothing -> exclude it entirely
             n += 1
             name = f"Home_{n}"
@@ -411,23 +418,23 @@ class EnergySystemModel:
         # Export vom Hausbus (Batterie/V2G). Wichtig ist nur, dass er nicht POSITIV verguetet
         # wird, waehrend Bezug billiger ist: sonst kauft das LP Strom und speist ihn im selben
         # Schritt gewinnbringend wieder ein.
-        feedin_tariff = homebus_tariff = float(self.config.grid_feedin_tariff)
+        feedin_tariff = float(self.config.grid_feedin_tariff)
         # grid feed-in sink (export from the home bus; battery/V2G)
         if self.config.enable_grid_feedin:
             self.es.add(cmp.Sink(
                 label=f"grid_feedin_{name}",
-                inputs={b: flows.Flow(variable_costs=homebus_tariff)},
+                inputs={b: flows.Flow(variable_costs=feedin_tariff)},
             ))
         # household load (fixed) if this GC has one
         load = gc.get("load")
-        if load is not None and float(np.sum(_as_array(load, periods))) > 0.0:
+        if _nonzero(load, periods):
             self.es.add(cmp.Sink(
                 label=f"household_demand_{name}",
                 inputs={b: flows.Flow(fix=_as_array(load, periods), nominal_value=1)},
             ))
         # PV on this GC; converter limit = installed plant size when the scenario has one
         pv = gc.get("pv")
-        if pv is not None and float(np.sum(_as_array(pv, periods))) > 0.0:
+        if _nonzero(pv, periods):
             self._add_pv(
                 b, name, _as_array(pv, periods), feedin_tariff,
                 float(gc.get("pv_power_kW", self.config.converter_pv_to_home_power_kW)))
@@ -498,24 +505,24 @@ class EnergySystemModel:
         # nur, wenn ein zweiter Weg IN den Speicher fuehrt, der sich sonst am Speicher vorbei
         # durch den Link zurueck ins Haus stehlen koennte. Den gab es mit dem PV-Direktzweig
         # zur Batterie; seit der weg ist, ist der Link der einzige Zugang.
-        b_bat_in = b_bat_out = buses.Bus(label=f"bus_battery_{bid}")
-        self.es.add(b_bat_in)
+        b_battery = buses.Bus(label=f"bus_battery_{bid}")
+        self.es.add(b_battery)
 
         # lossless DC/AC link between this GC's bus and the battery — it only
         # limits the power; the losses live in the storage below (like spice_ev)
         link = cmp.Link(
             label=f"link_home_battery_{bid}",
             inputs={
-                b_bat_out: flows.Flow(nominal_value=discharge_power),  # discharge
+                b_battery: flows.Flow(nominal_value=discharge_power),  # discharge
                 b_home: flows.Flow(nominal_value=power),               # charge
             },
             outputs={
                 b_home: flows.Flow(nominal_value=discharge_power),
-                b_bat_in: flows.Flow(nominal_value=power),
+                b_battery: flows.Flow(nominal_value=power),
             },
             conversion_factors={
-                (b_bat_out, b_home): 1.0,   # discharge into the home
-                (b_home, b_bat_in): 1.0,    # charge from the home
+                (b_battery, b_home): 1.0,   # discharge into the home
+                (b_home, b_battery): 1.0,   # charge from the home
             },
         )
         self.es.add(link)
@@ -523,9 +530,9 @@ class EnergySystemModel:
         storage = cmp.GenericStorage(
             label=f"home_battery_{bid}",
             # tiny penalty on BOTH directions kills free storage-cycling degeneracy
-            inputs={b_bat_in: flows.Flow(nominal_value=power,
-                                         variable_costs=self.config.storage_cycle_penalty)},
-            outputs={b_bat_out: flows.Flow(nominal_value=discharge_power,
+            inputs={b_battery: flows.Flow(nominal_value=power,
+                                          variable_costs=self.config.storage_cycle_penalty)},
+            outputs={b_battery: flows.Flow(nominal_value=discharge_power,
                                            variable_costs=self.config.storage_cycle_penalty)},
             nominal_storage_capacity=capacity,
             min_storage_level=self.config.battery_min_soc,
@@ -541,7 +548,7 @@ class EnergySystemModel:
         # forbid_simultaneous_storage an, falls es gebraucht wird
         self._storage_pairs.append({
             "label": f"home_battery_{bid}", "storage": storage,
-            "in_bus": b_bat_in, "out_bus": b_bat_out,
+            "in_bus": b_battery, "out_bus": b_battery,
             "p_in": power, "p_out": discharge_power,
         })
 
@@ -611,7 +618,6 @@ class EnergySystemModel:
         # Fahrzeug ueber die Wallbox, und die Kosten machen den Durchgang unattraktiv.
         b_mobility = buses.Bus(label=f"bus_mobility_{vid}")
         self.es.add(b_mobility)
-        b_mob_in = b_mobility
 
         # BEV battery at bus_mobility; driving demand = fixed absolute losses
         # (fixed_losses_absolute is NOT scaled by the conversion factors — the trip energy
@@ -619,7 +625,7 @@ class EnergySystemModel:
         bev = cmp.GenericStorage(
             label=f"bev_battery_{vid}",
             # tiny penalty kills the free storage-cycling degeneracy (see SystemConfig)
-            inputs={b_mob_in: flows.Flow(
+            inputs={b_mobility: flows.Flow(
                 variable_costs=self.config.storage_cycle_penalty)},
             # Non-v2g vehicles get NO storage outflow (nominal 0): energy only leaves by
             # driving (fixed_losses). An open, unbounded outflow would let the LP burn
@@ -652,7 +658,7 @@ class EnergySystemModel:
                 default=self.config.wallbox_power_kW)
             self._storage_pairs.append({
                 "label": f"bev_battery_{vid}", "storage": bev,
-                "in_bus": b_mob_in, "out_bus": b_mobility,
+                "in_bus": b_mobility, "out_bus": b_mobility,
                 "p_in": p_in, "p_out": min(p_in, p_entladen or p_in),
             })
 
