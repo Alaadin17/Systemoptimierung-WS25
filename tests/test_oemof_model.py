@@ -98,8 +98,9 @@ def test_per_gc_topology_and_pruning():
     assert {"wallbox_charge_CS1_v1", "wallbox_charge_CS2_v2"} <= labels
     assert "wallbox_discharge_CS1_v1" in labels          # v1 is v2g -> V2H
     assert "wallbox_discharge_CS2_v2" not in labels       # v2 is not v2g
-    assert not any(l.startswith("wallbox_charge_CS3_") for l in labels)   # CS3 unused
-    assert not any(l.startswith("wallbox_") and l.endswith("_v3") for l in labels)  # v3 unused
+    assert not any(lbl.startswith("wallbox_charge_CS3_") for lbl in labels)   # CS3 unused
+    assert not any(lbl.startswith("wallbox_") and lbl.endswith("_v3")
+                   for lbl in labels)                   # v3 unused
     assert "bus_mobility_v3" in labels                    # ... but every vehicle keeps a bus
 
     # grid source power = GC.max_power

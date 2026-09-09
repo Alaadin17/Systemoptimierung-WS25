@@ -43,7 +43,7 @@ class OemofSolve(Strategy):
     def __init__(self, components, start_time, **kwargs):
         super().__init__(components, start_time, **kwargs)
         self.description = "oemof_solve"
-        
+
         # Inputs from kwargs
         self.events = kwargs.get("events")
         # Flat dict with oemof_* parameters (from simulate.cfg, prefix removed)
@@ -118,19 +118,18 @@ class OemofSolve(Strategy):
         self._prepared = True
         return self.input_frames
 
-
     def _build_vehicle_events_df(self, vehicle_events) -> pd.DataFrame:
         """Build a vehicle_events dataframe.
         args:
             vehicle_events (List[VehicleEvent]): List of VehicleEvent objects.
-        
+
         returns:
                 pd.DataFrame: DataFrame with vehicle events and update fields.
-                Dataframe with columns: 
-                                        - signal_time, 
-                                        - start_time, 
-                                        - vehicle_id, 
-                                        - event_type, 
+                Dataframe with columns:
+                                        - signal_time,
+                                        - start_time,
+                                        - vehicle_id,
+                                        - event_type,
                                         - update_*
         """
 
@@ -154,24 +153,24 @@ class OemofSolve(Strategy):
 
         return df_vehicle_events
 
-
     def _build_world_state_vehicles_df(self, world_state_vehicles) -> pd.DataFrame:
         '''Build a DataFrame from a collection of WorldStateVehicles.
-    
+
         args:
-            world_state_vehicles (Dict[str, WorldStateVehicle]): Dictionary of WorldStateVehicle objects.
+            world_state_vehicles (Dict[str, WorldStateVehicle]): Dictionary of
+                WorldStateVehicle objects.
 
         returns:
             pd.DataFrame: DataFrame with the WorldStateVehicle data.
-                DataFrame with columns: 
-                                        - vehicle_id, 
-                                        - vehicle_type, 
-                                        - capacity_kwh, 
-                                        - min_charging_power, 
-                                        - v2g, 
-                                        - discharge_limit, 
-                                        - connected_charging_station, 
-                                        - desired_soc, 
+                DataFrame with columns:
+                                        - vehicle_id,
+                                        - vehicle_type,
+                                        - capacity_kwh,
+                                        - min_charging_power,
+                                        - v2g,
+                                        - discharge_limit,
+                                        - connected_charging_station,
+                                        - desired_soc,
                                         - soc
         '''
         vehicle_rows = []
@@ -196,7 +195,6 @@ class OemofSolve(Strategy):
         )
         return df_vehicles
 
-
     def _build_trip_df(self, vehicle_events, vehicles) -> pd.DataFrame:
         """Build a trip table from departure/arrival events.
 
@@ -208,11 +206,11 @@ class OemofSolve(Strategy):
             vehicles: Dict[vehicle_id, Vehicle] to access battery capacity.
 
         Returns:
-            DataFrame with columns: 
-                                    -vehicle_id, 
-                                    -departure_time, 
-                                    -arrival_time, 
-                                    -soc_delta, 
+            DataFrame with columns:
+                                    -vehicle_id,
+                                    -departure_time,
+                                    -arrival_time,
+                                    -soc_delta,
                                     -energy_kwh.
         """
         # Build a trip table from departure/arrival events per vehicle.
@@ -244,14 +242,13 @@ class OemofSolve(Strategy):
                 })
         return pd.DataFrame(rows)
 
-
     def _group_trips_by_vehicle(self, trip_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         """
         Group trips by vehicle_id.
 
         Args:
             trip_df: DataFrame with trip data including vehicle_id.
-        
+
         Returns:
             Dict mapping vehicle_id to its corresponding trip DataFrame.
         """
@@ -260,8 +257,8 @@ class OemofSolve(Strategy):
             trip_df_by_vehicle[vid] = group.sort_values("departure_time").reset_index(drop=True)
         return trip_df_by_vehicle
 
-
-    def _build_state_segments(self, vehicle_events, start_time, stop_time, vehicles=None) -> pd.DataFrame:
+    def _build_state_segments(self, vehicle_events, start_time, stop_time,
+                              vehicles=None) -> pd.DataFrame:
         """Build contiguous state segments (driving/parked) per vehicle.
 
         For each vehicle, departure and arrival events define state changes.
@@ -330,9 +327,7 @@ class OemofSolve(Strategy):
             })
         return pd.DataFrame(rows)
 
-
     def _build_time_index(self, start_time, stop_time, interval) -> pd.DatetimeIndex:
-
         """Build a time index from start_time to stop_time with given interval.
 
         The grid starts at ``start_time`` (not start+interval), so that
@@ -351,16 +346,17 @@ class OemofSolve(Strategy):
         return pd.date_range(
             start=start_time, end=stop_time - pd.Timedelta(interval), freq=interval)
 
-
-    def _map_trips_to_state_segments(self, trip_df_by_vehicle: Dict[str, pd.DataFrame], state_segments_df: pd.DataFrame) -> pd.DataFrame:
-         
+    def _map_trips_to_state_segments(self, trip_df_by_vehicle: Dict[str, pd.DataFrame],
+                                     state_segments_df: pd.DataFrame) -> pd.DataFrame:
         '''
             Map trips to state segments.
-            For each segment in state_segments_df, check whether there is an overlapping trip in trip_df_by_vehicle.
-            If so, the trip energy in kWh is written into the segment's "energy_kwh" column. Otherwise "energy_kwh" stays None.
+            For each segment in state_segments_df, check whether there is an overlapping
+            trip in trip_df_by_vehicle. If so, the trip energy in kWh is written into the
+            segment's "energy_kwh" column. Otherwise "energy_kwh" stays None.
 
             Args:
-                trip_df_by_vehicle: Dict[vehicle_id, DataFrame] with trips per vehicle (columns: departure_time, arrival_time, energy_kwh)
+                trip_df_by_vehicle: Dict[vehicle_id, DataFrame] with trips per vehicle
+                    (columns: departure_time, arrival_time, energy_kwh)
                 state_segments_df: DataFrame from _build_state_segments, i.e. columns
                     [vehicle_id, start_time, end_time, state, connected_charging_station,
                      desired_soc]
@@ -402,104 +398,107 @@ class OemofSolve(Strategy):
                 })
         return pd.DataFrame(rows)
 
-
     def _map_segments_to_timeseries(
         self, state_segments_df: pd.DataFrame, time_index: pd.DatetimeIndex, interval
     ) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
-            
-            """Build per-vehicle timeseries on a fixed time grid.
+        """Build per-vehicle timeseries on a fixed time grid.
 
-            Each row in state_segments_df represents a continuous segment [start_time, end_time)
-            with a state and optional energy_kwh. A time bin belongs to the segment iff its own
-            start lies in [start_time, end_time) — i.e. the assignment is by bin START, not by
-            overlap. Returns both per-vehicle tables and a long-format table.
+        Each row in state_segments_df represents a continuous segment [start_time, end_time)
+        with a state and optional energy_kwh. A time bin belongs to the segment iff its own
+        start lies in [start_time, end_time) — i.e. the assignment is by bin START, not by
+        overlap. Returns both per-vehicle tables and a long-format table.
 
-            Args:
-                state_segments_df: DataFrame with columns [vehicle_id, start_time, end_time,
-                    state, energy_kwh, connected_charging_station, desired_soc]; the last two
-                    are mapped onto the grid as well.
-                time_index: Iterable of timestamps defining bin starts.
-                interval: Bin width as Timedelta or a pandas-compatible frequency string (e.g. "15min").
+        Args:
+            state_segments_df: DataFrame with columns [vehicle_id, start_time, end_time,
+                state, energy_kwh, connected_charging_station, desired_soc]; the last two
+                are mapped onto the grid as well.
+            time_index: Iterable of timestamps defining bin starts.
+            interval: Bin width as Timedelta or a pandas-compatible frequency string
+                (e.g. "15min").
 
-            Returns:
-                Tuple (per_vehicle, long_df):
-                    per_vehicle: dict[vehicle_id, DataFrame] indexed by time_index.
-                    long_df: DataFrame with columns timestamp, vehicle_id, state,
-                    unterwegs, zuhause (German column names, kept), energy_kwh,
-                    connected_charging_station, desired_soc.
-            """
-            # Normalize the time index and interval to comparable types.
-            time_index = pd.DatetimeIndex(time_index)
-            if time_index.tz is not None:
-                # Remove timezone to avoid tz-aware vs tz-naive comparisons.
-                time_index = time_index.tz_localize(None)
-            interval = pd.Timedelta(interval)
+        Returns:
+            Tuple (per_vehicle, long_df):
+                per_vehicle: dict[vehicle_id, DataFrame] indexed by time_index.
+                long_df: DataFrame with columns timestamp, vehicle_id, state,
+                unterwegs, zuhause (German column names, kept), energy_kwh,
+                connected_charging_station, desired_soc.
+        """
+        # Normalize the time index and interval to comparable types.
+        time_index = pd.DatetimeIndex(time_index)
+        if time_index.tz is not None:
+            # Remove timezone to avoid tz-aware vs tz-naive comparisons.
+            time_index = time_index.tz_localize(None)
+        interval = pd.Timedelta(interval)
 
-            per_vehicle = {}
-            long_rows = []
+        per_vehicle = {}
+        long_rows = []
 
-            # Process each vehicle separately to create a per-vehicle timeseries.
-            # vid: vehicle_id, segs: all segments for this vehicle
-            # segs: DataFrame with columns [start_time, end_time, state, energy_kwh] for this vehicle
-            # Iterator over pairs (key = value of the vehicle_id column, group_df = the rows with that vehicle_id)
-            for vid, segs in state_segments_df.groupby("vehicle_id"):
-                # Initialize per-vehicle dataframe with default values.
-                df = pd.DataFrame(index=time_index)
-                df["state"] = "parked"  # Default state; will be overwritten by segments
-                df["energy_kwh"] = 0  # Default energy; will be overwritten by segments
-                df["connected_charging_station"] = None  # Default: not plugged in
-                df["desired_soc"] = np.nan  # SOC required before the next departure
+        # Process each vehicle separately to create a per-vehicle timeseries.
+        # vid: vehicle_id, segs: all segments for this vehicle
+        # segs: DataFrame with columns [start_time, end_time, state, energy_kwh] for this
+        # vehicle. Iterator over pairs (key = value of the vehicle_id column, group_df =
+        # the rows with that vehicle_id)
+        for vid, segs in state_segments_df.groupby("vehicle_id"):
+            # Initialize per-vehicle dataframe with default values.
+            df = pd.DataFrame(index=time_index)
+            df["state"] = "parked"  # Default state; will be overwritten by segments
+            df["energy_kwh"] = 0  # Default energy; will be overwritten by segments
+            df["connected_charging_station"] = None  # Default: not plugged in
+            df["desired_soc"] = np.nan  # SOC required before the next departure
 
-                # Apply each segment to all overlapping time bins.
-                # _: index of the segment (ignored), seg: the segment row with start_time, end_time, state, energy_kwh
-                for _, seg in segs.iterrows():
-                    start = pd.to_datetime(seg["start_time"])
+            # Apply each segment to all overlapping time bins.
+            # _: index of the segment (ignored), seg: the segment row with start_time,
+            # end_time, state, energy_kwh
+            for _, seg in segs.iterrows():
+                start = pd.to_datetime(seg["start_time"])
 
-                    end = pd.to_datetime(seg["end_time"])
+                end = pd.to_datetime(seg["end_time"])
 
-                    if start.tzinfo is not None:
-                        start = start.tz_localize(None)
-                    if end.tzinfo is not None:
-                        end = end.tz_localize(None)
+                if start.tzinfo is not None:
+                    start = start.tz_localize(None)
+                if end.tzinfo is not None:
+                    end = end.tz_localize(None)
 
-                    # bin ts belongs to the segment iff start <= ts < end
-                    left = time_index.searchsorted(start, side="left")
-                    right = time_index.searchsorted(end, side="left")
+                # bin ts belongs to the segment iff start <= ts < end
+                left = time_index.searchsorted(start, side="left")
+                right = time_index.searchsorted(end, side="left")
 
+                if left < right:
+                    ts_slice = time_index[left:right]
+                    df.loc[ts_slice, "state"] = seg["state"]
+                    df.loc[ts_slice, "energy_kwh"] = 0
+                    df.loc[ts_slice[-1], "energy_kwh"] = seg["energy_kwh"]
+                    df.loc[ts_slice, "connected_charging_station"] = (
+                        seg["connected_charging_station"])
+                    if seg["desired_soc"] is not None and not pd.isna(seg["desired_soc"]):
+                        df.loc[ts_slice, "desired_soc"] = float(seg["desired_soc"])
 
-                    if left < right:
-                        ts_slice = time_index[left:right]
-                        df.loc[ts_slice, "state"] = seg["state"]
-                        df.loc[ts_slice, "energy_kwh"] = 0
-                        df.loc[ts_slice[-1], "energy_kwh"] = seg["energy_kwh"]
-                        df.loc[ts_slice, "connected_charging_station"] = seg["connected_charging_station"]
-                        if seg["desired_soc"] is not None and not pd.isna(seg["desired_soc"]):
-                            df.loc[ts_slice, "desired_soc"] = float(seg["desired_soc"])
+            # Convenience boolean columns for quick filtering/plotting.
+            df["unterwegs"] = df["state"].eq("driving")
+            df["zuhause"] = df["state"].eq("parked")
+            df["vehicle_id"] = vid
 
-                # Convenience boolean columns for quick filtering/plotting.
-                df["unterwegs"] = df["state"].eq("driving")
-                df["zuhause"] = df["state"].eq("parked")
-                df["vehicle_id"] = vid
+            # Store per-vehicle and also build a long-format table.
+            per_vehicle[vid] = df
+            long_rows.append(df.reset_index().rename(columns={"index": "timestamp"}))
 
-                # Store per-vehicle and also build a long-format table.
-                per_vehicle[vid] = df
-                long_rows.append(df.reset_index().rename(columns={"index": "timestamp"}))
-
-            # Concatenate all vehicles into one long table (timestamp, vehicle_id, ...).
-            if long_rows:
-                long_df = pd.concat(long_rows, ignore_index=True)
-                long_df = long_df[["timestamp", "vehicle_id", "state", "unterwegs", "zuhause", "energy_kwh", "connected_charging_station", "desired_soc"]]
-            else:
-                long_df = pd.DataFrame(
-                    columns=["timestamp", "vehicle_id", "state", "unterwegs", "zuhause", "energy_kwh", "connected_charging_station", "desired_soc"]
-                )
-            # Return both representations: per-vehicle dict and long-format table.
-            return per_vehicle, long_df
-        
+        # Concatenate all vehicles into one long table (timestamp, vehicle_id, ...).
+        if long_rows:
+            long_df = pd.concat(long_rows, ignore_index=True)
+            long_df = long_df[["timestamp", "vehicle_id", "state", "unterwegs", "zuhause",
+                               "energy_kwh", "connected_charging_station", "desired_soc"]]
+        else:
+            long_df = pd.DataFrame(
+                columns=["timestamp", "vehicle_id", "state", "unterwegs", "zuhause",
+                         "energy_kwh", "connected_charging_station", "desired_soc"]
+            )
+        # Return both representations: per-vehicle dict and long-format table.
+        return per_vehicle, long_df
 
     # ------------------------------------------------------------------
     # Bridge spice_ev -> oemof
     # ------------------------------------------------------------------
+
     def _sample_event_list(self, ev_list, time_index: pd.DatetimeIndex) -> pd.Series:
         """
         Sample an EnergyValuesList (step function) onto the time grid.
@@ -849,7 +848,7 @@ class OemofSolve(Strategy):
         }
 
 ############################################################################
-############################ Oemof Model ###################################
+# ---------------------------- Oemof Model ----------------------------------
 ############################################################################
 
     def run_oemof_model(self, oemof_inputs: Dict[str, Any]) -> Dict[str, Dict[str, pd.DataFrame]]:
