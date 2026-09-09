@@ -28,7 +28,6 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from spice_ev import events
 from spice_ev.strategy import Strategy
 from spice_ev.util import get_cost
 
@@ -444,7 +443,6 @@ class OemofSolve(Strategy):
             # segs: DataFrame with columns [start_time, end_time, state, energy_kwh] for this vehicle
             # Iterator over pairs (key = value of the vehicle_id column, group_df = the rows with that vehicle_id)
             for vid, segs in state_segments_df.groupby("vehicle_id"):
-                print(f"Mapping segments to timeseries for vehicle {vid} with {len(segs)} segments.")
                 # Initialize per-vehicle dataframe with default values.
                 df = pd.DataFrame(index=time_index)
                 df["state"] = "parked"  # Default state; will be overwritten by segments
@@ -495,7 +493,6 @@ class OemofSolve(Strategy):
                 long_df = pd.DataFrame(
                     columns=["timestamp", "vehicle_id", "state", "unterwegs", "zuhause", "energy_kwh", "connected_charging_station", "desired_soc"]
                 )
-            print(f"Mapped segments to timeseries for {len(per_vehicle)} vehicles, resulting 1) dictionary with {len(per_vehicle)} vehicles with {len(per_vehicle)} dataframes with {len(per_vehicle[vid])} rows and 2) complete table with {len(long_df)} rows.")
             # Return both representations: per-vehicle dict and long-format table.
             return per_vehicle, long_df
         

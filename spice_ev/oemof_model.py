@@ -114,9 +114,8 @@ class SystemConfig:
     bev_max_soc: float = 0.95
     bev_initial_soc: float = 0.95
     bev_discharge_limit: float = 0.5  # min SOC for V2H/V2G discharge (spice_ev VehicleType default)
-    # Charging/discharging loss of the BEV itself (spice_ev: Battery.efficiency, default 0.95).
-    # Modelled AT THE STORAGE (inflow/outflow_conversion_factor) exactly like spice_ev does.
-    bev_efficiency: float = 0.95
+    # The BEV's own charging/discharging loss is not configured here: the strategy hands
+    # over each vehicle's Battery.efficiency, modelled AT THE STORAGE like spice_ev does.
 
     # Wallbox
     wallbox_power_kW: float = 11.0
@@ -598,7 +597,8 @@ class EnergySystemModel:
 
         # Charging/discharging loss lives IN THE BATTERY, exactly like spice_ev
         # (Battery.efficiency). The wallbox itself is lossless there, it only limits power.
-        efficiency = float(params.get("efficiency", self.config.bev_efficiency))
+        # 0.95 is spice_ev's own Battery default (battery.py); only the tests omit the key
+        efficiency = float(params.get("efficiency", 0.95))
 
         # ONE bus carries both directions; the wallbox is the only way into the vehicle.
         b_mobility = buses.Bus(label=f"bus_mobility_{vid}")
