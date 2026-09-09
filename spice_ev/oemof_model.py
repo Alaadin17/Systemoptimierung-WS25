@@ -239,14 +239,14 @@ def _coerce(name, value, typ):
             return True
         if text in _FALSCH:
             return False
-        logging.warning("oemof_%s: '%s' ist kein Wahrheitswert (erwartet true/false)",
+        logging.warning("oemof_%s: '%s' is not a boolean (expected true/false)",
                         name, value)
         return bool(value)
     if "float" in ziel or "int" in ziel:
         try:
             zahl = float(value)
         except (TypeError, ValueError):
-            logging.warning("oemof_%s: '%s' ist keine Zahl - Wert wird uebernommen wie er ist",
+            logging.warning("oemof_%s: '%s' is not a number - value taken over as is",
                             name, value)
             return value
         return int(zahl) if "int" in ziel and "float" not in ziel else zahl
@@ -775,7 +775,7 @@ class EnergySystemModel:
 
         m.speicher_nur_laden = po.Constraint(idx, rule=_laden)
         m.speicher_nur_entladen = po.Constraint(idx, rule=_entladen)
-        logging.info("Gleichzeitiges Laden/Entladen verboten: %d Binaervariablen, %d Zeilen "
+        logging.info("Simultaneous charge/discharge forbidden: %d binary variables, %d rows "
                      "(%s)", len(idx), 2 * len(idx),
                      ", ".join(sorted({lbl for lbl, _ in idx})))
 
