@@ -44,9 +44,9 @@
     },
     "grid_connectors": {
       "GC1": {
-        "max_power": 100,
+        "max_power": 30,
         "grid_operator": null,
-        "voltage_level": "MV",
+        "voltage_level": "LV",
         "cost": {
           "type": "fixed",
           "value": 0.3
@@ -73,8 +73,7 @@
             1,
             5.0
           ]
-        ],
-        "soc": 0.0
+        ]
       }
     },
     "photovoltaics": {
