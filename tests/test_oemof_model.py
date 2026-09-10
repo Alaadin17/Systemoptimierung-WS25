@@ -141,7 +141,7 @@ def test_per_gc_load_pv_from_events():
                          "GC2": SimpleNamespace(max_power=50.0)},
     )
 
-    gcs = strat._grid_connectors(idx)
+    gcs = strat._grid_connectors(idx, _roh())
 
     # grouped strictly by grid_connector_id
     assert list(gcs["GC1"]["load"]) == [1, 1, 1, 1]
@@ -226,11 +226,19 @@ def test_prices_come_from_the_config_or_the_scenario_and_nowhere_else():
                          "grid_price_from_scenario", "feedin_tariff_from_price_sheet"}
 
 
+def _roh(consumer_type="household"):
+    """Config whose markup is switched off - isolates the unit and the step function."""
+    return SystemConfig(debug=False, consumer_type=consumer_type,
+                        grid_price_markup_ct_kWh=0.0, grid_price_vat=0.0)
+
+
 def test_strategy_hands_the_model_physics_and_the_scenario_price():
     """Last, PV, Anschlussleistung, kWp - und der Bezugspreis, wenn das Szenario einen hat.
 
-    Aufschlaege gibt es keine mehr, und auch keine Umrechnung: spice_ev fuehrt gc.cost in
-    ct/kWh, also kommt der CSV-Wert unveraendert an. Die Einspeiseverguetung bleibt fest.
+    Der Aufschlag ist hier auf 0 gestellt, damit die EINHEIT allein gepruefte Sache bleibt:
+    spice_ev fuehrt gc.cost in ct/kWh, also kommt der CSV-Wert unveraendert an. Was der
+    Verbrauchertyp daraufschlaegt, prueft test_consumer_type_marks_up_the_exchange_price.
+    Die Einspeiseverguetung bleibt in jedem Fall fest.
     """
     idx = pd.date_range("2025-01-01", periods=4, freq="15min")
     strat = OemofSolve.__new__(OemofSolve)
@@ -244,13 +252,13 @@ def test_strategy_hands_the_model_physics_and_the_scenario_price():
         grid_connectors={"GC1": SimpleNamespace(max_power=30.0)},
         photovoltaics={"PV1": SimpleNamespace(parent="GC1", nominal_power=10.0)},
     )
-    info = strat._grid_connectors(idx)["GC1"]
+    info = strat._grid_connectors(idx, _roh())["GC1"]
     assert set(info) == {"load", "pv", "max_power", "pv_power_kW", "price_ct_kWh"}
     assert info["pv_power_kW"] == 10.0
     assert list(info["price_ct_kWh"]) == [30.0] * 4        # ct/kWh, unveraendert
     # ohne Preissignale bleibt der Schluessel weg -> das Modell nimmt die cfg
     strat.events.grid_operator_signals = []
-    assert "price_ct_kWh" not in strat._grid_connectors(idx)["GC1"]
+    assert "price_ct_kWh" not in strat._grid_connectors(idx, _roh())["GC1"]
     # die Preisblatt-Methoden gibt es nicht mehr - kein toter Pfad, ueber den etwas zurueckkommt
     for name in ("_retail_markup_ct", "_feedin_tariff_ct", "_homebus_feedin_tariff_ct",
                  "tariff"):
@@ -278,19 +286,120 @@ def test_scenario_price_signals_become_a_step_function():
         SimpleNamespace(grid_connector_id="GC2", start_time=idx[0],
                         cost={"type": "fixed", "value": 99.0}),   # anderer GC -> ignoriert
     ])
-    assert list(strat._grid_price_series("GC1", idx)) == [30.0, 30.0, 5.0, 5.0, 0.0, 0.0]
-    assert strat._grid_price_series("GC3", idx) is None       # keine Signale -> cfg-Wert
+    reihe = strat._grid_price_series("GC1", idx, _roh())
+    assert list(reihe) == [30.0, 30.0, 5.0, 5.0, 0.0, 0.0]
+    assert strat._grid_price_series("GC3", idx, _roh()) is None   # keine Signale -> cfg-Wert
 
     # ... und die Reihe landet als variable_costs im Modell, Schritt fuer Schritt
     m = EnergySystemModel(
         config=SystemConfig(debug=False, grid_variable_costs=35.0),
         time_index=idx,
         grid_connectors={"GC1": {"max_power": 30.0, "load": [1] * 6,
-                                 "price_ct_kWh": strat._grid_price_series("GC1", idx)}},
+                                 "price_ct_kWh": reihe}},
     )
     _build_es(m)
     kosten = _out_flow(_nodes(m)["grid_supply_Home_1"]).variable_costs
     assert [float(kosten[t]) for t in range(6)] == [30.0, 30.0, 5.0, 5.0, 0.0, 0.0]
+
+
+def test_consumer_type_marks_up_the_exchange_price():
+    """Aus dem Boersenpreis wird ein Endkundenpreis: (boerse + aufschlag) * (1 + mwst).
+
+    Die CSV eines Szenarios traegt den BOERSENpreis. Was ein Kunde zahlt, ist der plus
+    Netzentgelt, Umlagen, Konzessionsabgabe und Stromsteuer - beim Haushalt zusaetzlich
+    Mehrwertsteuer auf die Summe. Genau diese Zerlegung steckt in CONSUMER_TYPES; hier wird
+    geprueft, dass sie ankommt und dass die Overrides sie schlagen.
+    """
+    idx = pd.date_range("2025-01-01", periods=2, freq="15min")
+    strat = OemofSolve.__new__(OemofSolve)
+    strat.events = SimpleNamespace(grid_operator_signals=[
+        SimpleNamespace(grid_connector_id="GC1", start_time=idx[0],
+                        cost={"type": "fixed", "value": 10.0}),   # ct/kWh Boerse
+    ])
+
+    haushalt = strat._grid_price_series("GC1", idx, SystemConfig(consumer_type="household"))
+    gewerbe = strat._grid_price_series("GC1", idx, SystemConfig(consumer_type="commercial"))
+    # 12.09 netto + 19 % MwSt  /  8.10 netto, Vorsteuerabzug
+    assert haushalt[0] == pytest.approx((10.0 + 12.09) * 1.19)
+    assert gewerbe[0] == pytest.approx(10.0 + 8.10)
+    assert haushalt[0] > gewerbe[0] > 10.0                  # beide teurer als die Boerse
+
+    # Overrides schlagen den Verbrauchertyp
+    eigen = strat._grid_price_series("GC1", idx, SystemConfig(
+        consumer_type="household", grid_price_markup_ct_kWh=5.0, grid_price_vat=0.0))
+    assert eigen[0] == pytest.approx(15.0)
+
+    # ein Aufschlag hebt negative Boersenpreise ueber null - die Kappung greift dann nicht
+    strat.events.grid_operator_signals[0].cost["value"] = -4.0
+    assert strat._grid_price_series(
+        "GC1", idx, SystemConfig(consumer_type="household"))[0] == pytest.approx(
+            (-4.0 + 12.09) * 1.19)
+    # ohne Aufschlag bleibt sie als Schutz aktiv
+    assert strat._grid_price_series("GC1", idx, _roh())[0] == 0.0
+
+
+def test_unknown_consumer_type_warns_and_falls_back(caplog):
+    """Ein Tippfehler im cfg soll den Lauf nicht abbrechen, aber auffallen."""
+    with caplog.at_level(logging.WARNING):
+        markup, vat = SystemConfig(consumer_type="Haushalt").consumer_tariff()
+    assert (markup, vat) == SystemConfig(consumer_type="household").consumer_tariff()
+    assert "Haushalt" in caplog.text and "household" in caplog.text
+    # der Schluessel kommt aus der cfg an
+    assert SystemConfig.from_options(
+        {"oemof_consumer_type": "commercial"}).consumer_tariff() == (8.10, 0.00)
+
+
+def test_flat_fallback_price_is_never_marked_up():
+    """Ohne Szenario-Kurve gilt grid_variable_costs - und das ist schon ein Endkundenpreis.
+
+    Ein Aufschlag darauf wuerde Netzentgelt, Umlagen und Steuern doppelt zaehlen. Der
+    Aufschlag darf also ausschliesslich auf die Szenario-Kurve wirken.
+    """
+    idx = pd.date_range("2025-01-01", periods=4, freq="15min")
+    m = EnergySystemModel(
+        config=SystemConfig(debug=False, consumer_type="household",
+                            grid_variable_costs=35.0),
+        time_index=idx,
+        grid_connectors={"GC1": {"max_power": 30.0, "load": [1] * 4}},   # kein price_ct_kWh
+    )
+    _build_es(m)
+    # oemof normalisiert variable_costs zur Reihe je Schritt - alle Schritte 35, nicht 41.6
+    kosten = _out_flow(_nodes(m)["grid_supply_Home_1"]).variable_costs
+    assert [float(kosten[t]) for t in range(4)] == [35.0] * 4
+
+
+@requires_cbc
+def test_scalar_results_carry_the_grid_peak(tmp_path, monkeypatch):
+    """dump_costs.csv traegt die Lastspitze - damit ein Tarif SPAETER gerechnet werden kann.
+
+    Das Modell selbst bewertet keine Leistung: kein Leistungspreis in der Zielfunktion,
+    bewusst, sonst dominierte ein Jahresbetrag einen Wochenfahrplan. Es gibt statt dessen
+    die Spitze, die Energie und die Horizontlaenge heraus.
+    """
+    monkeypatch.chdir(tmp_path)
+    idx = pd.date_range("2025-01-01", periods=8, freq="15min")
+    m = EnergySystemModel(
+        config=SystemConfig(debug=False, should_dump_results=True, output_dir="out",
+                            consumer_type="commercial"),
+        time_index=idx,
+        grid_connectors={"GC1": {"max_power": 30.0, "load": [1, 1, 9, 1, 1, 1, 1, 1]}},
+    )
+    m.run()
+
+    k = m._costs
+    reihe = m._summary_df["grid_supply_Home_1"]
+    assert k["grid_peak_kW_Home_1"] == pytest.approx(float(reihe.max()))
+    assert k["grid_energy_kWh_Home_1"] == pytest.approx(float(reihe.sum()) * 0.25)
+    assert k["consumer_type"] == "commercial"
+    assert k["periods"] == 8 and k["step_hours"] == pytest.approx(0.25)
+    assert k["fraction_year"] == pytest.approx(8 * 0.25 / 8760.0)
+    # die Spitze ist die Lastspitze des Zeitraums, nicht der Mittelwert
+    assert k["grid_peak_kW_Home_1"] > k["grid_energy_kWh_Home_1"] / (8 * 0.25)
+    # kein Euro-Betrag im Modell - der Tarif ist eine nachgelagerte Entscheidung
+    assert not any("eur" in name.lower() or "capacity" in name.lower() for name in k)
+
+    dump = pd.read_csv(tmp_path / "out" / "dump_costs.csv")
+    assert dump.loc[0, "grid_peak_kW_Home_1"] == pytest.approx(k["grid_peak_kW_Home_1"])
 
 
 def test_from_options_coerces_cfg_types():

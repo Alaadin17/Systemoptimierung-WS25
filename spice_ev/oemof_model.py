@@ -164,6 +164,19 @@ class SystemConfig:
     grid_variable_costs: float = 35.0
     grid_feedin_tariff: float = 0.0   # negative = revenue; 0 = feeding in earns nothing
 
+    # --- consumer type ---------------------------------------------------------------
+    # A price CSV holds the EXCHANGE price. What a customer actually pays is that price
+    # plus grid fee, levies, concession fee and electricity tax, and for a household plus
+    # VAT on the sum. consumer_type picks those components from CONSUMER_TYPES; the two
+    # fields below override them when a study needs its own numbers.
+    #
+    # The markup applies ONLY to a price series the scenario brings along
+    # (include_price_csv). Without one, grid_variable_costs applies, and that is already a
+    # complete retail price - adding a markup there would count the same components twice.
+    consumer_type: str = "household"
+    grid_price_markup_ct_kWh: Optional[float] = None   # None = from consumer_type
+    grid_price_vat: Optional[float] = None             # None = from consumer_type
+
     # Solver
     solver: str = "cbc"
     solver_verbose: bool = False
@@ -192,6 +205,43 @@ class SystemConfig:
                 continue
             setattr(config, name, _coerce(name, value, typ[name]))
         return config
+
+    def consumer_tariff(self):
+        """(markup in ct/kWh, VAT factor) for this consumer type; overrides win.
+
+        An unknown ``consumer_type`` warns and falls back to the household values rather
+        than raising - a typo in a cfg should not abort a run that is otherwise fine.
+        """
+        if self.consumer_type not in CONSUMER_TYPES:
+            logging.warning("Unknown oemof_consumer_type %r - using 'household'. Known: %s",
+                            self.consumer_type, ", ".join(sorted(CONSUMER_TYPES)))
+        markup, vat = CONSUMER_TYPES.get(self.consumer_type, CONSUMER_TYPES["household"])
+        if self.grid_price_markup_ct_kWh is not None:
+            markup = float(self.grid_price_markup_ct_kWh)
+        if self.grid_price_vat is not None:
+            vat = float(self.grid_price_vat)
+        return markup, vat
+
+
+# What a consumer pays ON TOP of the exchange price: (markup ct/kWh, VAT factor).
+# Both numbers are the sum of the components in examples/data/price_sheet.json,
+# default_grid_operator, so they can be checked against it:
+#
+#                              household (SLP)   commercial (RLM, MV)
+#   grid_fee commodity_charge        7.48              3.49
+#   levies (sum of five)             1.237             1.237
+#   concession_fee                   1.32              1.32
+#   tax_on_electricity               2.05              2.05
+#                              ---------------   --------------------
+#                                   12.09 ct           8.10 ct
+#   value_added_tax                  19 %              0 % (reclaimable)
+#
+# power_procurement (7.70 ct) is deliberately NOT part of the markup - that IS the energy,
+# and the energy comes from the exchange series.
+CONSUMER_TYPES = {
+    "household":  (12.09, 0.19),
+    "commercial": (8.10, 0.00),
+}
 
 
 def _as_array(values, n):
@@ -542,11 +592,7 @@ class EnergySystemModel:
     def _loss_factor(self) -> float:
         """kWh/step -> kW factor: oemof multiplies fixed_losses_absolute by the step
         duration (hours), so divide the per-step kWh by the step hours."""
-        if len(self.time_index) > 1:
-            step_hours = (self.time_index[1] - self.time_index[0]) / pd.Timedelta(hours=1)
-        else:
-            step_hours = 0.25
-        return 1.0 / step_hours
+        return 1.0 / self._step_hours()
 
     def _add_vehicle(self, vid, params) -> None:
         """One vehicle: mobility bus + storage. The wallboxes are built by ``_add_wallbox``.
@@ -991,15 +1037,44 @@ class EnergySystemModel:
             }, index=idx)
         self._grid_schedule = grid_schedule
 
-        # --- cost ---
+        # --- scalar results ---
         # The objective in ct: purchase, feed-in and the two tiny tie-breakers
         # (storage_cycle_penalty, late_charging_penalty), nothing else. The EUR/a in
         # results.json are computed separately anyway, after the simulation from the
         # physical timeseries.
-        self._costs = {"objective": float(self.model.objective())}
+        step_hours = self._step_hours()
+        self._costs = {
+            "objective": float(self.model.objective()),
+            "consumer_type": self.config.consumer_type,
+            "periods": n,
+            "step_hours": step_hours,
+            # share of a year the simulated horizon covers - needed to pro-rate any annual
+            # tariff onto this run
+            "fraction_year": n * step_hours / 8760.0,
+        }
+        # Peak and energy per grid connector, for a tariff calculation done LATER and
+        # outside the model. The model itself prices energy only: no capacity charge enters
+        # the objective, deliberately - an annual amount would dominate a one-week schedule.
+        for bus in self._gc_bus.values():
+            spalte = f"grid_supply_{bus.label}"
+            if spalte not in self._summary_df.columns:
+                continue
+            reihe = self._summary_df[spalte]
+            self._costs[f"grid_peak_kW_{bus.label}"] = float(reihe.max())
+            self._costs[f"grid_energy_kWh_{bus.label}"] = float(reihe.sum() * step_hours)
+
+    def _step_hours(self) -> float:
+        """Length of one time step in hours (0.25 for a 15-minute grid)."""
+        if self.time_index is not None and len(self.time_index) > 1:
+            return (self.time_index[1] - self.time_index[0]) / pd.Timedelta(hours=1)
+        return 0.25
 
     def _save_results(self) -> None:
-        """Write the schedule, summary and cost as CSV into ``config.output_dir``."""
+        """Write the schedule, summary and scalar results as CSV into ``config.output_dir``.
+
+        ``<stem>_costs.csv`` is one row: the objective plus what a later tariff calculation
+        needs - the consumer type, the horizon length, and the grid peak and energy per
+        connector."""
         if not self.config.should_dump_results:
             return
         out = Path(self.config.output_dir)

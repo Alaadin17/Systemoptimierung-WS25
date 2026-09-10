@@ -591,13 +591,14 @@ class OemofSolve(Strategy):
         aligned.index = time_index
         return aligned
 
-    def _grid_connectors(self, time_index) -> Dict[str, Dict[str, Any]]:
+    def _grid_connectors(self, time_index, config) -> Dict[str, Dict[str, Any]]:
         """Per grid connector: max_power plus its OWN household load and PV timeseries.
 
         The oemof model builds one bus (Home_<n>) + source + feed-in sink per active GC;
         each GC also carries its own load and PV, grouped by the events'
         ``grid_connector_id``. Returns {gcid: {"load", "pv", "max_power" (if the GC has
-        one), "price_ct_kWh" (only when the scenario carries price signals, see
+        one), "price_ct_kWh" (the retail price - only when the scenario carries price
+        signals, see
         ``_grid_price_series``), "pv_power_kW" (installed kWp, only when > 0)}}.
         """
         fixed = getattr(self.events, "fixed_load_lists", {})
@@ -611,9 +612,10 @@ class OemofSolve(Strategy):
             mp = getattr(gc, "max_power", None)
             if mp:
                 info["max_power"] = float(mp)
-            # Purchase price: if the scenario carries price signals they apply, otherwise
-            # the fixed cfg value. The feed-in tariff is always fixed (grid_feedin_tariff).
-            preis = self._grid_price_series(gcid, time_index)
+            # Purchase price: if the scenario carries price signals they apply (exchange
+            # price plus the consumer type's markup), otherwise the fixed cfg value. The
+            # feed-in tariff is always fixed (grid_feedin_tariff).
+            preis = self._grid_price_series(gcid, time_index, config)
             if preis is not None:
                 info["price_ct_kWh"] = preis
             kwp = self._pv_kwp(gcid)
@@ -630,8 +632,9 @@ class OemofSolve(Strategy):
                 total = total.add(self._sample_event_list(ev_list, time_index), fill_value=0.0)
         return total.to_numpy()
 
-    def _grid_price_series(self, gcid, time_index) -> Optional[np.ndarray]:
-        """The purchase price per time step - exactly the one spice_ev sees.
+    def _grid_price_series(self, gcid, time_index, config) -> Optional[np.ndarray]:
+        """The retail purchase price per time step: the scenario's exchange price plus the
+        markup of ``config.consumer_type``.
 
         spice_ev does not keep prices as a timeseries but as GridOperatorSignal EVENTS: one
         ``cost`` dict per event, valid from its ``start_time`` until the next signal.
@@ -640,23 +643,33 @@ class OemofSolve(Strategy):
         in every step - with the same ``util.get_cost`` that greedy, balanced and
         balanced_market use.
 
-        The values are taken over UNCHANGED, because spice_ev keeps gc.cost in ct/kWh:
-        scenario.py and costs.py both divide by 100 to get EUR, and the default column name
-        in generate.py is "price [ct/kWh]". So the CSV unit is ct/kWh - whoever writes
-        EUR/kWh there is off by a factor of 100. The cross-check is the generated
-        timeseries.csv, column "price [ct/kWh]": it must show the same value as
-        grid_price_ct_<GC> in dump_summary.csv.
+        Unit: ct/kWh. spice_ev keeps gc.cost in ct/kWh (scenario.py and costs.py both divide
+        by 100 to get EUR, and generate.py names the column "price [ct/kWh]" by default), so
+        the CSV is read unchanged - whoever writes EUR/kWh there is off by a factor of 100.
 
-        No price sheet and no tariff markup are applied - the value from the CSV is all
-        there is. Without price signals (or with include_price_csv commented out) the
-        method returns None and the fixed grid_variable_costs from the cfg applies.
+        What the CSV holds is the EXCHANGE price. On top of it comes what the customer
+        really pays - grid fee, levies, concession fee, electricity tax and, for a
+        household, VAT on the sum:
+
+            price = (exchange + markup) * (1 + vat)
+
+        Both numbers come from ``SystemConfig.consumer_tariff()``; see CONSUMER_TYPES in
+        oemof_model.py for the components. The markup applies ONLY here, to a series the
+        scenario brings along. Without price signals this returns None and the flat
+        ``grid_variable_costs`` applies, which is already a complete retail price - marking
+        that up would count the same components twice.
+
+        Note the reported series in dump_summary.csv (grid_price_ct_<GC>) is this retail
+        price, while spice_ev's own timeseries.csv column "price [ct/kWh]" stays the raw
+        exchange price: the markup lives in the LP, not in the scenario.
 
         ONE deliberate difference to spice_ev: NEGATIVE prices are clipped to 0. An LP
         cannot be forbidden to get rid of energy - charging and discharging in the same
         step burns it through the efficiency. Being PAID to draw power then becomes a money
         pump: buy, destroy, collect again. A real house cannot do that and spice_ev does
-        not simulate it either - only the LP would find it. At 0 ct the model still charges
-        everything that is useful to it; only the reward for destroying energy is gone.
+        not simulate it either - only the LP would find it. With a markup a negative
+        exchange price usually turns positive anyway, so the clip rarely fires; it stays as
+        a guard for a markup of 0.
         """
         signale = [s for s in getattr(self.events, "grid_operator_signals", []) or []
                    if getattr(s, "grid_connector_id", None) == gcid
@@ -673,7 +686,9 @@ class OemofSolve(Strategy):
         if ziel.tz is not None:
             ziel = ziel.tz_localize(None)
         starts = pd.DatetimeIndex([p[0] for p in paare])
-        werte = np.maximum(np.array([p[1] for p in paare]), 0.0)
+        aufschlag, mwst = config.consumer_tariff()
+        boerse = np.array([p[1] for p in paare])
+        werte = np.maximum((boerse + aufschlag) * (1.0 + mwst), 0.0)
         idx = np.searchsorted(starts, ziel, side="right") - 1
         idx = np.clip(idx, 0, len(werte) - 1)   # before the first signal its value applies
         return werte[idx]
@@ -842,7 +857,7 @@ class OemofSolve(Strategy):
             "config": config,
             "time_index": self.time_index,
             "vehicle_params": vehicle_params,
-            "grid_connectors": self._grid_connectors(self.time_index),
+            "grid_connectors": self._grid_connectors(self.time_index, config),
             "battery_params": self._battery_params(config),
             "charging_stations": charging_stations,
         }
