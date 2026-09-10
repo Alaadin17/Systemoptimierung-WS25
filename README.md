@@ -115,16 +115,16 @@ renders the built topology as SVG.
 
 **Run the 7-day single-vehicle example** (PV, house battery, household load, price curve):
 ```sh
-python generate.py --config systemoptimierung/examples/example_2/generate.cfg
-python simulate.py --config systemoptimierung/examples/example_2/simulate.cfg
+python generate.py --config systemoptimierung/examples/01_household_baseline/generate.cfg
+python simulate.py --config systemoptimierung/examples/01_household_baseline/simulate.cfg
 ```
 The last line printed is `Costs at GC1: 261.99 €/a`. Outputs land in
-`systemoptimierung/examples/example_2/results/`: spice_ev's `timeseries.csv`, `soc.csv` and
+`systemoptimierung/examples/01_household_baseline/results/`: spice_ev's `timeseries.csv`, `soc.csv` and
 `results.json`, and the model's own dumps `dump_summary.csv` (grid, PV, battery SOC and
 wallbox power per step), `dump_wallbox_<vehicle>.csv` (the plan per vehicle),
 `dump_costs.csv` (the objective) and, with `oemof_debug = true`, the LP file. Further
-examples: `example_4` (four vehicles, `oemof_solve` against the built-in strategies in
-`example_4/laeufe/`) and `example_5` (a V2G-capable vehicle with `oemof_enable_v2h = true`).
+examples: `02_commercial_fleet` (four vehicles, `oemof_solve` against the built-in strategies in
+`02_commercial_fleet/laeufe/`) and `03_household_v2g` (a V2G-capable vehicle with `oemof_enable_v2h = true`).
 
 **Configuration** is a set of `oemof_*` keys in the simulate config; every key is explained
 in `examples/configs/simulate_with_oemof.cfg`. Two rules for that file: booleans must be

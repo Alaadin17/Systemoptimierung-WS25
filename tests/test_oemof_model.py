@@ -750,7 +750,7 @@ def test_v2g_discharge_is_capped_by_the_vehicles_own_curve():
     spice_ev bildet die Entladekurve aus der Ladekurve mal ``v2g_power_factor`` (Default
     0.5) und ``Battery.unload`` begrenzt darauf. Plant das Modell mit der vollen
     Stationsleistung, liefert die Simulation weniger und der geplante SOC laeuft weg - in
-    example_5 waren das 5.27 kW je Schritt, bis die Grenze durchgereicht wurde.
+    03_household_v2g waren das 5.27 kW je Schritt, bis die Grenze durchgereicht wurde.
     """
     m = _pv_scenario(SystemConfig(debug=False, enable_v2h=True), v2g=True)
     m.vehicle_params["v1"]["discharge_power_kW"] = 4.0      # Station kann 11

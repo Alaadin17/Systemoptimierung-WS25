@@ -812,7 +812,7 @@ class OemofSolve(Strategy):
             # curve by vehicle_type.v2g_power_factor (default 0.5) into the discharge_curve,
             # and Battery.unload clamps to it. Without this value the LP plans up to the
             # full station power, the simulation delivers half, and the planned SOC drifts
-            # away - measured in example_5 as 5.27 kW per step before the value was passed.
+            # away - measured in 03_household_v2g as 5.27 kW per step before the value was passed.
             entladeleistung = getattr(
                 getattr(getattr(veh, "battery", None), "unloading_curve", None),
                 "max_power", None)
