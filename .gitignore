@@ -29,7 +29,6 @@ systemoptimierung/examples/**/laeufe/*/*
 # not part of the handover
 systemoptimierung/examples/**/zwischenschritt/
 systemoptimierung/examples/dokumentation/
-systemoptimierung/examples/example_1/input_timeseries.csv
 systemoptimierung/examples/**/__pycache__/
 # default output folder when simulate.py runs without oemof_output_dir
 /results/
