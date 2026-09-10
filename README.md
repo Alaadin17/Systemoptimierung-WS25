@@ -103,7 +103,7 @@ against which the built-in strategies can be measured, not a strategy a real hou
 
 Code: `spice_ev/strategies/oemof_solve.py` (bridge between scenario and model) and
 `spice_ev/oemof_model.py` (the model). Tests: `python -m pytest tests/test_oemof_model.py`
-(23 tests; the 7 that solve are skipped without CBC).
+(27 tests; the ones that solve are skipped without CBC).
 
 **Requirements** - not installed by `pip install -e .`, which pulls nothing:
 ```sh
@@ -118,13 +118,36 @@ renders the built topology as SVG.
 python generate.py --config systemoptimierung/examples/01_household_baseline/generate.cfg
 python simulate.py --config systemoptimierung/examples/01_household_baseline/simulate.cfg
 ```
-The last line printed is `Costs at GC1: 261.99 €/a`. Outputs land in
+The last line printed is `Costs at GC1: 335.34 €/a` - spice_ev's own cost calculation, see
+the two notes at the end of this section. Outputs land in
 `systemoptimierung/examples/01_household_baseline/results/`: spice_ev's `timeseries.csv`, `soc.csv` and
 `results.json`, and the model's own dumps `dump_summary.csv` (grid, PV, battery SOC and
 wallbox power per step), `dump_wallbox_<vehicle>.csv` (the plan per vehicle),
-`dump_costs.csv` (the objective) and, with `oemof_debug = true`, the LP file. Further
-examples: `02_commercial_fleet` (four vehicles, `oemof_solve` against the built-in strategies in
-`02_commercial_fleet/laeufe/`) and `03_household_v2g` (a V2G-capable vehicle with `oemof_enable_v2h = true`).
+`dump_costs.csv` (see below) and, with `oemof_debug = true`, the LP file. Further examples:
+`02_commercial_fleet` (four vehicles, `oemof_solve` against the built-in strategies in
+`02_commercial_fleet/laeufe/`) and `03_household_v2g` (a V2G-capable vehicle with
+`oemof_enable_v2h = true`).
+
+**Consumer type.** A price CSV holds the EXCHANGE price. `oemof_consumer_type` says what a
+customer pays on top of it - grid fee, levies, concession fee, electricity tax, and for a
+household VAT on the sum:
+
+    price = (exchange + markup) * (1 + vat)
+    household   12.09 ct net + 19 % VAT        commercial   8.10 ct net, VAT reclaimable
+
+Both numbers are sums of components in `examples/data/price_sheet.json`; the breakdown is in
+`CONSUMER_TYPES` in `spice_ev/oemof_model.py`. Override the pair with
+`oemof_grid_price_markup_ct_kWh` / `oemof_grid_price_vat`. The markup applies only to a
+price series the scenario brings along - the flat `oemof_grid_variable_costs` is already a
+retail price and is never marked up.
+
+**Capacity charge.** The LP prices energy only; no capacity charge enters the objective,
+because an annual amount would dominate a one-week schedule. Instead `dump_costs.csv`
+reports what a tariff calculation needs afterwards: `grid_peak_kW_<gc>` and
+`grid_energy_kWh_<gc>` per connector, plus `consumer_type`, `periods`, `step_hours` and
+`fraction_year`. Note that spice_ev's own capacity charge in `results.json` is selected by
+the STRATEGY NAME (`simulate.py:71` bills greedy/balanced/distributed as SLP and everything
+else as RLM), so it is not comparable across strategies - use the reported peak.
 
 **Configuration** is a set of `oemof_*` keys in the simulate config; every key is explained
 in `examples/configs/simulate_with_oemof.cfg`. Two rules for that file: booleans must be
