@@ -124,14 +124,6 @@ class SystemConfig:
     wallbox_efficiency_charge: float = 1.0
     wallbox_efficiency_discharge: float = 1.0
     enable_v2h: bool = True
-    # At a CONSTANT price the LP does not care when it charges before departure - there
-    # are infinitely many equally cheap solutions and the solver picks one arbitrarily
-    # (in a plot that looks like random charging blocks in the middle of the night). With
-    # this switch earlier charging gets a tiny surcharge, so that on a tie the model
-    # charges as LATE as possible - close to departure and thus closer to the morning PV.
-    # The amount is so small that it never overrides a real price difference.
-    prefer_late_charging: bool = False
-    late_charging_penalty: float = 0.001   # ct/kWh in the first step, falling to 0
 
     # Tiny anti-degeneracy cost (ct/kWh) on storage charging and V2H feed-back. Without it
     # the LP may cycle energy pointlessly (storage out -> in, or wallbox charge+discharge in
@@ -713,12 +705,6 @@ class EnergySystemModel:
         """
         periods = self.config.periods
         power = float(self.charging_stations[csid].get("max_power", self.config.wallbox_power_kW))
-        # Optional tiny surcharge falling over time: resolves the degeneracy at a constant
-        # price by making later charging marginally cheaper (see SystemConfig).
-        late_costs = 0
-        if self.config.prefer_late_charging and periods > 1:
-            late_costs = (self.config.late_charging_penalty
-                          * (1.0 - np.arange(periods) / (periods - 1)))
         for vid in users:
             node = self._vehicle_nodes[vid]
             mask = self._cs_mask(node["connected_cs"], csid, periods)
@@ -728,8 +714,7 @@ class EnergySystemModel:
             # reach max_power/efficiency and exceed the station's rating.
             wb_charge = cmp.Converter(
                 label=f"wallbox_charge_{csid}_{vid}",
-                inputs={gc_bus: flows.Flow(max=mask, nominal_value=power,
-                                           variable_costs=late_costs)},
+                inputs={gc_bus: flows.Flow(max=mask, nominal_value=power)},
                 outputs={b_mob: flows.Flow()},
                 conversion_factors={b_mob: self.config.wallbox_efficiency_charge},
             )
@@ -1038,8 +1023,8 @@ class EnergySystemModel:
         self._grid_schedule = grid_schedule
 
         # --- scalar results ---
-        # The objective in ct: purchase, feed-in and the two tiny tie-breakers
-        # (storage_cycle_penalty, late_charging_penalty), nothing else. The EUR/a in
+        # The objective in ct: purchase, feed-in and the tiny storage_cycle_penalty
+        # tie-breaker, nothing else. The EUR/a in
         # results.json are computed separately anyway, after the simulation from the
         # physical timeseries.
         step_hours = self._step_hours()
