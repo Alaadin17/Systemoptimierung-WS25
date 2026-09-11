@@ -737,7 +737,7 @@ class OemofSolve(Strategy):
         """Read ALL stationary batteries from the scenario.
 
         Args:
-            config: SystemConfig with fallback values (power/SOC/efficiency).
+            config: SystemConfig with fallback values (power/efficiency).
 
         Returns:
             Dict[battery_id, infos] – empty dict if there is no (valid) battery.
@@ -768,7 +768,7 @@ class OemofSolve(Strategy):
                 "capacity_kWh": capacity,
                 "power_kW": power,
                 "discharge_power_kW": discharge_power,
-                "initial_soc": float(getattr(bat, "soc", config.battery_initial_soc)),
+                "initial_soc": float(bat.soc),  # StationaryBattery always has it (default 0.0)
                 "efficiency": float(getattr(bat, "efficiency", config.battery_efficiency)),
                 "parent": getattr(bat, "parent", None),
             }
