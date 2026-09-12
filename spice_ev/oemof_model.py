@@ -14,7 +14,6 @@ it. See ``_create_components``. Labels as they appear in the dumps, for Home_1:
 
     Home_1                          AC bus per active grid connector; {gcid: bus} in _gc_bus
       grid_supply_Home_1            purchase from the grid
-      grid_feedin_Home_1            export from the house bus (only with enable_grid_feedin)
       household_demand_Home_1       fixed load
       bus_pv_Home_1                 DC side of the PV: pv_Home_1 (source), excess_Home_1
                                     (feed-in sink), converter_pv_to_home_Home_1 (inverter,
@@ -88,7 +87,6 @@ class SystemConfig:
     # switched twice: PV and storages exist exactly when the scenario brings them.
     enable_pv_to_home: bool = True    # without the inverter PV can ONLY feed in -
     #                                   the scenario has no way to say that
-    enable_grid_feedin: bool = True   # allow export from the house bus (battery/V2G)
 
     # System parameters
     grid_supply_power_kW: float = 30.0
@@ -144,8 +142,9 @@ class SystemConfig:
     # charge. If the scenario carries price signals (include_price_csv in generate.cfg),
     # that series applies INSTEAD, per step, exactly as spice_ev's own strategies see it
     # (see OemofSolve._grid_price_series); grid_variable_costs is then without effect.
-    # grid_feedin_tariff is always fixed and applies to BOTH export paths (PV surplus and
-    # export from the house bus). Negative = revenue, 0 = no remuneration.
+    # grid_feedin_tariff is always fixed and applies to the ONE export path there is,
+    # the PV surplus. Negative = revenue, 0 = no remuneration. Energy on the house bus
+    # (battery, V2H) has no way out to the grid at all - see _add_grid_connector.
     #
     # NOTE - spice_ev's own cost calculation goes its own way: simulate.py evaluates
     # costs.py after the simulation with the price sheet (grid fees, levies, taxes,
@@ -436,8 +435,14 @@ class EnergySystemModel:
     # ------------------------------------------------------------------
     def _add_grid_connector(self, gcid, gc, b, name, cs_users) -> None:
         """Build one active grid connector ``name`` and everything on its bus ``b``:
-        grid_supply source, grid_feedin sink, household_demand, PV, batteries and the
-        wallboxes of the charging stations that belong to this GC (only used ones)."""
+        grid_supply source, household_demand, PV, batteries and the wallboxes of the
+        charging stations that belong to this GC (only used ones).
+
+        There is NO sink from the house bus to the grid. Energy that reaches this bus -
+        from the stationary battery or from a V2H-capable vehicle - can only be used in
+        the house. The single export path is the PV surplus through excess_<name>, which
+        hangs on the PV bus and is built by _add_pv.
+        """
         periods = self.config.periods
 
         # Supply source. If the strategy hands over a price series from the scenario
@@ -451,17 +456,11 @@ class EnergySystemModel:
                                 else self.config.grid_variable_costs))},
         )
         self.es.add(supply)
-        # Feed-in: the same fixed value for both paths - the PV surplus and the export
-        # from the house bus (battery/V2G). All that matters is that it is not remunerated
-        # POSITIVELY while purchase is cheaper: the LP would then buy power and feed it back
-        # in the same step at a profit.
+        # Feed-in tariff for the PV surplus. It must not be remunerated POSITIVELY while
+        # purchase is cheaper, or the LP would buy power and feed it back in the same
+        # step at a profit. The house bus has no export path, so this is the only place
+        # the tariff can be earned.
         feedin_tariff = float(self.config.grid_feedin_tariff)
-        # grid feed-in sink (export from the home bus; battery/V2G)
-        if self.config.enable_grid_feedin:
-            self.es.add(cmp.Sink(
-                label=f"grid_feedin_{name}",
-                inputs={b: flows.Flow(variable_costs=feedin_tariff)},
-            ))
         # household load (fixed) if this GC has one
         load = gc.get("load")
         if _nonzero(load, periods):
@@ -900,7 +899,7 @@ class EnergySystemModel:
         consumption), ``_battery_schedule`` per stationary battery (charge/discharge kW,
         soc_end), ``_grid_schedule`` per grid connector (supply/feedin kW, verification
         only), ``_summary_df`` with one column family per node type (grid_supply_*,
-        grid_feedin_*, pv_*, pv_feedin_*, pv_selfuse_*, household_demand_*,
+        pv_*, pv_feedin_*, pv_selfuse_*, household_demand_*,
         home_battery_<bid>_soc_kWh, wallbox_charge/discharge_<vid>,
         battery_charge/discharge_<bid>, grid_price_ct_*) and ``_costs``.
         """
@@ -955,8 +954,6 @@ class EnergySystemModel:
             lbl = node.label
             if lbl.startswith("grid_supply_"):
                 summary[lbl] = self._flow(res, node, list(node.outputs)[0], n)
-            elif lbl.startswith("grid_feedin_"):
-                summary[lbl] = self._flow(res, list(node.inputs)[0], node, n)
             elif lbl.startswith("pv_") and isinstance(node, cmp.Source):
                 summary[lbl] = self._flow(res, node, list(node.outputs)[0], n)
             elif lbl.startswith("excess_"):        # PV exported to the grid (PV feed-in)
@@ -1016,9 +1013,14 @@ class EnergySystemModel:
         grid_schedule = {}
         for gcid, bus in self._gc_bus.items():
             name = bus.label
+            # The only export is the PV surplus: it leaves the PV bus through excess_,
+            # never the house bus. A GC without PV feeds in nothing.
+            excess = self._node(f"excess_{name}")
+            feedin = (self._flow(res, list(excess.inputs)[0], excess, n)
+                      if excess is not None else np.zeros(n))
             grid_schedule[gcid] = pd.DataFrame({
                 "supply_kW": self._flow(res, self._node(f"grid_supply_{name}"), bus, n),
-                "feedin_kW": self._flow(res, bus, self._node(f"grid_feedin_{name}"), n),
+                "feedin_kW": feedin,
             }, index=idx)
         self._grid_schedule = grid_schedule
 

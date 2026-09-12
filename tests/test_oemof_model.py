@@ -85,7 +85,9 @@ def test_per_gc_topology_and_pruning():
     # GC pruning + naming: GC1 -> Home_1, GC2 -> Home_2, GC3 dropped
     assert "Home_1" in labels and "Home_2" in labels and "Home_3" not in labels
     assert {"grid_supply_Home_1", "grid_supply_Home_2"} <= labels
-    assert {"grid_feedin_Home_1", "grid_feedin_Home_2"} <= labels
+    # there is no export path from the house bus - only the PV surplus leaves, and it
+    # leaves through excess_ on the PV bus
+    assert not any(lbl.startswith("grid_feedin_") for lbl in labels)
 
     # load / PV only where the GC actually has them
     assert "household_demand_Home_1" in labels and "household_demand_Home_2" not in labels
@@ -170,7 +172,7 @@ def test_solve_small_model(tmp_path, monkeypatch, caplog):
     monkeypatch.chdir(tmp_path)   # keep the debug LP dump inside the tmp dir
     idx = pd.date_range("2025-01-01", periods=4, freq="15min")
     m = EnergySystemModel(
-        config=SystemConfig(debug=True, enable_grid_feedin=False, output_dir="lp_out"),
+        config=SystemConfig(debug=True, output_dir="lp_out"),
         time_index=idx,
         grid_connectors={"GC1": {"max_power": 30.0, "load": [1, 1, 1, 1]}},
         charging_stations={"CS1": {"max_power": 11.0, "parent": "GC1"}},
@@ -215,8 +217,7 @@ def test_prices_come_from_the_config_or_the_scenario_and_nowhere_else():
     nodes = _nodes(m)
     supply = _out_flow(nodes["grid_supply_Home_1"])
     assert [float(supply.variable_costs[t]) for t in range(4)] == [35.0] * 4
-    # beide Exportwege bekommen denselben cfg-Wert
-    assert float(list(nodes["grid_feedin_Home_1"].inputs.values())[0].variable_costs[0]) == 0.0
+    # der einzige Exportweg bekommt den cfg-Wert
     assert float(list(nodes["excess_Home_1"].inputs.values())[0].variable_costs[0]) == 0.0
     # die Anlagengroesse ist KEIN Preis und kommt weiterhin aus dem Szenario
     assert list(nodes["converter_pv_to_home_Home_1"].inputs.values())[0].nominal_value == 7.5
@@ -410,12 +411,12 @@ def test_from_options_coerces_cfg_types():
     would silently be ON while the cfg says False. This actually happened once.
     """
     c = SystemConfig.from_options({"oemof_enable_v2h": "False",
-                                   "oemof_enable_grid_feedin": "FALSE",
+                                   "oemof_enable_pv_to_home": "FALSE",
                                    "oemof_forbid_simultaneous_storage": "yes",
                                    "oemof_grid_variable_costs": "22.5",
                                    "oemof_solver_threads": "4",
                                    "oemof_solver": "cbc"})
-    assert c.enable_v2h is False and c.enable_grid_feedin is False
+    assert c.enable_v2h is False and c.enable_pv_to_home is False
     assert c.forbid_simultaneous_storage is True
     assert c.grid_variable_costs == 22.5 and isinstance(c.grid_variable_costs, float)
     assert c.solver_threads == 4 and isinstance(c.solver_threads, int)
@@ -641,7 +642,7 @@ def test_min_soc_series_forces_desired_soc_before_departure():
     # plugged in for steps 0-3, drives 4-7; spice_ev wants desired_soc=0.8 when it leaves
     floor = np.array([0.2, 0.2, 0.2, 0.8, 0.2, 0.2, 0.2, 0.2])
     m = EnergySystemModel(
-        config=SystemConfig(debug=False, should_dump_results=False, enable_grid_feedin=False),
+        config=SystemConfig(debug=False, should_dump_results=False),
         time_index=idx,
         grid_connectors={"GC1": {"max_power": 30.0, "load": [1] * 8}},
         charging_stations={"CS1": {"max_power": 22.0, "parent": "GC1"}},

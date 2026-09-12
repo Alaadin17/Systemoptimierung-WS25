@@ -614,7 +614,8 @@ class OemofSolve(Strategy):
                 info["max_power"] = float(mp)
             # Purchase price: if the scenario carries price signals they apply (exchange
             # price plus the consumer type's markup), otherwise the fixed cfg value. The
-            # feed-in tariff is always fixed (grid_feedin_tariff).
+            # feed-in tariff is always fixed (grid_feedin_tariff) and only the PV
+            # surplus can earn it - the house bus has no export path.
             preis = self._grid_price_series(gcid, time_index, config)
             if preis is not None:
                 info["price_ct_kWh"] = preis
