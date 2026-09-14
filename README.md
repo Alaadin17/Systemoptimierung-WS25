@@ -94,16 +94,16 @@ python generate_schedule.py --scenario scenario.json --input examples/data/grid_
 
 ## Optimizing a Scenario with oemof (`oemof_solve`)
 `oemof_solve` is a charging strategy that replaces the heuristic by an optimization. It
-builds an [oemof.solph](https://oemof-solph.readthedocs.io) energy system from the scenario
-(one bus per grid connector; PV, house battery, wallboxes and vehicle batteries attached to
-it), solves the linear program ONCE over the whole horizon and then steers every vehicle
-and stationary battery to the planned state of charge step by step. Because the model knows
-every price and every trip in advance, the result is a lower bound on cost - the benchmark
-against which the built-in strategies can be measured, not a strategy a real house could run.
+builds an [oemof.solph](https://oemof-solph.readthedocs.io) energy system from the scenario,
+solves the linear program ONCE over the whole horizon and then steers every vehicle and
+stationary battery to the planned state of charge step by step. Because the model knows
+every price and every trip in advance, its result is a lower bound on cost - the benchmark
+against which the built-in strategies can be measured, not a strategy a real installation
+could run.
 
 Code: `spice_ev/strategies/oemof_solve.py` (bridge between scenario and model) and
 `spice_ev/oemof_model.py` (the model). Tests: `python -m pytest tests/test_oemof_model.py`
-(27 tests; the ones that solve are skipped without CBC).
+(25 tests; the ones that solve are skipped without CBC).
 
 **Requirements** - not installed by `pip install -e .`, which pulls nothing:
 ```sh
@@ -113,58 +113,29 @@ plus the [CBC solver](https://github.com/coin-or/Cbc/releases) on the `PATH` (ch
 `cbc -quit`). Graphviz `dot` on the `PATH` is optional; with `oemof_export_graph = true` it
 renders the built topology as SVG.
 
-**Run the 7-day single-vehicle example** (PV, house battery, household load, price curve):
+**Examples** live under `systemoptimierung/examples/`. Each folder brings its own
+`generate.cfg`, `simulate.cfg`, scenario and input timeseries:
+
+| Folder | What it demonstrates |
+|---|---|
+| `01_household_baseline` | one vehicle, PV, house battery, household grid connection |
+| `02_commercial_fleet` | four vehicles, `oemof_solve` against five built-in strategies |
+| `03_household_v2g` | the baseline with a V2H-capable vehicle |
+
+Run one of them with:
 ```sh
 python generate.py --config systemoptimierung/examples/01_household_baseline/generate.cfg
 python simulate.py --config systemoptimierung/examples/01_household_baseline/simulate.cfg
 ```
-The last line printed is `Costs at GC1: 335.34 €/a` - spice_ev's own cost calculation, see
-the two notes at the end of this section. Outputs land in
-`systemoptimierung/examples/01_household_baseline/results/`: spice_ev's `timeseries.csv`, `soc.csv` and
-`results.json`, and the model's own dumps `dump_summary.csv` (grid, PV, battery SOC and
-wallbox power per step), `dump_wallbox_<vehicle>.csv` (the plan per vehicle),
-`dump_costs.csv` (see below) and, with `oemof_debug = true`, the LP file. Further examples:
-`02_commercial_fleet` (four vehicles, `oemof_solve` against the built-in strategies in
-`02_commercial_fleet/laeufe/`) and `03_household_v2g` (a V2G-capable vehicle with
-`oemof_enable_v2h = true`).
-
-**Retail markup.** A price CSV holds the EXCHANGE price. What a customer really pays is that
-price plus grid fee, levies, concession fee, electricity tax and, where it applies, VAT on
-the sum. Two plain cfg values say how much:
-
-    price = (exchange + oemof_grid_price_markup_ct_kWh) * (1 + oemof_grid_price_vat)
-
-Both default to `0.0`, so without them the LP calculates with the raw exchange price. Any
-consumer group is a different pair of numbers, not a different case in the code. For
-orientation, the sums of the components in `examples/data/price_sheet.json`:
-
-    household   12.09 ct net + 19 % VAT        commercial   8.10 ct net, VAT reclaimable
-
-On the example series this turns 1.72 .. 17.10 ct into 16.43 .. 34.74 for the household
-pair and 9.82 .. 25.20 for the commercial pair. `power_procurement` (7.70 ct) is NOT part of
-the markup - that is the energy, and the energy comes from the exchange series. The VAT
-stays a separate number because it applies to the SUM: folded into the markup it would make
-the effective markup depend on the exchange price. The markup applies only to a price series
-the scenario brings along - the flat `oemof_grid_variable_costs` is already a retail price
-and is never marked up.
-
-**Capacity charge.** The LP prices energy only; no capacity charge enters the objective,
-because an annual amount would dominate a one-week schedule. Instead `dump_costs.csv`
-reports what a tariff calculation needs afterwards: `grid_peak_kW_<gc>` and
-`grid_energy_kWh_<gc>` per connector, plus `markup_ct_kWh`, `vat`, `periods`, `step_hours`
-and `fraction_year`. Note that spice_ev's own capacity charge in `results.json` is selected by
-the STRATEGY NAME (`simulate.py:71` bills greedy/balanced/distributed as SLP and everything
-else as RLM), so it is not comparable across strategies - use the reported peak.
+Results land in that folder: spice_ev's own `timeseries.csv`, `soc.csv` and `results.json`,
+plus the model's `dump_*.csv`.
 
 **Configuration** is a set of `oemof_*` keys in the simulate config; every key is explained
-in `examples/configs/simulate_with_oemof.cfg`. Two rules for that file: booleans must be
-lowercase `true`/`false`, and nothing may follow a value on its line. Two things to know when
-reading results: the LP prices energy with the scenario's price signals (ct/kWh, from
-`include_price_csv`) or the constant `oemof_grid_variable_costs`, while the EUR/a in
-`results.json` come from spice_ev's own cost calculation with the price sheet - they answer
-different questions; and with `oemof_solver_threads > 1` CBC is not deterministic, so two
-runs can differ in how they split energy between equally priced paths at the same objective -
-compare totals, not single steps.
+once in `examples/configs/simulate_with_oemof.cfg`. Two rules for that file: booleans must
+be lowercase `true`/`false`, and nothing may follow a value on its line. One thing to know
+when comparing runs: with `oemof_solver_threads > 1` CBC is not deterministic, so two runs
+can differ in how they split energy between equally priced paths at the same objective -
+compare totals and peaks, not single steps.
 
 # Integrating SimBEV
 SpiceEV supports scenarios generated by the [SimBEV](https://github.com/rl-institut/simbev) tool. Convert SimBEV output files to a SpiceEV scenario: 
