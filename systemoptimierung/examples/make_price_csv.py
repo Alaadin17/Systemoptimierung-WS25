@@ -4,8 +4,8 @@ Why this exists: the three ``input_preis.csv`` used to be hand-made artefacts th
 in the repository could reproduce - and one of them carried a flat +20 ct markup baked into
 every row, which made that example incomparable to the others. The exchange series now
 lives in ONE file, ``input_preis_boerse.csv``, and this script copies it into each example.
-The markup is a model parameter (``oemof_consumer_type``, see ``spice_ev/oemof_model.py``),
-so the CSVs stay pure exchange prices.
+The markup is a cfg parameter (``oemof_grid_price_markup_ct_kWh`` and
+``oemof_grid_price_vat`` in the simulate config), so the CSVs stay pure exchange prices.
 
 Each example needs its own copy because ``generate.py`` stores the bare file name in
 scenario.json and spice_ev resolves it relative to that file (``spice_ev/events.py:194``).

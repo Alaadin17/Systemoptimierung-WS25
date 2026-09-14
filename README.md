@@ -128,24 +128,31 @@ wallbox power per step), `dump_wallbox_<vehicle>.csv` (the plan per vehicle),
 `02_commercial_fleet/laeufe/`) and `03_household_v2g` (a V2G-capable vehicle with
 `oemof_enable_v2h = true`).
 
-**Consumer type.** A price CSV holds the EXCHANGE price. `oemof_consumer_type` says what a
-customer pays on top of it - grid fee, levies, concession fee, electricity tax, and for a
-household VAT on the sum:
+**Retail markup.** A price CSV holds the EXCHANGE price. What a customer really pays is that
+price plus grid fee, levies, concession fee, electricity tax and, where it applies, VAT on
+the sum. Two plain cfg values say how much:
 
-    price = (exchange + markup) * (1 + vat)
+    price = (exchange + oemof_grid_price_markup_ct_kWh) * (1 + oemof_grid_price_vat)
+
+Both default to `0.0`, so without them the LP calculates with the raw exchange price. Any
+consumer group is a different pair of numbers, not a different case in the code. For
+orientation, the sums of the components in `examples/data/price_sheet.json`:
+
     household   12.09 ct net + 19 % VAT        commercial   8.10 ct net, VAT reclaimable
 
-Both numbers are sums of components in `examples/data/price_sheet.json`; the breakdown is in
-`CONSUMER_TYPES` in `spice_ev/oemof_model.py`. Override the pair with
-`oemof_grid_price_markup_ct_kWh` / `oemof_grid_price_vat`. The markup applies only to a
-price series the scenario brings along - the flat `oemof_grid_variable_costs` is already a
-retail price and is never marked up.
+On the example series this turns 1.72 .. 17.10 ct into 16.43 .. 34.74 for the household
+pair and 9.82 .. 25.20 for the commercial pair. `power_procurement` (7.70 ct) is NOT part of
+the markup - that is the energy, and the energy comes from the exchange series. The VAT
+stays a separate number because it applies to the SUM: folded into the markup it would make
+the effective markup depend on the exchange price. The markup applies only to a price series
+the scenario brings along - the flat `oemof_grid_variable_costs` is already a retail price
+and is never marked up.
 
 **Capacity charge.** The LP prices energy only; no capacity charge enters the objective,
 because an annual amount would dominate a one-week schedule. Instead `dump_costs.csv`
 reports what a tariff calculation needs afterwards: `grid_peak_kW_<gc>` and
-`grid_energy_kWh_<gc>` per connector, plus `consumer_type`, `periods`, `step_hours` and
-`fraction_year`. Note that spice_ev's own capacity charge in `results.json` is selected by
+`grid_energy_kWh_<gc>` per connector, plus `markup_ct_kWh`, `vat`, `periods`, `step_hours`
+and `fraction_year`. Note that spice_ev's own capacity charge in `results.json` is selected by
 the STRATEGY NAME (`simulate.py:71` bills greedy/balanced/distributed as SLP and everything
 else as RLM), so it is not comparable across strategies - use the reported peak.
 
