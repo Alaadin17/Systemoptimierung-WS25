@@ -57,14 +57,15 @@ def lade(beispiel):
     if not pfad.exists():
         raise SystemExit(f"{pfad} gibt es nicht - waehle einen der Beispielordner")
     sc = Scenario(json.loads(pfad.read_text(encoding="utf-8")), pfad.parent)
-    # The oemof_* keys the example's simulate.cfg sets; only consumer_type matters here,
-    # because it decides the markup on the exchange price.
+    # The oemof_* keys the example's simulate.cfg sets; only the two markup values matter
+    # here, because they turn the exchange price into the retail price the LP uses.
     cfg = {}
     sim = pfad.parent / "simulate.cfg"
     if sim.exists():
         for z in sim.read_text(encoding="utf-8").splitlines():
-            if z.startswith("oemof_consumer_type"):
-                cfg["consumer_type"] = z.split("=")[1].strip()
+            for schluessel in ("grid_price_markup_ct_kWh", "grid_price_vat"):
+                if z.startswith(f"oemof_{schluessel}"):
+                    cfg[schluessel] = z.split("=")[1].strip()
     return sc, cfg
 
 
@@ -83,7 +84,9 @@ def main():
     s = OemofSolve(sc.components, sc.start_time, events=sc.events,
                    interval=sc.interval, stop_time=sc.stop_time, oemof_config=cfg)
 
-    print(f"Beispiel: {args.beispiel}   Verbrauchertyp: {cfg.get('consumer_type', '-')}")
+    print(f"Beispiel: {args.beispiel}   Aufschlag: "
+          f"{cfg.get('grid_price_markup_ct_kWh', '0.0')} ct netto, "
+          f"MwSt-Faktor {cfg.get('grid_price_vat', '0.0')}")
     print(f"Zeitraum: {sc.start_time} bis {sc.stop_time}   Intervall: {sc.interval}")
 
     # ---------------------------------------------------------------- prepare_inputs()
