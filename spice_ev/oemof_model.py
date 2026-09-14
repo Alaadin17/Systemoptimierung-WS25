@@ -149,18 +149,25 @@ class SystemConfig:
     grid_variable_costs: float = 35.0
     grid_feedin_tariff: float = 0.0   # negative = revenue; 0 = feeding in earns nothing
 
-    # --- consumer type ---------------------------------------------------------------
-    # A price CSV holds the EXCHANGE price. What a customer actually pays is that price
-    # plus grid fee, levies, concession fee and electricity tax, and for a household plus
-    # VAT on the sum. consumer_type picks those components from CONSUMER_TYPES; the two
-    # fields below override them when a study needs its own numbers.
+    # --- retail markup ----------------------------------------------------------------
+    # A price CSV holds the EXCHANGE price. What a customer actually pays is
+    #     price = (exchange + markup) * (1 + vat)
+    # Both are plain numbers, so ANY consumer group can be expressed - not just the two a
+    # lookup table would offer. For orientation, the sums of grid fee + levies +
+    # concession fee + electricity tax in examples/data/price_sheet.json:
+    #     household   12.09 ct net + 19 % VAT      commercial   8.10 ct net, VAT reclaimable
+    # power_procurement (7.70 ct) is deliberately NOT part of the markup - that IS the
+    # energy, and the energy comes from the exchange series.
     #
-    # The markup applies ONLY to a price series the scenario brings along
-    # (include_price_csv). Without one, grid_variable_costs applies, and that is already a
-    # complete retail price - adding a markup there would count the same components twice.
-    consumer_type: str = "household"
-    grid_price_markup_ct_kWh: Optional[float] = None   # None = from consumer_type
-    grid_price_vat: Optional[float] = None             # None = from consumer_type
+    # The VAT cannot be folded into the markup: it applies to the SUM, so a single
+    # additive number would make the effective markup depend on the exchange price.
+    #
+    # Default 0.0/0.0 means the LP calculates with the raw exchange price. Every cfg in
+    # the project sets both values explicitly. The markup applies ONLY to a price series
+    # the scenario brings along (include_price_csv); without one, grid_variable_costs
+    # applies, and that is already a complete retail price.
+    grid_price_markup_ct_kWh: float = 0.0
+    grid_price_vat: float = 0.0
 
     # Solver
     solver: str = "cbc"
@@ -189,43 +196,6 @@ class SystemConfig:
                 continue
             setattr(config, name, _coerce(name, value, typ[name]))
         return config
-
-    def consumer_tariff(self):
-        """(markup in ct/kWh, VAT factor) for this consumer type; overrides win.
-
-        An unknown ``consumer_type`` warns and falls back to the household values rather
-        than raising - a typo in a cfg should not abort a run that is otherwise fine.
-        """
-        if self.consumer_type not in CONSUMER_TYPES:
-            logging.warning("Unknown oemof_consumer_type %r - using 'household'. Known: %s",
-                            self.consumer_type, ", ".join(sorted(CONSUMER_TYPES)))
-        markup, vat = CONSUMER_TYPES.get(self.consumer_type, CONSUMER_TYPES["household"])
-        if self.grid_price_markup_ct_kWh is not None:
-            markup = float(self.grid_price_markup_ct_kWh)
-        if self.grid_price_vat is not None:
-            vat = float(self.grid_price_vat)
-        return markup, vat
-
-
-# What a consumer pays ON TOP of the exchange price: (markup ct/kWh, VAT factor).
-# Both numbers are the sum of the components in examples/data/price_sheet.json,
-# default_grid_operator, so they can be checked against it:
-#
-#                              household (SLP)   commercial (RLM, MV)
-#   grid_fee commodity_charge        7.48              3.49
-#   levies (sum of five)             1.237             1.237
-#   concession_fee                   1.32              1.32
-#   tax_on_electricity               2.05              2.05
-#                              ---------------   --------------------
-#                                   12.09 ct           8.10 ct
-#   value_added_tax                  19 %              0 % (reclaimable)
-#
-# power_procurement (7.70 ct) is deliberately NOT part of the markup - that IS the energy,
-# and the energy comes from the exchange series.
-CONSUMER_TYPES = {
-    "household":  (12.09, 0.19),
-    "commercial": (8.10, 0.00),
-}
 
 
 def _as_array(values, n):
@@ -939,7 +909,10 @@ class EnergySystemModel:
         step_hours = self._step_hours()
         self._costs = {
             "objective": float(self.model.objective()),
-            "consumer_type": self.config.consumer_type,
+            # the markup the run actually used - so the retail price can be reconstructed
+            # from the dump alone, without the cfg next to it
+            "markup_ct_kWh": float(self.config.grid_price_markup_ct_kWh),
+            "vat": float(self.config.grid_price_vat),
             "periods": n,
             "step_hours": step_hours,
             # share of a year the simulated horizon covers - needed to pro-rate any annual

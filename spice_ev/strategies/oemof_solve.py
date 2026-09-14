@@ -635,7 +635,7 @@ class OemofSolve(Strategy):
 
     def _grid_price_series(self, gcid, time_index, config) -> Optional[np.ndarray]:
         """The retail purchase price per time step: the scenario's exchange price plus the
-        markup of ``config.consumer_type``.
+        markup from the cfg.
 
         spice_ev does not keep prices as a timeseries but as GridOperatorSignal EVENTS: one
         ``cost`` dict per event, valid from its ``start_time`` until the next signal.
@@ -649,16 +649,17 @@ class OemofSolve(Strategy):
         the CSV is read unchanged - whoever writes EUR/kWh there is off by a factor of 100.
 
         What the CSV holds is the EXCHANGE price. On top of it comes what the customer
-        really pays - grid fee, levies, concession fee, electricity tax and, for a
-        household, VAT on the sum:
+        really pays - grid fee, levies, concession fee, electricity tax and, where it
+        applies, VAT on the sum:
 
             price = (exchange + markup) * (1 + vat)
 
-        Both numbers come from ``SystemConfig.consumer_tariff()``; see CONSUMER_TYPES in
-        oemof_model.py for the components. The markup applies ONLY here, to a series the
-        scenario brings along. Without price signals this returns None and the flat
-        ``grid_variable_costs`` applies, which is already a complete retail price - marking
-        that up would count the same components twice.
+        Both numbers are plain cfg values, ``oemof_grid_price_markup_ct_kWh`` and
+        ``oemof_grid_price_vat``, so any consumer group can be expressed by changing them;
+        SystemConfig documents where the orientation values come from. The markup applies
+        ONLY here, to a series the scenario brings along. Without price signals this
+        returns None and the flat ``grid_variable_costs`` applies, which is already a
+        complete retail price - marking that up would count the same components twice.
 
         Note the reported series in dump_summary.csv (grid_price_ct_<GC>) is this retail
         price, while spice_ev's own timeseries.csv column "price [ct/kWh]" stays the raw
@@ -687,7 +688,8 @@ class OemofSolve(Strategy):
         if ziel.tz is not None:
             ziel = ziel.tz_localize(None)
         starts = pd.DatetimeIndex([p[0] for p in paare])
-        aufschlag, mwst = config.consumer_tariff()
+        aufschlag = float(config.grid_price_markup_ct_kWh)
+        mwst = float(config.grid_price_vat)
         boerse = np.array([p[1] for p in paare])
         werte = np.maximum((boerse + aufschlag) * (1.0 + mwst), 0.0)
         idx = np.searchsorted(starts, ziel, side="right") - 1
