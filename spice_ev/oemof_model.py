@@ -130,12 +130,6 @@ class SystemConfig:
     # genuine decisions; it only makes useless cycling strictly worse than doing nothing.
     storage_cycle_penalty: float = 0.001
 
-    # Forbids a storage to charge and discharge in the SAME time step. Costs one BINARY
-    # variable per storage and step: the LP becomes a MILP and solve time rises sharply.
-    # Off by default and kept for experiments only - why it once mattered is told in
-    # _add_no_simultaneous_constraints.
-    forbid_simultaneous_storage: bool = False
-
     # --- Prices (ct/kWh) -------------------------------------------------------------
     # grid_variable_costs is the purchase price when the scenario brings none: the
     # COMPLETE price as it stands on the bill - no price sheet, no markup, no capacity
@@ -173,7 +167,6 @@ class SystemConfig:
     solver_verbose: bool = False
     debug: bool = True
     solver_threads: int = 8
-    solver_ratio_gap: float = 0.01
 
     # Result storage
     should_dump_results: bool = True
@@ -346,9 +339,6 @@ class EnergySystemModel:
         self._costs: Optional[Dict[str, float]] = None   # objective value
         self._gc_bus: Dict[str, Any] = {}   # {gcid: Home_<n> bus} (_create_components)
         self._vehicle_nodes: Dict[str, Dict[str, Any]] = {}  # per-vehicle nodes (bus/flags/cs)
-        # storages that can charge AND discharge — the candidates for the binary
-        # "not both at once" constraint (see _add_no_simultaneous_constraints)
-        self._storage_pairs: list = []
 
     # ------------------------------------------------------------------
     # Pipeline orchestration
@@ -393,8 +383,6 @@ class EnergySystemModel:
         wallbox OR a load OR PV OR a battery - otherwise the connector is not built at all.
         """
         periods = self.config.periods
-        # clear before the first node - the vehicles register themselves right here
-        self._storage_pairs = []
 
         # 1) one bus + BEV per vehicle
         for vid, params in self.vehicle_params.items():
@@ -572,13 +560,6 @@ class EnergySystemModel:
             balanced=False,
         )
         self.es.add(storage)
-        # at the two storage flows "charge" and "discharge" are unambiguous - this is where
-        # forbid_simultaneous_storage attaches, if it is used
-        self._storage_pairs.append({
-            "label": f"home_battery_{bid}", "storage": storage,
-            "in_bus": b_battery, "out_bus": b_battery,
-            "p_in": power, "p_out": discharge_power,
-        })
 
     def _loss_factor(self) -> float:
         """kWh/step -> kW factor: oemof multiplies fixed_losses_absolute by the step
@@ -668,22 +649,6 @@ class EnergySystemModel:
         )
         self.es.add(bev)
 
-        if can_discharge:
-            # Only a V2H vehicle can charge and discharge at once. Its storage inflow has no
-            # nominal_value of its own (the wallbox limits it), so the big-M comes from the
-            # strongest station this vehicle ever plugs into.
-            # no "or []": connected_cs is a numpy array, whose truth value raises
-            angeschlossen = params.get("connected_cs")
-            used = {c for c in ([] if angeschlossen is None else list(angeschlossen)) if c}
-            p_in = max((float(self.charging_stations.get(c, {}).get(
-                "max_power", self.config.wallbox_power_kW)) for c in used),
-                default=self.config.wallbox_power_kW)
-            self._storage_pairs.append({
-                "label": f"bev_battery_{vid}", "storage": bev,
-                "in_bus": b_mobility, "out_bus": b_mobility,
-                "p_in": p_in, "p_out": min(p_in, p_entladen or p_in),
-            })
-
         self._vehicle_nodes[vid] = {
             "bus": b_mobility,      # charging arrives here, V2H leaves here
             "can_discharge": can_discharge,
@@ -747,67 +712,10 @@ class EnergySystemModel:
         """Build the LP from the energy system: bus balances, power limits, storage
         equations and the objective. With ``debug`` a readable ``.lp`` file is written."""
         self.model = Model(self.es)
-        self._add_no_simultaneous_constraints()   # optional, turns the LP into a MILP
         if self.config.debug:
             lp_path = Path(self.config.output_dir) / f"{self.config.dump_filename}_debug.lp"
             lp_path.parent.mkdir(parents=True, exist_ok=True)
             self.model.write(str(lp_path), io_options={"symbolic_solver_labels": True})
-
-    def _add_no_simultaneous_constraints(self) -> None:
-        """Forbid every storage to charge AND discharge in the same step.
-
-        "Either A or B" is not a linear statement; it needs one binary variable per storage
-        and step:
-
-            inflow[t]   <=  P_charge    * y[t]
-            outflow[t]  <=  P_discharge * (1 - y[t])          y[t] in {0, 1}
-
-        Big-M is the power limit that exists anyway - the tighter, the faster the MILP.
-        Attached at the STORAGE flows, because every path converges there.
-
-        History: this was needed against a PV charging bonus that made it profitable to
-        route PV *through* a storage into the house - each flow was allowed on its own, the
-        detour only cost the round trip, and the bonus was collected in full. That bonus and
-        its branches are gone, and with them the incentive: storage_cycle_penalty already
-        makes cycling more expensive than doing nothing. Off by default; the switch stays
-        for experiments.
-
-        Price: the LP becomes a MILP. One binary per storage and step - 5856 for a
-        two-month horizon - and solve time rises by orders of magnitude.
-        """
-        if not self.config.forbid_simultaneous_storage or not self._storage_pairs:
-            return
-        import pyomo.environ as po
-
-        steps = list(self.model.TIMESTEPS)
-        rows, m = {}, self.model
-        for pair in self._storage_pairs:
-            zufluss = (pair["in_bus"], pair["storage"])
-            abfluss = (pair["storage"], pair["out_bus"])
-            for t in steps:
-                # only build where both directions exist at all
-                if (zufluss[0], zufluss[1], t) in m.flow and (abfluss[0], abfluss[1], t) in m.flow:
-                    rows[(pair["label"], t)] = (zufluss, abfluss,
-                                                float(pair["p_in"]), float(pair["p_out"]))
-        if not rows:
-            return
-
-        idx = list(rows)
-        m.speicher_modus = po.Var(idx, domain=po.Binary)
-
-        def _laden(model, label, t):
-            zu, _, p_in, _ = rows[(label, t)]
-            return model.flow[zu[0], zu[1], t] <= p_in * model.speicher_modus[label, t]
-
-        def _entladen(model, label, t):
-            _, ab, _, p_out = rows[(label, t)]
-            return model.flow[ab[0], ab[1], t] <= p_out * (1 - model.speicher_modus[label, t])
-
-        m.speicher_nur_laden = po.Constraint(idx, rule=_laden)
-        m.speicher_nur_entladen = po.Constraint(idx, rule=_entladen)
-        logging.info("Simultaneous charge/discharge forbidden: %d binary variables, %d rows "
-                     "(%s)", len(idx), 2 * len(idx),
-                     ", ".join(sorted({lbl for lbl, _ in idx})))
 
     def _solve(self) -> None:
         """Solve the LP and check optimality.
@@ -818,8 +726,7 @@ class EnergySystemModel:
         """
         solver_options = {}
         if self.config.solver == "cbc":
-            solver_options = {"threads": self.config.solver_threads,
-                              "ratioGap": self.config.solver_ratio_gap}
+            solver_options = {"threads": self.config.solver_threads}
         # debug turns the solver console on so a run can be watched live
         tee = self.config.solver_verbose or self.config.debug
 

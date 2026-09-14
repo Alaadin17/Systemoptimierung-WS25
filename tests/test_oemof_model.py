@@ -412,12 +412,10 @@ def test_from_options_coerces_cfg_types():
     """
     c = SystemConfig.from_options({"oemof_enable_v2h": "False",
                                    "oemof_enable_pv_to_home": "FALSE",
-                                   "oemof_forbid_simultaneous_storage": "yes",
                                    "oemof_grid_variable_costs": "22.5",
                                    "oemof_solver_threads": "4",
                                    "oemof_solver": "cbc"})
     assert c.enable_v2h is False and c.enable_pv_to_home is False
-    assert c.forbid_simultaneous_storage is True
     assert c.grid_variable_costs == 22.5 and isinstance(c.grid_variable_costs, float)
     assert c.solver_threads == 4 and isinstance(c.solver_threads, int)
     assert c.solver == "cbc"          # Strings bleiben unangetastet
@@ -873,26 +871,3 @@ def test_v2g_discharge_is_capped_by_the_vehicles_own_curve():
     _build_es(m2)
     ab2 = list(_nodes(m2)["wallbox_discharge_CS1_v1"].outputs.values())[0]
     assert ab2.nominal_value == 11.0
-
-
-@requires_cbc
-def test_forbid_simultaneous_storage_creates_binaries():
-    """Der Schalter macht aus dem LP ein MILP - eine Binaervariable je Speicher und Schritt.
-
-    Gebraucht wurde er gegen das Kreisen, das ein PV-Ladebonus ausloesen konnte. Den Bonus
-    gibt es nicht mehr; der Schalter bleibt fuer eigene Experimente und steht auf aus.
-    """
-    assert SystemConfig().forbid_simultaneous_storage is False
-
-    aus = _pv_scenario(SystemConfig(debug=False, enable_v2h=True), v2g=True)
-    _build_es(aus)
-    aus._optimize()
-    assert not hasattr(aus.model, "speicher_modus")
-    # die Registry ist trotzdem gefuellt - Einschalten braucht keinen Neuaufbau
-    assert {p["label"] for p in aus._storage_pairs} == {"home_battery_BAT1", "bev_battery_v1"}
-
-    an = _pv_scenario(SystemConfig(debug=False, enable_v2h=True,
-                                   forbid_simultaneous_storage=True), v2g=True)
-    _build_es(an)
-    an._optimize()
-    assert hasattr(an.model, "speicher_modus")
