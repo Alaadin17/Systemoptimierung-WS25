@@ -591,15 +591,17 @@ class OemofSolve(Strategy):
         aligned.index = time_index
         return aligned
 
-    def _grid_connectors(self, time_index, config) -> Dict[str, Dict[str, Any]]:
+    def _grid_connectors(self, time_index) -> Dict[str, Dict[str, Any]]:
         """Per grid connector: max_power plus its OWN household load and PV timeseries.
 
-        The oemof model builds one bus (Home_<n>) + source + feed-in sink per active GC;
-        each GC also carries its own load and PV, grouped by the events'
-        ``grid_connector_id``. Returns {gcid: {"load", "pv", "max_power" (if the GC has
-        one), "price_ct_kWh" (the retail price - only when the scenario carries price
-        signals, see
-        ``_grid_price_series``), "pv_power_kW" (installed kWp, only when > 0)}}.
+        The oemof model builds one bus (Home_<n>) + source per active GC; each GC also
+        carries its own load and PV, grouped by the events' ``grid_connector_id``.
+        Returns {gcid: {"load", "pv", "max_power" (if the GC has one), "price_ct_kWh"
+        (the scenario's price series, see ``_grid_price_series``), "pv_power_kW"
+        (installed kWp, only when > 0)}}.
+
+        A GC without price signals raises: the model prices energy with the scenario's
+        own series and has no fallback.
         """
         fixed = getattr(self.events, "fixed_load_lists", {})
         gen = getattr(self.events, "local_generation_lists", {})
@@ -612,13 +614,17 @@ class OemofSolve(Strategy):
             mp = getattr(gc, "max_power", None)
             if mp:
                 info["max_power"] = float(mp)
-            # Purchase price: if the scenario carries price signals they apply (exchange
-            # price plus the consumer type's markup), otherwise the fixed cfg value. The
-            # feed-in tariff is always fixed (grid_feedin_tariff) and only the PV
-            # surplus can earn it - the house bus has no export path.
-            preis = self._grid_price_series(gcid, time_index, config)
-            if preis is not None:
-                info["price_ct_kWh"] = preis
+            # Purchase price: the scenario's own series, the same one spice_ev's built-in
+            # strategies read. The feed-in tariff is fixed (grid_feedin_tariff) and only
+            # the PV surplus can earn it - the house bus has no export path.
+            preis = self._grid_price_series(gcid, time_index)
+            if preis is None:
+                raise ValueError(
+                    f"grid connector {gcid!r} carries no price signals. oemof_solve "
+                    "prices energy with the scenario's own series and has no fallback - "
+                    "add a price curve to the scenario (include_price_csv in "
+                    "generate.cfg).")
+            info["price_ct_kWh"] = preis
             kwp = self._pv_kwp(gcid)
             if kwp > 0:
                 info["pv_power_kW"] = kwp              # PV plant size -> converter limit
@@ -633,45 +639,33 @@ class OemofSolve(Strategy):
                 total = total.add(self._sample_event_list(ev_list, time_index), fill_value=0.0)
         return total.to_numpy()
 
-    def _grid_price_series(self, gcid, time_index, config) -> Optional[np.ndarray]:
-        """The retail purchase price per time step: the scenario's exchange price plus the
-        markup from the cfg.
+    def _grid_price_series(self, gcid, time_index) -> Optional[np.ndarray]:
+        """The purchase price per time step, exactly as spice_ev carries it.
 
         spice_ev does not keep prices as a timeseries but as GridOperatorSignal EVENTS: one
         ``cost`` dict per event, valid from its ``start_time`` until the next signal.
         ``include_price_csv`` in generate.cfg turns EVERY CSV row into such an event. This
         method rebuilds the step function that spice_ev has in front of it as ``gc.cost``
         in every step - with the same ``util.get_cost`` that greedy, balanced and
-        balanced_market use.
+        balanced_market use. Nothing is added: the LP is priced with the series the
+        scenario brings, so its schedule and spice_ev's own timeseries.csv column
+        "price [ct/kWh]" rest on the same numbers.
 
         Unit: ct/kWh. spice_ev keeps gc.cost in ct/kWh (scenario.py and costs.py both divide
         by 100 to get EUR, and generate.py names the column "price [ct/kWh]" by default), so
         the CSV is read unchanged - whoever writes EUR/kWh there is off by a factor of 100.
 
-        What the CSV holds is the EXCHANGE price. On top of it comes what the customer
-        really pays - grid fee, levies, concession fee, electricity tax and, where it
-        applies, VAT on the sum:
+        Returns None when the scenario carries no signals for this GC. There is no
+        fallback price; the caller raises.
 
-            price = (exchange + markup) * (1 + vat)
-
-        Both numbers are plain cfg values, ``oemof_grid_price_markup_ct_kWh`` and
-        ``oemof_grid_price_vat``, so any consumer group can be expressed by changing them;
-        SystemConfig documents where the orientation values come from. The markup applies
-        ONLY here, to a series the scenario brings along. Without price signals this
-        returns None and the flat ``grid_variable_costs`` applies, which is already a
-        complete retail price - marking that up would count the same components twice.
-
-        Note the reported series in dump_summary.csv (grid_price_ct_<GC>) is this retail
-        price, while spice_ev's own timeseries.csv column "price [ct/kWh]" stays the raw
-        exchange price: the markup lives in the LP, not in the scenario.
-
-        ONE deliberate difference to spice_ev: NEGATIVE prices are clipped to 0. An LP
+        THE ONE deliberate difference to spice_ev: NEGATIVE prices are clipped to 0. An LP
         cannot be forbidden to get rid of energy - charging and discharging in the same
         step burns it through the efficiency. Being PAID to draw power then becomes a money
         pump: buy, destroy, collect again. A real house cannot do that and spice_ev does
-        not simulate it either - only the LP would find it. With a markup a negative
-        exchange price usually turns positive anyway, so the clip rarely fires; it stays as
-        a guard for a markup of 0.
+        not simulate it either - only the LP would find it. spice_ev's own strategies do
+        see the negative value, so this clip is the single remaining deviation between the
+        price they read and the price the LP optimizes against. On a series whose minimum
+        is above zero it never fires.
         """
         signale = [s for s in getattr(self.events, "grid_operator_signals", []) or []
                    if getattr(s, "grid_connector_id", None) == gcid
@@ -688,10 +682,8 @@ class OemofSolve(Strategy):
         if ziel.tz is not None:
             ziel = ziel.tz_localize(None)
         starts = pd.DatetimeIndex([p[0] for p in paare])
-        aufschlag = float(config.grid_price_markup_ct_kWh)
-        mwst = float(config.grid_price_vat)
         boerse = np.array([p[1] for p in paare])
-        werte = np.maximum((boerse + aufschlag) * (1.0 + mwst), 0.0)
+        werte = np.maximum(boerse, 0.0)
         idx = np.searchsorted(starts, ziel, side="right") - 1
         idx = np.clip(idx, 0, len(werte) - 1)   # before the first signal its value applies
         return werte[idx]
@@ -781,8 +773,8 @@ class OemofSolve(Strategy):
         """Assemble every input EnergySystemModel needs, from the spice_ev scenario.
 
         Returns a dict with: config (SystemConfig from the oemof_* cfg keys), time_index,
-        grid_connectors (per GC: max_power, its own load/pv, the price series when the
-        scenario has one, the installed kWp when > 0), charging_stations (max_power +
+        grid_connectors (per GC: max_power, its own load/pv, the scenario's price series,
+        the installed kWp when > 0), charging_stations (max_power +
         parent GC), vehicle_params (capacity/SOC/v2g/efficiency + consumption,
         connected_cs, min_soc_series and discharge_power_kW) and battery_params.
         """
@@ -860,7 +852,7 @@ class OemofSolve(Strategy):
             "config": config,
             "time_index": self.time_index,
             "vehicle_params": vehicle_params,
-            "grid_connectors": self._grid_connectors(self.time_index, config),
+            "grid_connectors": self._grid_connectors(self.time_index),
             "battery_params": self._battery_params(config),
             "charging_stations": charging_stations,
         }

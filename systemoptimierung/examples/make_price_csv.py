@@ -3,9 +3,12 @@
 Why this exists: the three ``input_preis.csv`` used to be hand-made artefacts that nothing
 in the repository could reproduce - and one of them carried a flat +20 ct markup baked into
 every row, which made that example incomparable to the others. The exchange series now
-lives in ONE file, ``input_preis_boerse.csv``, and this script copies it into each example.
-The markup is a cfg parameter (``oemof_grid_price_markup_ct_kWh`` and
-``oemof_grid_price_vat`` in the simulate config), so the CSVs stay pure exchange prices.
+lives in ONE file, ``input_preis_boerse.csv``, and this script copies it into each example,
+so all three are priced from the same numbers.
+
+The model prices energy with whatever the scenario carries and adds nothing to it, so a
+scenario is free to bring a retail curve instead. This shared source is not: it stays a
+pure exchange series, because the three examples are only comparable while they share it.
 
 Each example needs its own copy because ``generate.py`` stores the bare file name in
 scenario.json and spice_ev resolves it relative to that file (``spice_ev/events.py:194``).
@@ -34,8 +37,9 @@ def lese(pfad):
         sys.exit(f"{pfad} has no column {SPALTE!r} (found {list(rows[0])})")
     werte = [float(r[SPALTE]) for r in rows]
     if min(werte) > 20.0:
-        sys.exit(f"{pfad} looks like a retail series (min {min(werte):.2f} ct) - the source "
-                 f"must be the pure exchange price; the markup is a model parameter")
+        sys.exit(f"{pfad} looks like a retail series (min {min(werte):.2f} ct) - this file "
+                 f"is the one series all three examples share, and a markup baked into it "
+                 f"would make them incomparable")
     return rows, werte
 
 

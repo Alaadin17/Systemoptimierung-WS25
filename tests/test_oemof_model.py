@@ -60,8 +60,10 @@ def test_per_gc_topology_and_pruning():
         config=SystemConfig(debug=False),
         time_index=idx,
         grid_connectors={
-            "GC1": {"max_power": 30.0, "load": [1, 1, 1, 1], "pv": [0, 3, 3, 0]},
-            "GC2": {"max_power": 50.0},           # only CS2 is used -> active
+            # jeder aktive Anschluss braucht eine Preisreihe - es gibt keinen Rueckfall
+            "GC1": {"max_power": 30.0, "load": [1, 1, 1, 1], "pv": [0, 3, 3, 0],
+                    "price_ct_kWh": [30.0] * 4},
+            "GC2": {"max_power": 50.0, "price_ct_kWh": [30.0] * 4},   # nur CS2 -> aktiv
             "GC3": {"max_power": 20.0},           # nothing at all -> pruned
         },
         charging_stations={
@@ -137,13 +139,17 @@ def test_per_gc_load_pv_from_events():
         fixed_load_lists={"L1": _ev([1, 1, 1, 1], start, "GC1"),
                           "L2": _ev([2, 2, 2, 2], start, "GC2")},
         local_generation_lists={"PV1": _ev([0, 3, 3, 0], start, "GC1")},
+        # je Anschluss ein Preissignal - ohne eines lehnt die Strategie ab
+        grid_operator_signals=[
+            SimpleNamespace(grid_connector_id=g, start_time=start,
+                            cost={"type": "fixed", "value": 30.0}) for g in ("GC1", "GC2")],
     )
     strat.world_state = SimpleNamespace(
         grid_connectors={"GC1": SimpleNamespace(max_power=30.0),
                          "GC2": SimpleNamespace(max_power=50.0)},
     )
 
-    gcs = strat._grid_connectors(idx, _roh())
+    gcs = strat._grid_connectors(idx)
 
     # grouped strictly by grid_connector_id
     assert list(gcs["GC1"]["load"]) == [1, 1, 1, 1]
@@ -174,7 +180,8 @@ def test_solve_small_model(tmp_path, monkeypatch, caplog):
     m = EnergySystemModel(
         config=SystemConfig(debug=True, output_dir="lp_out"),
         time_index=idx,
-        grid_connectors={"GC1": {"max_power": 30.0, "load": [1, 1, 1, 1]}},
+        grid_connectors={"GC1": {"max_power": 30.0, "load": [1, 1, 1, 1],
+                                 "price_ct_kWh": [30.0] * 4}},
         charging_stations={"CS1": {"max_power": 11.0, "parent": "GC1"}},
         vehicle_params={"v1": {"capacity_kWh": 50.0,
                                "connected_cs": ["CS1"] * 4, "consumption": [0, 0, 0, 0]}},
@@ -190,25 +197,27 @@ def test_solve_small_model(tmp_path, monkeypatch, caplog):
 
 
 # ---------------------------------------------------------------------------
-# Test 2a2 — feste Preise: die cfg ist die einzige Quelle
+# Test 2a2 — der Preis kommt aus dem Szenario und sonst nirgendwo her
 # ---------------------------------------------------------------------------
-def test_prices_come_from_the_config_or_the_scenario_and_nowhere_else():
-    """Bezugspreis: Szenario, sonst cfg. Einspeiseverguetung: immer cfg.
+def test_prices_come_from_the_scenario_and_nowhere_else():
+    """Bezugspreis: allein das Szenario. Einspeiseverguetung: immer cfg.
 
     Frueher konnte ein Preis aus drei Quellen kommen - den grid_operator_signals des
     Szenarios, dem Preisblatt (Netzentgelt, Umlagen, Konzession, Stromsteuer, MwSt) und der
     cfg -, die sich gegenseitig ueberschrieben haben. Genau daraus sind zwei stille Fehler
     entstanden: das LP kalkulierte einen anderen Tarif als abgerechnet wurde, und
     ``oemof_grid_feedin_tariff = 0`` blieb wirkungslos, solange ein Preisblatt konfiguriert
-    war. Das Preisblatt ist jetzt ganz raus.
+    war. Preisblatt, Aufschlag und Festpreis sind jetzt alle drei raus - das LP bewertet
+    Energie mit derselben Reihe, die spice_evs eigene Strategien in gc.cost lesen.
     """
     idx = pd.date_range("2025-01-01", periods=4, freq="15min")
     m = EnergySystemModel(
-        config=SystemConfig(debug=False, grid_variable_costs=35.0, grid_feedin_tariff=0.0),
+        config=SystemConfig(debug=False, grid_feedin_tariff=0.0),
         time_index=idx,
         # Verguetungs-Keys, wie das Preisblatt sie frueher geliefert hat: sie muessen
         # wirkungslos sein, sonst haette sich die alte Quelle nur versteckt
         grid_connectors={"GC1": {"max_power": 30.0, "load": [1, 1, 1, 1], "pv": [0, 3, 3, 0],
+                                 "price_ct_kWh": [30.0] * 4,
                                  "feedin_tariff_ct_kWh": -6.24,
                                  "homebus_feedin_tariff_ct_kWh": -1.5,
                                  "pv_power_kW": 7.5}},
@@ -216,32 +225,25 @@ def test_prices_come_from_the_config_or_the_scenario_and_nowhere_else():
     _build_es(m)
     nodes = _nodes(m)
     supply = _out_flow(nodes["grid_supply_Home_1"])
-    assert [float(supply.variable_costs[t]) for t in range(4)] == [35.0] * 4
+    assert [float(supply.variable_costs[t]) for t in range(4)] == [30.0] * 4
     # der einzige Exportweg bekommt den cfg-Wert
     assert float(list(nodes["excess_Home_1"].inputs.values())[0].variable_costs[0]) == 0.0
     # die Anlagengroesse ist KEIN Preis und kommt weiterhin aus dem Szenario
     assert list(nodes["converter_pv_to_home_Home_1"].inputs.values())[0].nominal_value == 7.5
-    # ... und die Preis-Felder existieren nicht mehr
+    # ... und kein Feld des Modells kann den Preis noch beeinflussen
     felder = {f.name for f in dataclasses.fields(SystemConfig)}
     assert not felder & {"tariff", "fee_type", "use_retail_markup", "cost_parameters_file",
-                         "grid_price_from_scenario", "feedin_tariff_from_price_sheet"}
-
-
-def _roh():
-    """Config whose markup is switched off - isolates the unit and the step function.
-
-    0.0/0.0 is also the default, so this is explicit rather than necessary.
-    """
-    return SystemConfig(debug=False, grid_price_markup_ct_kWh=0.0, grid_price_vat=0.0)
+                         "grid_price_from_scenario", "feedin_tariff_from_price_sheet",
+                         "grid_price_markup_ct_kWh", "grid_price_vat",
+                         "grid_variable_costs", "consumer_type"}
 
 
 def test_strategy_hands_the_model_physics_and_the_scenario_price():
-    """Last, PV, Anschlussleistung, kWp - und der Bezugspreis, wenn das Szenario einen hat.
+    """Last, PV, Anschlussleistung, kWp - und der Bezugspreis des Szenarios.
 
-    Der Aufschlag ist hier auf 0 gestellt, damit die EINHEIT allein gepruefte Sache bleibt:
-    spice_ev fuehrt gc.cost in ct/kWh, also kommt der CSV-Wert unveraendert an. Was der
-    Aufschlag daraufschlaegt, prueft test_markup_and_vat_come_from_the_cfg.
-    Die Einspeiseverguetung bleibt in jedem Fall fest.
+    Geprueft wird vor allem die EINHEIT: spice_ev fuehrt gc.cost in ct/kWh, also kommt der
+    CSV-Wert unveraendert an - nichts wird daraufgeschlagen. Die Einspeiseverguetung bleibt
+    in jedem Fall fest.
     """
     idx = pd.date_range("2025-01-01", periods=4, freq="15min")
     strat = OemofSolve.__new__(OemofSolve)
@@ -255,17 +257,41 @@ def test_strategy_hands_the_model_physics_and_the_scenario_price():
         grid_connectors={"GC1": SimpleNamespace(max_power=30.0)},
         photovoltaics={"PV1": SimpleNamespace(parent="GC1", nominal_power=10.0)},
     )
-    info = strat._grid_connectors(idx, _roh())["GC1"]
+    info = strat._grid_connectors(idx)["GC1"]
     assert set(info) == {"load", "pv", "max_power", "pv_power_kW", "price_ct_kWh"}
     assert info["pv_power_kW"] == 10.0
     assert list(info["price_ct_kWh"]) == [30.0] * 4        # ct/kWh, unveraendert
-    # ohne Preissignale bleibt der Schluessel weg -> das Modell nimmt die cfg
-    strat.events.grid_operator_signals = []
-    assert "price_ct_kWh" not in strat._grid_connectors(idx, _roh())["GC1"]
     # die Preisblatt-Methoden gibt es nicht mehr - kein toter Pfad, ueber den etwas zurueckkommt
     for name in ("_retail_markup_ct", "_feedin_tariff_ct", "_homebus_feedin_tariff_ct",
                  "tariff"):
         assert not hasattr(OemofSolve, name), name
+
+
+def test_a_scenario_without_prices_is_refused():
+    """Ohne Preisreihe bricht der Lauf ab, statt mit einer erfundenen Zahl zu rechnen.
+
+    Es gibt keinen Festpreis-Rueckfall mehr. Ein Szenario ohne ``include_price_csv`` kann
+    nicht optimiert werden, und das soll man merken - eine Vorgabe wuerde eine Frage
+    beantworten, die niemand gestellt hat. Geprueft werden beide Ebenen: die Strategie
+    (sie nennt den Netzanschluss und den Weg) und das Modell selbst.
+    """
+    idx = pd.date_range("2025-01-01", periods=4, freq="15min")
+    strat = OemofSolve.__new__(OemofSolve)
+    strat.events = SimpleNamespace(fixed_load_lists={}, local_generation_lists={},
+                                   grid_operator_signals=[])
+    strat.world_state = SimpleNamespace(
+        grid_connectors={"GC1": SimpleNamespace(max_power=30.0)}, photovoltaics={})
+    assert strat._grid_price_series("GC1", idx) is None
+    with pytest.raises(ValueError, match="include_price_csv"):
+        strat._grid_connectors(idx)
+
+    # und das Modell laesst sich auch nicht direkt ohne Preisreihe bauen
+    m = EnergySystemModel(
+        config=SystemConfig(debug=False), time_index=idx,
+        grid_connectors={"GC1": {"max_power": 30.0, "load": [1] * 4}},   # kein price_ct_kWh
+    )
+    with pytest.raises(ValueError, match="no price series"):
+        _build_es(m)
 
 
 def test_scenario_price_signals_become_a_step_function():
@@ -289,13 +315,13 @@ def test_scenario_price_signals_become_a_step_function():
         SimpleNamespace(grid_connector_id="GC2", start_time=idx[0],
                         cost={"type": "fixed", "value": 99.0}),   # anderer GC -> ignoriert
     ])
-    reihe = strat._grid_price_series("GC1", idx, _roh())
+    reihe = strat._grid_price_series("GC1", idx)
     assert list(reihe) == [30.0, 30.0, 5.0, 5.0, 0.0, 0.0]
-    assert strat._grid_price_series("GC3", idx, _roh()) is None   # keine Signale -> cfg-Wert
+    assert strat._grid_price_series("GC3", idx) is None            # keine Signale
 
     # ... und die Reihe landet als variable_costs im Modell, Schritt fuer Schritt
     m = EnergySystemModel(
-        config=SystemConfig(debug=False, grid_variable_costs=35.0),
+        config=SystemConfig(debug=False),
         time_index=idx,
         grid_connectors={"GC1": {"max_power": 30.0, "load": [1] * 6,
                                  "price_ct_kWh": reihe}},
@@ -305,65 +331,28 @@ def test_scenario_price_signals_become_a_step_function():
     assert [float(kosten[t]) for t in range(6)] == [30.0, 30.0, 5.0, 5.0, 0.0, 0.0]
 
 
-def test_markup_and_vat_come_from_the_cfg():
-    """Aus dem Boersenpreis wird ein Endkundenpreis: (boerse + aufschlag) * (1 + mwst).
+def test_negative_prices_are_clipped_to_zero():
+    """Die EINZIGE Abweichung vom Preis, den spice_evs Strategien sehen.
 
-    Die CSV eines Szenarios traegt den BOERSENpreis. Was ein Kunde zahlt, ist der plus
-    Netzentgelt, Umlagen, Konzessionsabgabe und Stromsteuer - und wo sie anfaellt,
-    Mehrwertsteuer auf die Summe. Beide Groessen sind gewoehnliche cfg-Werte, damit JEDE
-    Verbrauchergruppe darstellbar ist und nicht nur die zwei, die eine Tabelle anbieten
-    wuerde. Die Zahlen hier sind die Orientierungswerte aus dem Preisblatt.
+    spice_ev gibt einen negativen Preis unveraendert an greedy, balanced und
+    balanced_market weiter. Das LP darf ihn nicht sehen: ein lineares Programm kann nicht
+    daran gehindert werden, Energie loszuwerden - laden und entladen im selben Schritt
+    verbrennt sie ueber den Wirkungsgrad. Wird man fuer den Bezug BEZAHLT, ist das eine
+    Geldpumpe. Ein reales Haus kann das nicht, und spice_ev simuliert es auch nicht.
+
+    Die Kappung ist damit eine erklaerte Modellentscheidung und keine Preisbildung. Auf
+    einer Reihe mit positivem Minimum greift sie nie.
     """
     idx = pd.date_range("2025-01-01", periods=2, freq="15min")
     strat = OemofSolve.__new__(OemofSolve)
     strat.events = SimpleNamespace(grid_operator_signals=[
         SimpleNamespace(grid_connector_id="GC1", start_time=idx[0],
-                        cost={"type": "fixed", "value": 10.0}),   # ct/kWh Boerse
+                        cost={"type": "fixed", "value": -4.0}),
     ])
-
-    def preis(markup, vat):
-        return strat._grid_price_series("GC1", idx, SystemConfig(
-            grid_price_markup_ct_kWh=markup, grid_price_vat=vat))
-
-    haushalt = preis(12.09, 0.19)      # 12.09 netto + 19 % MwSt
-    gewerbe = preis(8.10, 0.00)        # 8.10 netto, Vorsteuerabzug
-    assert haushalt[0] == pytest.approx((10.0 + 12.09) * 1.19)
-    assert gewerbe[0] == pytest.approx(10.0 + 8.10)
-    assert haushalt[0] > gewerbe[0] > 10.0                  # beide teurer als die Boerse
-
-    # eine beliebige andere Verbrauchergruppe ist eine andere Zahl, kein neuer Codepfad
-    assert preis(5.0, 0.0)[0] == pytest.approx(15.0)
-
-    # die MwSt wirkt auf die SUMME - deshalb laesst sie sich nicht in den Aufschlag falten
-    assert preis(12.09, 0.19)[0] != pytest.approx(10.0 + 12.09 * 1.19)
-
-    # ohne Angabe rechnet das LP mit der reinen Boerse
-    assert strat._grid_price_series("GC1", idx, SystemConfig())[0] == pytest.approx(10.0)
-
-    # ein Aufschlag hebt negative Boersenpreise ueber null - die Kappung greift dann nicht
-    strat.events.grid_operator_signals[0].cost["value"] = -4.0
-    assert preis(12.09, 0.19)[0] == pytest.approx((-4.0 + 12.09) * 1.19)
-    # ohne Aufschlag bleibt sie als Schutz aktiv
-    assert strat._grid_price_series("GC1", idx, _roh())[0] == 0.0
-
-
-def test_flat_fallback_price_is_never_marked_up():
-    """Ohne Szenario-Kurve gilt grid_variable_costs - und das ist schon ein Endkundenpreis.
-
-    Ein Aufschlag darauf wuerde Netzentgelt, Umlagen und Steuern doppelt zaehlen. Der
-    Aufschlag darf also ausschliesslich auf die Szenario-Kurve wirken.
-    """
-    idx = pd.date_range("2025-01-01", periods=4, freq="15min")
-    m = EnergySystemModel(
-        config=SystemConfig(debug=False, grid_price_markup_ct_kWh=12.09,
-                            grid_price_vat=0.19, grid_variable_costs=35.0),
-        time_index=idx,
-        grid_connectors={"GC1": {"max_power": 30.0, "load": [1] * 4}},   # kein price_ct_kWh
-    )
-    _build_es(m)
-    # oemof normalisiert variable_costs zur Reihe je Schritt - alle Schritte 35, nicht 41.6
-    kosten = _out_flow(_nodes(m)["grid_supply_Home_1"]).variable_costs
-    assert [float(kosten[t]) for t in range(4)] == [35.0] * 4
+    assert strat._grid_price_series("GC1", idx)[0] == 0.0
+    # ein positiver Wert wird nicht angetastet - die Kappung ist keine Preisbildung
+    strat.events.grid_operator_signals[0].cost["value"] = 10.0
+    assert strat._grid_price_series("GC1", idx)[0] == pytest.approx(10.0)
 
 
 @requires_cbc
@@ -377,10 +366,10 @@ def test_scalar_results_carry_the_grid_peak(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     idx = pd.date_range("2025-01-01", periods=8, freq="15min")
     m = EnergySystemModel(
-        config=SystemConfig(debug=False, should_dump_results=True, output_dir="out",
-                            grid_price_markup_ct_kWh=8.10, grid_price_vat=0.0),
+        config=SystemConfig(debug=False, should_dump_results=True, output_dir="out"),
         time_index=idx,
-        grid_connectors={"GC1": {"max_power": 30.0, "load": [1, 1, 9, 1, 1, 1, 1, 1]}},
+        grid_connectors={"GC1": {"max_power": 30.0, "load": [1, 1, 9, 1, 1, 1, 1, 1],
+                                 "price_ct_kWh": [30.0] * 8}},
     )
     m.run()
 
@@ -388,14 +377,13 @@ def test_scalar_results_carry_the_grid_peak(tmp_path, monkeypatch):
     reihe = m._summary_df["grid_supply_Home_1"]
     assert k["grid_peak_kW_Home_1"] == pytest.approx(float(reihe.max()))
     assert k["grid_energy_kWh_Home_1"] == pytest.approx(float(reihe.sum()) * 0.25)
-    # der benutzte Aufschlag steht im Dump - der Endkundenpreis ist daraus rekonstruierbar
-    assert k["markup_ct_kWh"] == pytest.approx(8.10) and k["vat"] == pytest.approx(0.0)
     assert k["periods"] == 8 and k["step_hours"] == pytest.approx(0.25)
     assert k["fraction_year"] == pytest.approx(8 * 0.25 / 8760.0)
     # die Spitze ist die Lastspitze des Zeitraums, nicht der Mittelwert
     assert k["grid_peak_kW_Home_1"] > k["grid_energy_kWh_Home_1"] / (8 * 0.25)
-    # kein Euro-Betrag im Modell - der Tarif ist eine nachgelagerte Entscheidung
-    assert not any("eur" in name.lower() or "capacity" in name.lower() for name in k)
+    # kein Euro-Betrag und kein Aufschlag im Modell - der Tarif ist nachgelagert
+    assert not any(t in name.lower() for name in k
+                   for t in ("eur", "capacity", "markup", "vat"))
 
     dump = pd.read_csv(tmp_path / "out" / "dump_costs.csv")
     assert dump.loc[0, "grid_peak_kW_Home_1"] == pytest.approx(k["grid_peak_kW_Home_1"])
@@ -410,14 +398,13 @@ def test_from_options_coerces_cfg_types():
     """
     c = SystemConfig.from_options({"oemof_enable_v2h": "False",
                                    "oemof_enable_pv_to_home": "FALSE",
-                                   "oemof_grid_variable_costs": "22.5",
-                                   "oemof_grid_price_markup_ct_kWh": "8.10",
-                                   "oemof_grid_price_vat": "0.19",
+                                   "oemof_grid_feedin_tariff": "-6.24",
+                                   "oemof_storage_cycle_penalty": "0.002",
                                    "oemof_solver_threads": "4",
                                    "oemof_solver": "cbc"})
     assert c.enable_v2h is False and c.enable_pv_to_home is False
-    assert c.grid_variable_costs == 22.5 and isinstance(c.grid_variable_costs, float)
-    assert c.grid_price_markup_ct_kWh == 8.10 and c.grid_price_vat == 0.19
+    assert c.grid_feedin_tariff == -6.24 and isinstance(c.grid_feedin_tariff, float)
+    assert c.storage_cycle_penalty == 0.002
     assert c.solver_threads == 4 and isinstance(c.solver_threads, int)
     assert c.solver == "cbc"          # Strings bleiben unangetastet
     # echte JSON-Werte gehen unveraendert durch
@@ -643,7 +630,8 @@ def test_min_soc_series_forces_desired_soc_before_departure():
     m = EnergySystemModel(
         config=SystemConfig(debug=False, should_dump_results=False),
         time_index=idx,
-        grid_connectors={"GC1": {"max_power": 30.0, "load": [1] * 8}},
+        grid_connectors={"GC1": {"max_power": 30.0, "load": [1] * 8,
+                                 "price_ct_kWh": [30.0] * 8}},
         charging_stations={"CS1": {"max_power": 22.0, "parent": "GC1"}},
         vehicle_params={"v1": {"capacity_kWh": 50.0, "initial_soc": 0.5, "min_soc": 0.2,
                                "min_soc_series": floor,
@@ -673,7 +661,7 @@ def test_full_run_extracts_schedule(tmp_path, monkeypatch):
         config=SystemConfig(debug=False, should_dump_results=True, output_dir="out"),
         time_index=idx,
         # car starts at 50% (25 kWh), drives steps 4-7 (16 kWh) -> must charge to stay >= min
-        grid_connectors={"GC1": {"max_power": 30.0,
+        grid_connectors={"GC1": {"max_power": 30.0, "price_ct_kWh": [30.0] * 8,
                                  "load": [1] * 8, "pv": [0, 0, 2, 4, 4, 2, 0, 0]}},
         charging_stations={"CS1": {"max_power": 11.0, "parent": "GC1"}},
         battery_params={"BAT1": {"capacity_kWh": 10.0, "power_kW": 5.0, "parent": "GC1"}},
@@ -747,6 +735,7 @@ def _pv_scenario(config, pv_power_kW=10.0, pv=(0, 0, 20, 20, 20, 20, 0, 0), v2g=
         config=config,
         time_index=idx,
         grid_connectors={"GC1": {"max_power": 40.0, "load": [8] * 8, "pv": list(pv),
+                                 "price_ct_kWh": [30.0] * 8,
                                  "pv_power_kW": pv_power_kW}},
         charging_stations={"CS1": {"max_power": 11.0, "parent": "GC1"}},
         battery_params={"BAT1": {"capacity_kWh": 20.0, "power_kW": 5.0, "parent": "GC1"}},

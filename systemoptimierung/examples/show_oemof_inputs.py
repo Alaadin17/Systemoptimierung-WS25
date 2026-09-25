@@ -57,16 +57,7 @@ def lade(beispiel):
     if not pfad.exists():
         raise SystemExit(f"{pfad} gibt es nicht - waehle einen der Beispielordner")
     sc = Scenario(json.loads(pfad.read_text(encoding="utf-8")), pfad.parent)
-    # The oemof_* keys the example's simulate.cfg sets; only the two markup values matter
-    # here, because they turn the exchange price into the retail price the LP uses.
-    cfg = {}
-    sim = pfad.parent / "simulate.cfg"
-    if sim.exists():
-        for z in sim.read_text(encoding="utf-8").splitlines():
-            for schluessel in ("grid_price_markup_ct_kWh", "grid_price_vat"):
-                if z.startswith(f"oemof_{schluessel}"):
-                    cfg[schluessel] = z.split("=")[1].strip()
-    return sc, cfg
+    return sc
 
 
 def main():
@@ -80,13 +71,13 @@ def main():
     pd.set_option("display.width", 200)
     pd.set_option("display.max_columns", 40)
 
-    sc, cfg = lade(args.beispiel)
+    sc = lade(args.beispiel)
+    # No oemof_* key is read here: the prices come from the scenario's own signals, and
+    # the rest of the defaults do not change any of the tables shown below.
     s = OemofSolve(sc.components, sc.start_time, events=sc.events,
-                   interval=sc.interval, stop_time=sc.stop_time, oemof_config=cfg)
+                   interval=sc.interval, stop_time=sc.stop_time, oemof_config={})
 
-    print(f"Beispiel: {args.beispiel}   Aufschlag: "
-          f"{cfg.get('grid_price_markup_ct_kWh', '0.0')} ct netto, "
-          f"MwSt-Faktor {cfg.get('grid_price_vat', '0.0')}")
+    print(f"Beispiel: {args.beispiel}")
     print(f"Zeitraum: {sc.start_time} bis {sc.stop_time}   Intervall: {sc.interval}")
 
     # ---------------------------------------------------------------- prepare_inputs()
@@ -161,7 +152,7 @@ def main():
     print(f"  Summe {verbrauch.sum():.6f} kWh = Summe der Trips "
           f"{f['trips'].query('vehicle_id == @fz')['energy_kwh'].sum():.6f} kWh")
 
-    titel("7", "grid_connectors - load, PV and the retail price per step")
+    titel("7", "grid_connectors - load, PV and the scenario's price per step")
     for gcid, gc in oi["grid_connectors"].items():
         print(f"  {gcid}:")
         for k, v in gc.items():

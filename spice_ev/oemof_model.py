@@ -131,14 +131,17 @@ class SystemConfig:
     storage_cycle_penalty: float = 0.001
 
     # --- Prices (ct/kWh) -------------------------------------------------------------
-    # grid_variable_costs is the purchase price when the scenario brings none: the
-    # COMPLETE price as it stands on the bill - no price sheet, no markup, no capacity
-    # charge. If the scenario carries price signals (include_price_csv in generate.cfg),
-    # that series applies INSTEAD, per step, exactly as spice_ev's own strategies see it
-    # (see OemofSolve._grid_price_series); grid_variable_costs is then without effect.
-    # grid_feedin_tariff is always fixed and applies to the ONE export path there is,
-    # the PV surplus. Negative = revenue, 0 = no remuneration. Energy on the house bus
-    # (battery, V2H) has no way out to the grid at all - see _add_grid_connector.
+    # The purchase price is NOT a model parameter. It comes from the scenario, as the
+    # GridOperatorSignal series that include_price_csv creates, and the model reads it
+    # per step exactly as spice_ev's own strategies do - see OemofSolve._grid_price_series.
+    # A grid connector without such a series cannot be priced and the build fails; there
+    # is deliberately no constant fallback, because a made-up price would answer a
+    # question nobody asked.
+    #
+    # grid_feedin_tariff is the one exception: it is fixed and applies to the ONE export
+    # path there is, the PV surplus. Negative = revenue, 0 = no remuneration. Energy on
+    # the house bus (battery, V2H) has no way out to the grid at all - see
+    # _add_grid_connector.
     #
     # NOTE - spice_ev's own cost calculation goes its own way: simulate.py evaluates
     # costs.py after the simulation with the price sheet (grid fees, levies, taxes,
@@ -146,28 +149,7 @@ class SystemConfig:
     # the schedule did - both numbers are right, they are just not the same calculation.
     # The full price semantics are documented in examples/configs/simulate_with_oemof.cfg.
     pv_variable_costs: float = 0.0
-    grid_variable_costs: float = 35.0
     grid_feedin_tariff: float = 0.0   # negative = revenue; 0 = feeding in earns nothing
-
-    # --- retail markup ----------------------------------------------------------------
-    # A price CSV holds the EXCHANGE price. What a customer actually pays is
-    #     price = (exchange + markup) * (1 + vat)
-    # Both are plain numbers, so ANY consumer group can be expressed - not just the two a
-    # lookup table would offer. For orientation, the sums of grid fee + levies +
-    # concession fee + electricity tax in examples/data/price_sheet.json:
-    #     household   12.09 ct net + 19 % VAT      commercial   8.10 ct net, VAT reclaimable
-    # power_procurement (7.70 ct) is deliberately NOT part of the markup - that IS the
-    # energy, and the energy comes from the exchange series.
-    #
-    # The VAT cannot be folded into the markup: it applies to the SUM, so a single
-    # additive number would make the effective markup depend on the exchange price.
-    #
-    # Default 0.0/0.0 means the LP calculates with the raw exchange price. Every cfg in
-    # the project sets both values explicitly. The markup applies ONLY to a price series
-    # the scenario brings along (include_price_csv); without one, grid_variable_costs
-    # applies, and that is already a complete retail price.
-    grid_price_markup_ct_kWh: float = 0.0
-    grid_price_vat: float = 0.0
 
     # Solver
     solver: str = "cbc"
@@ -403,15 +385,18 @@ class EnergySystemModel:
         """
         periods = self.config.periods
 
-        # Supply source. If the strategy hands over a price series from the scenario
-        # (include_price_csv) it applies per step - otherwise the fixed cfg value.
+        # Supply source. The price per step comes from the scenario and nowhere else.
         preis = gc.get("price_ct_kWh")
+        if preis is None:
+            raise ValueError(
+                f"grid connector {gcid!r} has no price series. The model prices energy "
+                "with the scenario's own signals and has no fallback - give the scenario "
+                "a price curve (include_price_csv in generate.cfg).")
         supply = cmp.Source(
             label=f"grid_supply_{name}",
             outputs={b: flows.Flow(
                 nominal_value=float(gc.get("max_power", self.config.grid_supply_power_kW)),
-                variable_costs=(_as_array(preis, periods) if preis is not None
-                                else self.config.grid_variable_costs))},
+                variable_costs=_as_array(preis, periods))},
         )
         self.es.add(supply)
         # Feed-in tariff for the PV surplus. It must not be remunerated POSITIVELY while
@@ -851,14 +836,12 @@ class EnergySystemModel:
             summary[f"wallbox_charge_{vid}"] = charge[vid]
             summary[f"wallbox_discharge_{vid}"] = discharge[vid]
 
-        # The price the objective really used - a constant or the step function from the
-        # price CSV, depending on the scenario. Written out either way so plots and checks
-        # have one source and need not look up the cfg.
+        # The price the objective really used: the step function from the scenario's price
+        # signals. Written out so plots and checks have one source, and so it can be held
+        # against spice_ev's own column "price [ct/kWh]" - the two must be identical.
         for gcid, bus in self._gc_bus.items():
-            p = self.grid_connectors.get(gcid, {}).get("price_ct_kWh")
-            summary[f"grid_price_ct_{bus.label}"] = (
-                _as_array(p, n) if p is not None
-                else np.full(n, float(self.config.grid_variable_costs)))
+            p = self.grid_connectors[gcid]["price_ct_kWh"]
+            summary[f"grid_price_ct_{bus.label}"] = _as_array(p, n)
 
         # --- per-battery plan: AC power at the GC bus (the link flows) ---
         # charge   = flow Home_<n> -> link (AC drawn to charge the battery)
@@ -902,17 +885,12 @@ class EnergySystemModel:
         self._grid_schedule = grid_schedule
 
         # --- scalar results ---
-        # The objective in ct: purchase, feed-in and the tiny storage_cycle_penalty
-        # tie-breaker, nothing else. The EUR/a in
-        # results.json are computed separately anyway, after the simulation from the
-        # physical timeseries.
+        # The objective in ct: purchase at the scenario's price, feed-in and the tiny
+        # storage_cycle_penalty tie-breaker, nothing else. The EUR/a in results.json are
+        # computed separately anyway, after the simulation from the physical timeseries.
         step_hours = self._step_hours()
         self._costs = {
             "objective": float(self.model.objective()),
-            # the markup the run actually used - so the retail price can be reconstructed
-            # from the dump alone, without the cfg next to it
-            "markup_ct_kWh": float(self.config.grid_price_markup_ct_kWh),
-            "vat": float(self.config.grid_price_vat),
             "periods": n,
             "step_hours": step_hours,
             # share of a year the simulated horizon covers - needed to pro-rate any annual
@@ -940,8 +918,7 @@ class EnergySystemModel:
         """Write the schedule, summary and scalar results as CSV into ``config.output_dir``.
 
         ``<stem>_costs.csv`` is one row: the objective plus what a later tariff calculation
-        needs - the consumer type, the horizon length, and the grid peak and energy per
-        connector."""
+        needs - the horizon length and the grid peak and energy per connector."""
         if not self.config.should_dump_results:
             return
         out = Path(self.config.output_dir)
