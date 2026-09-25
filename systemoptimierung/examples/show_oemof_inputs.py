@@ -117,7 +117,7 @@ def main():
                   & (lts.timestamp >= grenze - pd.Timedelta(minutes=45))
                   & (lts.timestamp <= grenze + pd.Timedelta(minutes=45))]
     print(f"  erste Abfahrt: {ab}")
-    tabelle(fenster[["timestamp", "state", "unterwegs", "zuhause", "energy_kwh",
+    tabelle(fenster[["timestamp", "state", "is_driving", "is_parked", "energy_kwh",
                      "connected_charging_station"]])
 
     # ------------------------------------------------------------ build_oemof_inputs()

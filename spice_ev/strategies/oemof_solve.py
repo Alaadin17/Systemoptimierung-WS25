@@ -1,7 +1,7 @@
 '''
 ----------------- OemofSolve strategy -----------------------
 
-Autor: Alaa Alsleman, GitHub: Alaadin17
+Author: Alaa Alsleman, GitHub: Alaadin17
 
 Goal: derive the charging strategy from an oemof optimization instead of a heuristic.
 The whole horizon is optimized ONCE (open loop) and the resulting plan is then applied
@@ -420,8 +420,8 @@ class OemofSolve(Strategy):
             Tuple (per_vehicle, long_df):
                 per_vehicle: dict[vehicle_id, DataFrame] indexed by time_index.
                 long_df: DataFrame with columns timestamp, vehicle_id, state,
-                unterwegs, zuhause (German column names, kept), energy_kwh,
-                connected_charging_station, desired_soc.
+                is_driving, is_parked, energy_kwh, connected_charging_station,
+                desired_soc.
         """
         # Normalize the time index and interval to comparable types.
         time_index = pd.DatetimeIndex(time_index)
@@ -474,8 +474,8 @@ class OemofSolve(Strategy):
                         df.loc[ts_slice, "desired_soc"] = float(seg["desired_soc"])
 
             # Convenience boolean columns for quick filtering/plotting.
-            df["unterwegs"] = df["state"].eq("driving")
-            df["zuhause"] = df["state"].eq("parked")
+            df["is_driving"] = df["state"].eq("driving")
+            df["is_parked"] = df["state"].eq("parked")
             df["vehicle_id"] = vid
 
             # Store per-vehicle and also build a long-format table.
@@ -485,11 +485,11 @@ class OemofSolve(Strategy):
         # Concatenate all vehicles into one long table (timestamp, vehicle_id, ...).
         if long_rows:
             long_df = pd.concat(long_rows, ignore_index=True)
-            long_df = long_df[["timestamp", "vehicle_id", "state", "unterwegs", "zuhause",
+            long_df = long_df[["timestamp", "vehicle_id", "state", "is_driving", "is_parked",
                                "energy_kwh", "connected_charging_station", "desired_soc"]]
         else:
             long_df = pd.DataFrame(
-                columns=["timestamp", "vehicle_id", "state", "unterwegs", "zuhause",
+                columns=["timestamp", "vehicle_id", "state", "is_driving", "is_parked",
                          "energy_kwh", "connected_charging_station", "desired_soc"]
             )
         # Return both representations: per-vehicle dict and long-format table.
@@ -617,14 +617,14 @@ class OemofSolve(Strategy):
             # Purchase price: the scenario's own series, the same one spice_ev's built-in
             # strategies read. The feed-in tariff is fixed (grid_feedin_tariff) and only
             # the PV surplus can earn it - the house bus has no export path.
-            preis = self._grid_price_series(gcid, time_index)
-            if preis is None:
+            price = self._grid_price_series(gcid, time_index)
+            if price is None:
                 raise ValueError(
                     f"grid connector {gcid!r} carries no price signals. oemof_solve "
                     "prices energy with the scenario's own series and has no fallback - "
                     "add a price curve to the scenario (include_price_csv in "
                     "generate.cfg).")
-            info["price_ct_kWh"] = preis
+            info["price_ct_kWh"] = price
             kwp = self._pv_kwp(gcid)
             if kwp > 0:
                 info["pv_power_kW"] = kwp              # PV plant size -> converter limit
@@ -667,26 +667,26 @@ class OemofSolve(Strategy):
         price they read and the price the LP optimizes against. On a series whose minimum
         is above zero it never fires.
         """
-        signale = [s for s in getattr(self.events, "grid_operator_signals", []) or []
+        signals = [s for s in getattr(self.events, "grid_operator_signals", []) or []
                    if getattr(s, "grid_connector_id", None) == gcid
                    and getattr(s, "cost", None)]
-        if not signale:
+        if not signals:
             return None
-        paare = []
-        for s in sorted(signale, key=lambda s: s.start_time):
+        pairs = []
+        for s in sorted(signals, key=lambda s: s.start_time):
             t = pd.Timestamp(s.start_time)
             if t.tzinfo is not None:
                 t = t.tz_localize(None)
-            paare.append((t, float(get_cost(1, s.cost))))          # ct/kWh, as in spice_ev
-        ziel = time_index
-        if ziel.tz is not None:
-            ziel = ziel.tz_localize(None)
-        starts = pd.DatetimeIndex([p[0] for p in paare])
-        boerse = np.array([p[1] for p in paare])
-        werte = np.maximum(boerse, 0.0)
-        idx = np.searchsorted(starts, ziel, side="right") - 1
-        idx = np.clip(idx, 0, len(werte) - 1)   # before the first signal its value applies
-        return werte[idx]
+            pairs.append((t, float(get_cost(1, s.cost))))          # ct/kWh, as in spice_ev
+        target = time_index
+        if target.tz is not None:
+            target = target.tz_localize(None)
+        starts = pd.DatetimeIndex([p[0] for p in pairs])
+        exchange = np.array([p[1] for p in pairs])
+        values = np.maximum(exchange, 0.0)
+        idx = np.searchsorted(starts, target, side="right") - 1
+        idx = np.clip(idx, 0, len(values) - 1)   # before the first signal its value applies
+        return values[idx]
 
     def _pv_kwp(self, gcid) -> float:
         """Installed PV nominal power (kWp) at one grid connector, summed over its plants."""
@@ -823,7 +823,7 @@ class OemofSolve(Strategy):
             # and Battery.unload clamps to it. Without this value the LP plans up to the
             # full station power, the simulation delivers half, and the planned SOC drifts
             # away - measured in 03_household_v2g as 5.27 kW per step before the value was passed.
-            entladeleistung = getattr(
+            discharge_power = getattr(
                 getattr(getattr(veh, "battery", None), "unloading_curve", None),
                 "max_power", None)
 
@@ -838,8 +838,8 @@ class OemofSolve(Strategy):
                 "connected_cs": connected_cs,
                 "min_soc_series": self._min_soc_series(ts, config),
                 "efficiency": eff,   # spice_ev Battery.efficiency -> storage in/outflow
-                "discharge_power_kW": (float(entladeleistung)
-                                       if entladeleistung is not None else None),
+                "discharge_power_kW": (float(discharge_power)
+                                       if discharge_power is not None else None),
             }
 
         # Charging stations (one wallbox per CS in the oemof model): power + parent GC

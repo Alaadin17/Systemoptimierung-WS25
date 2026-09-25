@@ -204,8 +204,8 @@ def _nonzero(values, n):
     return values is not None and float(np.sum(_as_array(values, n))) > 0.0
 
 
-_WAHR = {"true", "yes", "on", "1"}
-_FALSCH = {"false", "no", "off", "0"}
+_TRUE = {"true", "yes", "on", "1"}
+_FALSE = {"false", "no", "off", "0"}
 
 
 def _coerce(name, value, typ):
@@ -215,26 +215,26 @@ def _coerce(name, value, typ):
     ``oemof_enable_v2h = False`` therefore stays the STRING "False" - which is truthy in
     Python, so the switch would silently be ON. That has happened once.
     """
-    ziel = str(typ)
-    if "bool" in ziel:
+    declared = str(typ)
+    if "bool" in declared:
         if isinstance(value, bool):
             return value
         text = str(value).strip().lower()
-        if text in _WAHR:
+        if text in _TRUE:
             return True
-        if text in _FALSCH:
+        if text in _FALSE:
             return False
         logging.warning("oemof_%s: '%s' is not a boolean (expected true/false)",
                         name, value)
         return bool(value)
-    if "float" in ziel or "int" in ziel:
+    if "float" in declared or "int" in declared:
         try:
-            zahl = float(value)
+            number = float(value)
         except (TypeError, ValueError):
             logging.warning("oemof_%s: '%s' is not a number - value taken over as is",
                             name, value)
             return value
-        return int(zahl) if "int" in ziel and "float" not in ziel else zahl
+        return int(number) if "int" in declared and "float" not in declared else number
     return value
 
 
@@ -386,8 +386,8 @@ class EnergySystemModel:
         periods = self.config.periods
 
         # Supply source. The price per step comes from the scenario and nowhere else.
-        preis = gc.get("price_ct_kWh")
-        if preis is None:
+        price = gc.get("price_ct_kWh")
+        if price is None:
             raise ValueError(
                 f"grid connector {gcid!r} has no price series. The model prices energy "
                 "with the scenario's own signals and has no fallback - give the scenario "
@@ -396,7 +396,7 @@ class EnergySystemModel:
             label=f"grid_supply_{name}",
             outputs={b: flows.Flow(
                 nominal_value=float(gc.get("max_power", self.config.grid_supply_power_kW)),
-                variable_costs=_as_array(preis, periods))},
+                variable_costs=_as_array(price, periods))},
         )
         self.es.add(supply)
         # Feed-in tariff for the PV surplus. It must not be remunerated POSITIVELY while
@@ -549,8 +549,8 @@ class EnergySystemModel:
         # V2G discharges with the discharge_curve that spice_ev derives from the charging
         # curve times v2g_power_factor - typically half. Without this limit the LP plans
         # with the full station power and the planned SOC drifts away from the simulated one.
-        p_entladen = params.get("discharge_power_kW")
-        p_entladen = float(p_entladen) if p_entladen else None
+        p_discharge = params.get("discharge_power_kW")
+        p_discharge = float(p_discharge) if p_discharge else None
         discharge_limit = float(params.get("discharge_limit", self.config.bev_discharge_limit))
         floor = max(min_soc, discharge_limit) if can_discharge else min_soc
 
@@ -607,7 +607,7 @@ class EnergySystemModel:
         self._vehicle_nodes[vid] = {
             "bus": b_mobility,      # charging arrives here, V2H leaves here
             "can_discharge": can_discharge,
-            "p_discharge": p_entladen,   # None = only the station power limits
+            "p_discharge": p_discharge,   # None = only the station power limits
             "connected_cs": list(params.get("connected_cs", [])),
         }
 
@@ -643,14 +643,14 @@ class EnergySystemModel:
                 # discharge_curve (charging curve times v2g_power_factor). Allowing the full
                 # station power here plans more feed-back than the simulation can deliver -
                 # the SOC then diverges.
-                p_ab = min(power, node["p_discharge"]) if node["p_discharge"] else power
+                p_discharge = min(power, node["p_discharge"]) if node["p_discharge"] else power
                 wb_discharge = cmp.Converter(
                     label=f"wallbox_discharge_{csid}_{vid}",
                     inputs={b_mob: flows.Flow()},
                     # the tiny penalty also prevents simultaneous charge+discharge (a free
                     # cycle through the two lossless wallbox converters)
                     outputs={gc_bus: flows.Flow(
-                        max=mask, nominal_value=p_ab,
+                        max=mask, nominal_value=p_discharge,
                         variable_costs=self.config.storage_cycle_penalty)},
                     conversion_factors={gc_bus: self.config.wallbox_efficiency_discharge},
                 )
@@ -901,12 +901,12 @@ class EnergySystemModel:
         # outside the model. The model itself prices energy only: no capacity charge enters
         # the objective, deliberately - an annual amount would dominate a one-week schedule.
         for bus in self._gc_bus.values():
-            spalte = f"grid_supply_{bus.label}"
-            if spalte not in self._summary_df.columns:
+            column = f"grid_supply_{bus.label}"
+            if column not in self._summary_df.columns:
                 continue
-            reihe = self._summary_df[spalte]
-            self._costs[f"grid_peak_kW_{bus.label}"] = float(reihe.max())
-            self._costs[f"grid_energy_kWh_{bus.label}"] = float(reihe.sum() * step_hours)
+            series = self._summary_df[column]
+            self._costs[f"grid_peak_kW_{bus.label}"] = float(series.max())
+            self._costs[f"grid_energy_kWh_{bus.label}"] = float(series.sum() * step_hours)
 
     def _step_hours(self) -> float:
         """Length of one time step in hours (0.25 for a 15-minute grid)."""
