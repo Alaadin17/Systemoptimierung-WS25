@@ -22,11 +22,12 @@ systemoptimierung/examples/**/varianten/
 systemoptimierung/examples/**/scenario_homeoffice.json
 systemoptimierung/examples/**/generate.homeoffice.cfg
 systemoptimierung/examples/**/test_run.ipynb
-# run outputs: results/ of every example; in laeufe/<strategy>/ everything but its sim.cfg
+# run outputs: results/ of every example, and the per-strategy runs incl. their sim.cfg
 systemoptimierung/examples/**/results/
-systemoptimierung/examples/**/laeufe/*/*
-!systemoptimierung/examples/**/laeufe/*/sim.cfg
+systemoptimierung/examples/**/laeufe/
 # not part of the handover
+systemoptimierung/examples/show_oemof_inputs.py
+systemoptimierung/examples/make_price_csv.py
 systemoptimierung/examples/**/zwischenschritt/
 systemoptimierung/examples/dokumentation/
 systemoptimierung/examples/**/__pycache__/
