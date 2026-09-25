@@ -39,6 +39,8 @@ def simulate(args):
         'testing': args.get("testing"),
         'timing': args.get("eta"),
         'visual': args.get("visual"),
+        # oemof-Parameter (oemof_*-Keys from cfg) are passed to the strategy
+        'oemof_config': args.get("oemof_options", {}),
     }
 
     # parse strategy options

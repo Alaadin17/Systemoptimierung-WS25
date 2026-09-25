@@ -9,7 +9,7 @@ from spice_ev.util import get_cost, clamp_power
 
 STRATEGIES = [
     'greedy', 'balanced', 'balanced_market', 'distributed',
-    'peak_load_window', 'peak_shaving', 'flex_window', 'schedule'
+    'peak_load_window', 'peak_shaving', 'flex_window', 'schedule', 'oemof_solve'
 ]
 
 

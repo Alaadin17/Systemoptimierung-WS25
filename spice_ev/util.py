@@ -275,6 +275,13 @@ def set_options_from_config(args, check=None, verbose=True):
                 except ValueError:
                     # or not
                     pass
+                # oemof_* keys are not argparse options: collect them in a dict
+                # and forward them to the strategy (see OemofSolve). The prefix is
+                # stripped so the dict keys match the SystemConfig fields.
+                if k.startswith("oemof_"):
+                    opts = vars(args).setdefault("oemof_options", {})
+                    opts[k[len("oemof_"):]] = v
+                    continue
                 # check option
                 if check is not None:
                     # find action by name
