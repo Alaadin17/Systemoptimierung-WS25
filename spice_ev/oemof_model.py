@@ -109,7 +109,8 @@ class SystemConfig:
 
     # BEV (default/fallback; overridden per vehicle from the master data)
     bev_capacity_kWh: float = 77.0
-    bev_min_soc: float = 0.2
+    # No general SOC floor for vehicles: spice_ev has none either (only SOC >= 0). The
+    # only floors are desired_soc at departures and, for V2H, discharge_limit.
     bev_max_soc: float = 0.95
     bev_initial_soc: float = 0.95
     bev_discharge_limit: float = 0.5  # min SOC for V2H/V2G discharge (spice_ev VehicleType default)
@@ -526,8 +527,8 @@ class EnergySystemModel:
 
         - consumption is the driving demand as ``fixed_losses_absolute`` - it is taken from
           the storage even while the car is away.
-        - The SOC floor is ``min_soc``, for V2H/V2G-capable vehicles
-          ``max(min_soc, discharge_limit)``.
+        - There is no general SOC floor - spice_ev has none (only SOC >= 0). For V2H/V2G-
+          capable vehicles the floor is ``discharge_limit``.
         - min_soc_series raises that floor PER STEP to the ``desired_soc`` from the scenario,
           in the step before each departure - so the car is as full as spice_ev expects.
           Capped at ``max_soc``, otherwise the storage would be infeasible.
@@ -539,7 +540,6 @@ class EnergySystemModel:
         loss_factor = self._loss_factor()
 
         capacity = float(params.get("capacity_kWh", self.config.bev_capacity_kWh))
-        min_soc = float(params.get("min_soc", self.config.bev_min_soc))
         max_soc = float(params.get("max_soc", self.config.bev_max_soc))
         v2g = bool(params.get("v2g", False))
 
@@ -552,7 +552,7 @@ class EnergySystemModel:
         p_discharge = params.get("discharge_power_kW")
         p_discharge = float(p_discharge) if p_discharge else None
         discharge_limit = float(params.get("discharge_limit", self.config.bev_discharge_limit))
-        floor = max(min_soc, discharge_limit) if can_discharge else min_soc
+        floor = discharge_limit if can_discharge else 0.0
 
         # per-step floor from the scenario (desired_soc at departures), else the constant one
         series = params.get("min_soc_series")

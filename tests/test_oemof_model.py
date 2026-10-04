@@ -638,14 +638,14 @@ def test_step_ignores_missing_soc_target():
 def test_min_soc_series_forces_desired_soc_before_departure():
     idx = pd.date_range("2025-01-01", periods=8, freq="15min")
     # plugged in for steps 0-3, drives 4-7; spice_ev wants desired_soc=0.8 when it leaves
-    floor = np.array([0.2, 0.2, 0.2, 0.8, 0.2, 0.2, 0.2, 0.2])
+    floor = np.array([0.0, 0.0, 0.0, 0.8, 0.0, 0.0, 0.0, 0.0])
     m = EnergySystemModel(
         config=SystemConfig(debug=False, should_dump_results=False),
         time_index=idx,
         grid_connectors={"GC1": {"max_power": 30.0, "load": [1] * 8,
                                  "price_ct_kWh": [30.0] * 8}},
         charging_stations={"CS1": {"max_power": 22.0, "parent": "GC1"}},
-        vehicle_params={"v1": {"capacity_kWh": 50.0, "initial_soc": 0.5, "min_soc": 0.2,
+        vehicle_params={"v1": {"capacity_kWh": 50.0, "initial_soc": 0.5,
                                "min_soc_series": floor,
                                "connected_cs": ["CS1"] * 4 + [None] * 4,
                                "consumption": [0, 0, 0, 0, 4, 4, 4, 4]}},
@@ -764,8 +764,8 @@ def test_unplugged_steps_reach_the_model_as_none():
     assert all(c == "CS1" for c, a in zip(station, away) if not a)
 
     # exactly one departure step - 08:45, the last one plugged in - carries desired_soc;
-    # every other step keeps the global floor, here 0
-    floor = OemofSolve._min_soc_series(ts, SystemConfig(bev_min_soc=0.0))
+    # every other step has no floor at all, as in spice_ev
+    floor = OemofSolve._min_soc_series(ts)
     assert [f"{ts.index[i]:%H:%M}" for i in np.flatnonzero(floor > 0)] == ["08:45"]
     assert floor[35] == pytest.approx(0.8)
 
@@ -827,14 +827,15 @@ def test_full_run_extracts_schedule(tmp_path, monkeypatch):
     m = EnergySystemModel(
         config=SystemConfig(debug=False, should_dump_results=True, output_dir="out"),
         time_index=idx,
-        # car starts at 50% (25 kWh), drives steps 4-7 (16 kWh) -> must charge to stay >= min
+        # car starts at 50% (25 kWh) and drives 32 kWh in steps 4-7 -> it must charge before
+        # it leaves, or the SOC would go below 0
         grid_connectors={"GC1": {"max_power": 30.0, "price_ct_kWh": [30.0] * 8,
                                  "load": [1] * 8, "pv": [0, 0, 2, 4, 4, 2, 0, 0]}},
         charging_stations={"CS1": {"max_power": 11.0, "parent": "GC1"}},
         battery_params={"BAT1": {"capacity_kWh": 10.0, "power_kW": 5.0, "parent": "GC1"}},
-        vehicle_params={"v1": {"capacity_kWh": 50.0, "initial_soc": 0.5, "min_soc": 0.2,
+        vehicle_params={"v1": {"capacity_kWh": 50.0, "initial_soc": 0.5,
                                "connected_cs": ["CS1", "CS1", "CS1", "CS1", None, None, None, None],
-                               "consumption": [0, 0, 0, 0, 4, 4, 4, 4]}},
+                               "consumption": [0, 0, 0, 0, 8, 8, 8, 8]}},
     )
     m.run()   # full pipeline incl. _extract_results + _save_results
 
@@ -905,7 +906,7 @@ def _pv_scenario(config, pv=(0, 0, 20, 20, 20, 20, 0, 0), v2g=False, load=8):
                                  "price_ct_kWh": [30.0] * 8}},
         charging_stations={"CS1": {"max_power": 11.0, "parent": "GC1"}},
         battery_params={"BAT1": {"capacity_kWh": 20.0, "power_kW": 5.0, "parent": "GC1"}},
-        vehicle_params={"v1": {"capacity_kWh": 80.0, "initial_soc": 0.2, "min_soc": 0.1,
+        vehicle_params={"v1": {"capacity_kWh": 80.0, "initial_soc": 0.2,
                                "v2g": v2g, "discharge_limit": 0.1,
                                "connected_cs": ["CS1"] * 8, "consumption": [0] * 8}},
     )

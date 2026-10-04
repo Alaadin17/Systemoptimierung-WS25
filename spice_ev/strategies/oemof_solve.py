@@ -724,24 +724,23 @@ class OemofSolve(Strategy):
         return values[idx]
 
     @staticmethod
-    def _min_soc_series(ts, config) -> np.ndarray:
+    def _min_soc_series(ts) -> np.ndarray:
         """Per-step SOC floor for one vehicle, taken from the spice_ev scenario.
 
         spice_ev expects a vehicle to be charged to its ``desired_soc`` when it leaves
         (the trips are sized for that). The oemof model therefore gets a time-varying
         ``min_storage_level``: ``desired_soc`` at every DEPARTURE step (the last step the
-        vehicle is still plugged in before it drives off), and the global
-        ``config.bev_min_soc`` everywhere else — a constant desired_soc floor would be
-        infeasible, since driving must be allowed to drain the battery below it.
+        vehicle is still plugged in before it drives off), and 0 everywhere else - spice_ev
+        knows no other SOC floor. A constant desired_soc floor would be infeasible, since
+        driving must be allowed to drain the battery below it.
 
         Args:
             ts: per-vehicle timeseries with columns connected_charging_station, desired_soc.
-            config: SystemConfig (fallback floor ``bev_min_soc``).
 
         Returns:
             np.ndarray of length len(ts) with the SOC floor (0..1) per step.
         """
-        base = float(config.bev_min_soc)
+        base = 0.0
         # notna, not "is not None": a missing station is NaN as soon as pandas owns the dtype
         connected = ts["connected_charging_station"].notna().to_numpy()
         n = len(connected)
@@ -858,14 +857,13 @@ class OemofSolve(Strategy):
 
             vehicle_params[vid] = {
                 "capacity_kWh": capacity,
-                "min_soc": config.bev_min_soc,
                 "max_soc": config.bev_max_soc,
                 "initial_soc": init_soc,
                 "v2g": v2g,
                 "discharge_limit": discharge_limit,
                 "consumption": consumption,
                 "connected_cs": connected_cs,
-                "min_soc_series": self._min_soc_series(ts, config),
+                "min_soc_series": self._min_soc_series(ts),
                 "efficiency": eff,   # spice_ev Battery.efficiency -> storage in/outflow
                 "discharge_power_kW": (float(discharge_power)
                                        if discharge_power is not None else None),
@@ -1028,8 +1026,8 @@ class OemofSolve(Strategy):
                 cs.current_power += avg_power
             elif target_soc < soc_now - self.EPS and vehicle.vehicle_type.v2g:
                 # V2H/V2G: discharge down to the planned SOC. The plan never goes below the
-                # LP's own floor (max of bev_min_soc and discharge_limit), so the target IS
-                # the floor — no separate safety net needed.
+                # LP's own floor (discharge_limit), so the target IS the floor — no
+                # separate safety net needed.
                 avg_power = vehicle.battery.unload(
                     self.interval, target_soc=target_soc, max_power=cs.max_power)["avg_power"]
                 commands[cs_id] = gc.add_load(cs_id, -avg_power)
