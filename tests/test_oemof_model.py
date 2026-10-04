@@ -448,6 +448,28 @@ def test_from_options_coerces_cfg_types():
     assert SystemConfig.from_options({"oemof_enable_v2h": False}).enable_v2h is False
 
 
+def test_fallbacks_are_spice_evs_defaults():
+    """Where spice_ev has a default, the model's fallback is that default.
+
+    Read from spice_ev's own classes, built with only their required keys. The model used
+    to fall back to a battery band of 0.1..1, a lossless battery starting half full and
+    vehicles charged to 0.95 - none of which spice_ev does.
+    """
+    from spice_ev import components
+    bat = components.StationaryBattery({"parent": "GC1", "charging_curve": [[0, 5], [1, 5]]})
+    vt = components.VehicleType({"name": "t", "capacity": 50,
+                                 "charging_curve": [[0, 11], [1, 11]]})
+    veh = components.Vehicle({"vehicle_type": "t"}, {"t": vt})
+
+    c = SystemConfig()
+    assert (c.battery_min_soc, c.battery_max_soc) == (0.0, 1.0)   # charges to 1, empties to 0
+    assert c.battery_initial_soc == bat.soc
+    assert c.battery_efficiency == bat.efficiency
+    assert c.bev_max_soc == 1.0
+    assert c.bev_initial_soc == veh.battery.soc
+    assert c.bev_discharge_limit == vt.discharge_limit
+
+
 # ---------------------------------------------------------------------------
 # Test 2c — step() skeleton: reads the right plan values, all guards intact
 # ---------------------------------------------------------------------------

@@ -899,7 +899,7 @@ class OemofSolve(Strategy):
             else:
                 capacity = config.bev_capacity_kWh
                 init_soc = config.bev_initial_soc
-                v2g = config.enable_v2h
+                v2g = False                         # spice_ev's VehicleType default
                 discharge_limit = config.bev_discharge_limit
 
             # spice_ev has NO wallbox loss: the charging station only limits the power and

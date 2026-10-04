@@ -99,21 +99,26 @@ class SystemConfig:
     converter_pv_to_home_efficiency: float = 1.0
     converter_pv_to_home_variable_costs: float = 0.0
 
-    # Stationary battery storage
-    battery_capacity_kWh: float = 10.2
-    battery_min_soc: float = 0.1
+    # Fallbacks follow spice_ev's own defaults (components.py) wherever spice_ev has one.
+    # Values without a spice_ev default stand for keys that spice_ev requires anyway
+    # (grid connector and station max_power, charging curve, vehicle type capacity).
+
+    # Stationary battery storage. The SOC band 0..1 is spice_ev's: its battery charges to 1
+    # and discharges to 0.
+    battery_capacity_kWh: float = 10.2   # spice_ev: -1 = size unknown, see _battery_params
+    battery_min_soc: float = 0.0
     battery_max_soc: float = 1.0
-    battery_initial_soc: float = 0.5
-    battery_efficiency: float = 1.0
+    battery_initial_soc: float = 0.0     # StationaryBattery soc
+    battery_efficiency: float = 0.95     # StationaryBattery efficiency
     battery_max_power_kW: float = 10.0
 
     # BEV (default/fallback; overridden per vehicle from the master data)
     bev_capacity_kWh: float = 77.0
     # No general SOC floor for vehicles: spice_ev has none either (only SOC >= 0). The
     # only floors are desired_soc at departures and, for V2H, discharge_limit.
-    bev_max_soc: float = 0.95
-    bev_initial_soc: float = 0.95
-    bev_discharge_limit: float = 0.5  # min SOC for V2H/V2G discharge (spice_ev VehicleType default)
+    bev_max_soc: float = 1.0             # spice_ev charges a vehicle up to 1
+    bev_initial_soc: float = 0.0         # Vehicle soc
+    bev_discharge_limit: float = 0.5     # VehicleType discharge_limit (min SOC for V2H)
     # The BEV's own charging/discharging loss is not configured here: the strategy hands
     # over each vehicle's Battery.efficiency, modelled AT THE STORAGE like spice_ev does.
 
