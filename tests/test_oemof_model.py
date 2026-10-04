@@ -241,8 +241,7 @@ def test_prices_come_from_the_scenario_and_nowhere_else():
         grid_connectors={"GC1": {"max_power": 30.0, "load": [1, 1, 1, 1], "pv": [0, 3, 3, 0],
                                  "price_ct_kWh": [30.0] * 4,
                                  "feedin_tariff_ct_kWh": -6.24,
-                                 "homebus_feedin_tariff_ct_kWh": -1.5,
-                                 "pv_power_kW": 7.5}},
+                                 "homebus_feedin_tariff_ct_kWh": -1.5}},
     )
     _build_es(m)
     nodes = _nodes(m)
@@ -250,8 +249,6 @@ def test_prices_come_from_the_scenario_and_nowhere_else():
     assert [float(supply.variable_costs[t]) for t in range(4)] == [30.0] * 4
     # der einzige Exportweg bekommt den cfg-Wert
     assert float(list(nodes["excess_Home_1"].inputs.values())[0].variable_costs[0]) == 0.0
-    # die Anlagengroesse ist KEIN Preis und kommt weiterhin aus dem Szenario
-    assert list(nodes["converter_pv_to_home_Home_1"].inputs.values())[0].nominal_value == 7.5
     # die cfg kennt nur diese Preis- und Kostenfelder - keins davon bewertet den Bezug
     felder = {f.name for f in dataclasses.fields(SystemConfig)}
     assert {f for f in felder if any(s in f for s in ("price", "tariff", "cost", "fee"))} == {
@@ -259,7 +256,7 @@ def test_prices_come_from_the_scenario_and_nowhere_else():
 
 
 def test_strategy_hands_the_model_physics_and_the_scenario_price():
-    """Last, PV, Anschlussleistung, kWp - und der Bezugspreis des Szenarios.
+    """Last, PV, Anschlussleistung - und der Bezugspreis des Szenarios. Kein kWp-Wert.
 
     Geprueft wird vor allem die EINHEIT: spice_ev fuehrt gc.cost in ct/kWh, also kommt der
     CSV-Wert unveraendert an. Die Einspeiseverguetung bleibt in jedem Fall fest.
@@ -277,8 +274,8 @@ def test_strategy_hands_the_model_physics_and_the_scenario_price():
         photovoltaics={"PV1": SimpleNamespace(parent="GC1", nominal_power=10.0)},
     )
     info = strat._grid_connectors(idx)["GC1"]
-    assert set(info) == {"load", "pv", "max_power", "pv_power_kW", "price_ct_kWh"}
-    assert info["pv_power_kW"] == 10.0
+    # die Anlagengroesse geht nicht ans Modell - die PV-Reihe ist schon die Erzeugung
+    assert set(info) == {"load", "pv", "max_power", "price_ct_kWh"}
     assert list(info["price_ct_kWh"]) == [30.0] * 4        # ct/kWh, unveraendert
 
 
@@ -894,7 +891,7 @@ def test_full_run_extracts_schedule(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # Test 5 — PV, Speicher und Wallbox ohne Direktzweige
 # ---------------------------------------------------------------------------
-def _pv_scenario(config, pv_power_kW=10.0, pv=(0, 0, 20, 20, 20, 20, 0, 0), v2g=False):
+def _pv_scenario(config, pv=(0, 0, 20, 20, 20, 20, 0, 0), v2g=False, load=8):
     """PV-Ueberschuss bei angestecktem Auto - die Lage, um die es geht.
 
     Die Haushaltslast muss gross genug sein, dass das Netz wirklich gebraucht wird: mit
@@ -904,9 +901,8 @@ def _pv_scenario(config, pv_power_kW=10.0, pv=(0, 0, 20, 20, 20, 20, 0, 0), v2g=
     return EnergySystemModel(
         config=config,
         time_index=idx,
-        grid_connectors={"GC1": {"max_power": 40.0, "load": [8] * 8, "pv": list(pv),
-                                 "price_ct_kWh": [30.0] * 8,
-                                 "pv_power_kW": pv_power_kW}},
+        grid_connectors={"GC1": {"max_power": 40.0, "load": [load] * 8, "pv": list(pv),
+                                 "price_ct_kWh": [30.0] * 8}},
         charging_stations={"CS1": {"max_power": 11.0, "parent": "GC1"}},
         battery_params={"BAT1": {"capacity_kWh": 20.0, "power_kW": 5.0, "parent": "GC1"}},
         vehicle_params={"v1": {"capacity_kWh": 80.0, "initial_soc": 0.2, "min_soc": 0.1,
@@ -942,9 +938,9 @@ def test_pv_reaches_everything_through_the_house_bus(v2h):
     assert "bus_battery_BAT1" in labels and "bus_mobility_v1" in labels
 
     n = _nodes(m)
-    # der Wechselrichter speist direkt ins Haus und traegt die Anlagengrenze
+    # der Wechselrichter speist direkt ins Haus, ohne eigene Leistungsgrenze
     pv_conv = n["converter_pv_to_home_Home_1"]
-    assert list(pv_conv.inputs.values())[0].nominal_value == 10.0
+    assert list(pv_conv.inputs.values())[0].nominal_value is None
     assert list(pv_conv.outputs)[0].label == "Home_1"
     # die Wallbox haengt am Hausbus, der Speicher an seinem einen Bus
     assert list(n["wallbox_charge_CS1_v1"].inputs)[0].label == "Home_1"
@@ -964,21 +960,24 @@ def test_no_artificial_incentives_are_left():
 
 
 @requires_cbc
-def test_inverter_and_station_ratings_hold():
-    """Zwei Grenzen, die der Fahrplan einhalten MUSS, damit step() ihn ausfuehren kann.
+def test_station_rating_holds_and_pv_is_not_capped():
+    """Die Wallbox hat eine Grenze, die der Fahrplan einhalten MUSS - die PV hat keine.
 
     Die Wallbox: step() steuert mit ``Battery.load(max_power=cs.max_power)``. Ein Plan, der
     mehr verlangt, wuerde stillschweigend gekappt und der simulierte SOC bliebe zurueck.
-    Der Wechselrichter: er begrenzt, wie viel PV ueberhaupt ins Haus kommt.
+    Die PV: ihre Zeitreihe ist schon die Leistung am Netzanschluss, und spice_ev bucht sie
+    dort vollstaendig. Der Wechselrichter darf davon nichts zurueckhalten - bei 30 kW PV
+    deckt sie die 15 kW Hauslast in jedem Schritt, das Netz liefert nichts. (Die fruehere
+    Ersatzgrenze von 10 kW haette hier 5 kW aus dem Netz verlangt.)
     """
     m = _pv_scenario(SystemConfig(debug=False, should_dump_results=False),
-                     pv_power_kW=6.0, pv=(30,) * 8)
+                     pv=(30,) * 8, load=15)
     m.run()
     laden = m.get_wallbox_schedule()["v1"]["charge_kW"].to_numpy()
     assert np.all(laden <= 11.0 + 1e-6)
     eigen = m._summary_df["pv_selfuse_Home_1"].to_numpy()
-    assert np.all(eigen <= 6.0 + 1e-6)
-    assert eigen.max() == pytest.approx(6.0, abs=1e-6)      # und sie greift wirklich
+    assert np.all(eigen >= 15.0 - 1e-6)
+    assert m._summary_df["grid_supply_Home_1"].max() <= 1e-6
 
 
 @requires_cbc

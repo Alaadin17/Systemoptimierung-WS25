@@ -637,8 +637,8 @@ class OemofSolve(Strategy):
         The oemof model builds one bus (Home_<n>) + source per active GC; each GC also
         carries its own load and PV, grouped by the events' ``grid_connector_id``.
         Returns {gcid: {"load", "pv", "max_power" (if the GC has one), "price_ct_kWh"
-        (the scenario's price series, see ``_grid_price_series``), "pv_power_kW"
-        (installed kWp, only when > 0)}}.
+        (the scenario's price series, see ``_grid_price_series``)}}. The installed kWp is not
+        handed over: the PV series already is the generation, and nothing else limits it.
 
         A GC without price signals raises: the model prices energy with the scenario's
         own series and has no fallback.
@@ -664,9 +664,6 @@ class OemofSolve(Strategy):
                     "add a price curve to the scenario (include_price_csv in "
                     "generate.cfg).")
             info["price_ct_kWh"] = price
-            kwp = self._pv_kwp(gcid)
-            if kwp > 0:
-                info["pv_power_kW"] = kwp              # PV plant size -> converter limit
             result[gcid] = info
         return result
 
@@ -725,12 +722,6 @@ class OemofSolve(Strategy):
         idx = np.searchsorted(starts, target, side="right") - 1
         idx = np.clip(idx, 0, len(values) - 1)   # before the first signal its value applies
         return values[idx]
-
-    def _pv_kwp(self, gcid) -> float:
-        """Installed PV nominal power (kWp) at one grid connector, summed over its plants."""
-        return sum(float(pv.nominal_power)
-                   for pv in getattr(self.world_state, "photovoltaics", {}).values()
-                   if getattr(pv, "parent", None) == gcid)
 
     @staticmethod
     def _min_soc_series(ts, config) -> np.ndarray:
@@ -812,10 +803,10 @@ class OemofSolve(Strategy):
         """Assemble every input EnergySystemModel needs, from the spice_ev scenario.
 
         Returns a dict with: config (SystemConfig from the oemof_* cfg keys), time_index,
-        grid_connectors (per GC: max_power, its own load/pv, the scenario's price series,
-        the installed kWp when > 0), charging_stations (max_power +
-        parent GC), vehicle_params (capacity/SOC/v2g/efficiency + consumption,
-        connected_cs, min_soc_series and discharge_power_kW) and battery_params.
+        grid_connectors (per GC: max_power, its own load/pv and the scenario's price
+        series), charging_stations (max_power + parent GC), vehicle_params
+        (capacity/SOC/v2g/efficiency + consumption, connected_cs, min_soc_series and
+        discharge_power_kW) and battery_params.
         """
         if not self._prepared:
             raise ValueError("Inputs must be prepared before building Oemof inputs")

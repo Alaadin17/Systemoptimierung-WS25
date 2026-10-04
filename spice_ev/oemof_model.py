@@ -39,7 +39,7 @@ Inputs (__init__)
 -----------------
 ``OemofSolve.build_oemof_inputs`` builds them from the spice_ev scenario (the tests build
 them directly): config (SystemConfig), time_index (= the spice_ev steps), grid_connectors
-(load, PV, max_power, optional price series and installed kWp), charging_stations,
+(load, PV, max_power and the price series), charging_stations,
 vehicle_params, battery_params.
 
 Flow
@@ -94,7 +94,8 @@ class SystemConfig:
     # Converter. The battery LINK is lossless on purpose (conversion factors 1.0) — the
     # charging/discharging loss lives in the storage, exactly like spice_ev's Battery, see
     # _add_battery. There are therefore no per-direction link efficiencies to configure.
-    converter_pv_to_home_power_kW: float = 10.0
+    # The PV inverter has no power limit: the PV series already is the power at the grid
+    # connector, and spice_ev books all of it there - see _add_pv.
     converter_pv_to_home_efficiency: float = 1.0
     converter_pv_to_home_variable_costs: float = 0.0
 
@@ -271,8 +272,8 @@ class EnergySystemModel:
         self.config = config or SystemConfig()
         self._time_index_input = time_index
         self.vehicle_params: Dict[str, Dict[str, Any]] = dict(vehicle_params or {})
-        # {gcid: {"load", "pv", "max_power", "price_ct_kWh", "pv_power_kW"}} - the last three
-        # optional; each ACTIVE GC becomes one Home_<n> bus
+        # {gcid: {"load", "pv", "max_power", "price_ct_kWh"}} - price_ct_kWh is required, the
+        # rest optional; each ACTIVE GC becomes one Home_<n> bus
         self.grid_connectors: Dict[str, Dict[str, Any]] = dict(grid_connectors or {})
         self.battery_params: Dict[str, Dict[str, Any]] = dict(battery_params or {})
         # {csid: {"max_power", "parent"}} — one wallbox per CS, but only for the vehicles
@@ -411,12 +412,10 @@ class EnergySystemModel:
                 label=f"household_demand_{name}",
                 inputs={b: flows.Flow(fix=_as_array(load, periods), nominal_value=1)},
             ))
-        # PV on this GC; converter limit = installed plant size when the scenario has one
+        # PV on this GC
         pv = gc.get("pv")
         if _nonzero(pv, periods):
-            self._add_pv(
-                b, name, _as_array(pv, periods), feedin_tariff,
-                float(gc.get("pv_power_kW", self.config.converter_pv_to_home_power_kW)))
+            self._add_pv(b, name, _as_array(pv, periods), feedin_tariff)
         # stationary batteries whose parent is this GC
         for bid, bp in self.battery_params.items():
             if bp.get("parent") == gcid:
@@ -426,14 +425,16 @@ class EnergySystemModel:
             if self.charging_stations[csid].get("parent") == gcid:
                 self._add_wallbox(csid, users, b)
 
-    def _add_pv(self, gc_bus, name, pv_series, feedin_tariff, converter_power_kW) -> None:
+    def _add_pv(self, gc_bus, name, pv_series, feedin_tariff) -> None:
         """PV at one grid connector: PV bus, source, surplus sink and - only with
         ``enable_pv_to_home`` - the inverter.
 
-        The inverter carries ``nominal_value = converter_power_kW`` on its DC input and feeds
-        the house bus. Whatever is not needed there leaves through ``excess_<name>`` as
-        feed-in. From the house bus on, a PV kWh is indistinguishable from a grid kWh, so
-        there is no attribution "this much PV went into the car".
+        The inverter feeds the house bus and has no power limit of its own: the PV series is
+        already the power at the grid connector, and spice_ev has no inverter either - it
+        books the whole generation there. A limit could only send PV to the grid that the
+        simulation uses in the house. Whatever the house does not need leaves through
+        ``excess_<name>`` as feed-in. From the house bus on, a PV kWh is indistinguishable
+        from a grid kWh, so there is no attribution "this much PV went into the car".
         """
         b_pv = buses.Bus(label=f"bus_pv_{name}")
         self.es.add(b_pv)
@@ -451,7 +452,6 @@ class EnergySystemModel:
         self.es.add(cmp.Converter(
             label=f"converter_pv_to_home_{name}",
             inputs={b_pv: flows.Flow(
-                nominal_value=converter_power_kW,
                 variable_costs=self.config.converter_pv_to_home_variable_costs)},
             outputs={gc_bus: flows.Flow()},
             conversion_factors={gc_bus: self.config.converter_pv_to_home_efficiency},
