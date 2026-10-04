@@ -228,22 +228,16 @@ def test_solve_small_model(tmp_path, monkeypatch, caplog):
 # Test 2a2 — der Preis kommt aus dem Szenario und sonst nirgendwo her
 # ---------------------------------------------------------------------------
 def test_prices_come_from_the_scenario_and_nowhere_else():
-    """Bezugspreis: allein das Szenario. Einspeiseverguetung: immer cfg.
+    """Bezugspreis: allein die Preiszeitreihe des Szenarios. Einspeiseverguetung: cfg.
 
-    Frueher konnte ein Preis aus drei Quellen kommen - den grid_operator_signals des
-    Szenarios, dem Preisblatt (Netzentgelt, Umlagen, Konzession, Stromsteuer, MwSt) und der
-    cfg -, die sich gegenseitig ueberschrieben haben. Genau daraus sind zwei stille Fehler
-    entstanden: das LP kalkulierte einen anderen Tarif als abgerechnet wurde, und
-    ``oemof_grid_feedin_tariff = 0`` blieb wirkungslos, solange ein Preisblatt konfiguriert
-    war. Preisblatt, Aufschlag und Festpreis sind jetzt alle drei raus - das LP bewertet
-    Energie mit derselben Reihe, die spice_evs eigene Strategien in gc.cost lesen.
+    Das LP bewertet Energie mit derselben Reihe, die spice_evs eigene Strategien in
+    gc.cost lesen - eine zweite Preisquelle gibt es nicht.
     """
     idx = pd.date_range("2025-01-01", periods=4, freq="15min")
     m = EnergySystemModel(
         config=SystemConfig(debug=False, grid_feedin_tariff=0.0),
         time_index=idx,
-        # Verguetungs-Keys, wie das Preisblatt sie frueher geliefert hat: sie muessen
-        # wirkungslos sein, sonst haette sich die alte Quelle nur versteckt
+        # fremde Verguetungs-Keys am Netzanschluss muessen wirkungslos bleiben
         grid_connectors={"GC1": {"max_power": 30.0, "load": [1, 1, 1, 1], "pv": [0, 3, 3, 0],
                                  "price_ct_kWh": [30.0] * 4,
                                  "feedin_tariff_ct_kWh": -6.24,
@@ -258,20 +252,17 @@ def test_prices_come_from_the_scenario_and_nowhere_else():
     assert float(list(nodes["excess_Home_1"].inputs.values())[0].variable_costs[0]) == 0.0
     # die Anlagengroesse ist KEIN Preis und kommt weiterhin aus dem Szenario
     assert list(nodes["converter_pv_to_home_Home_1"].inputs.values())[0].nominal_value == 7.5
-    # ... und kein Feld des Modells kann den Preis noch beeinflussen
+    # die cfg kennt nur diese Preis- und Kostenfelder - keins davon bewertet den Bezug
     felder = {f.name for f in dataclasses.fields(SystemConfig)}
-    assert not felder & {"tariff", "fee_type", "use_retail_markup", "cost_parameters_file",
-                         "grid_price_from_scenario", "feedin_tariff_from_price_sheet",
-                         "grid_price_markup_ct_kWh", "grid_price_vat",
-                         "grid_variable_costs", "consumer_type"}
+    assert {f for f in felder if any(s in f for s in ("price", "tariff", "cost", "fee"))} == {
+        "grid_feedin_tariff", "pv_variable_costs", "converter_pv_to_home_variable_costs"}
 
 
 def test_strategy_hands_the_model_physics_and_the_scenario_price():
     """Last, PV, Anschlussleistung, kWp - und der Bezugspreis des Szenarios.
 
     Geprueft wird vor allem die EINHEIT: spice_ev fuehrt gc.cost in ct/kWh, also kommt der
-    CSV-Wert unveraendert an - nichts wird daraufgeschlagen. Die Einspeiseverguetung bleibt
-    in jedem Fall fest.
+    CSV-Wert unveraendert an. Die Einspeiseverguetung bleibt in jedem Fall fest.
     """
     idx = pd.date_range("2025-01-01", periods=4, freq="15min")
     strat = OemofSolve.__new__(OemofSolve)
@@ -289,16 +280,12 @@ def test_strategy_hands_the_model_physics_and_the_scenario_price():
     assert set(info) == {"load", "pv", "max_power", "pv_power_kW", "price_ct_kWh"}
     assert info["pv_power_kW"] == 10.0
     assert list(info["price_ct_kWh"]) == [30.0] * 4        # ct/kWh, unveraendert
-    # die Preisblatt-Methoden gibt es nicht mehr - kein toter Pfad, ueber den etwas zurueckkommt
-    for name in ("_retail_markup_ct", "_feedin_tariff_ct", "_homebus_feedin_tariff_ct",
-                 "tariff"):
-        assert not hasattr(OemofSolve, name), name
 
 
 def test_a_scenario_without_prices_is_refused():
     """Ohne Preisreihe bricht der Lauf ab, statt mit einer erfundenen Zahl zu rechnen.
 
-    Es gibt keinen Festpreis-Rueckfall mehr. Ein Szenario ohne ``include_price_csv`` kann
+    Es gilt allein die Preiszeitreihe. Ein Szenario ohne ``include_price_csv`` kann
     nicht optimiert werden, und das soll man merken - eine Vorgabe wuerde eine Frage
     beantworten, die niemand gestellt hat. Geprueft werden beide Ebenen: die Strategie
     (sie nennt den Netzanschluss und den Weg) und das Modell selbst.
@@ -409,9 +396,9 @@ def test_scalar_results_carry_the_grid_peak(tmp_path, monkeypatch):
     assert k["fraction_year"] == pytest.approx(8 * 0.25 / 8760.0)
     # die Spitze ist die Lastspitze des Zeitraums, nicht der Mittelwert
     assert k["grid_peak_kW_Home_1"] > k["grid_energy_kWh_Home_1"] / (8 * 0.25)
-    # kein Euro-Betrag und kein Aufschlag im Modell - der Tarif ist nachgelagert
-    assert not any(t in name.lower() for name in k
-                   for t in ("eur", "capacity", "markup", "vat"))
+    # genau diese Werte - kein Euro-Betrag im Modell, der Tarif ist nachgelagert
+    assert set(k) == {"objective", "periods", "step_hours", "fraction_year",
+                      "grid_peak_kW_Home_1", "grid_energy_kWh_Home_1"}
 
     dump = pd.read_csv(tmp_path / "out" / "dump_costs.csv")
     assert dump.loc[0, "grid_peak_kW_Home_1"] == pytest.approx(k["grid_peak_kW_Home_1"])
