@@ -1084,11 +1084,9 @@ class OemofSolve(Strategy):
             soc_now = vehicle.battery.soc
 
             if target_soc > soc_now + self.EPS:
-                # charge up to the planned SOC. max_power is the station rating: the plan
-                # respects it anyway, so this only guarantees the command can never exceed
-                # what the charging station can physically deliver.
-                avg_power = vehicle.battery.load(
-                    self.interval, target_soc=target_soc, max_power=cs.max_power)["avg_power"]
+                # charge up to the planned SOC. No max_power: the station rating is a limit
+                # of the LP (wallbox flow), the plan already holds it.
+                avg_power = vehicle.battery.load(self.interval, target_soc=target_soc)["avg_power"]
                 commands[cs_id] = gc.add_load(cs_id, avg_power)
                 cs.current_power += avg_power
             elif target_soc < soc_now - self.EPS and vehicle.vehicle_type.v2g:
@@ -1096,7 +1094,7 @@ class OemofSolve(Strategy):
                 # LP's own floor (discharge_limit), so the target IS the floor — no
                 # separate safety net needed.
                 avg_power = vehicle.battery.unload(
-                    self.interval, target_soc=target_soc, max_power=cs.max_power)["avg_power"]
+                    self.interval, target_soc=target_soc)["avg_power"]
                 commands[cs_id] = gc.add_load(cs_id, -avg_power)
                 cs.current_power -= avg_power
 

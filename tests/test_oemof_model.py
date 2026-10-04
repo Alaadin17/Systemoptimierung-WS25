@@ -563,8 +563,8 @@ def test_step_applies_vehicle_charging():
     cs1 = strat.world_state.charging_stations["CS1"]
     gc = strat.world_state.grid_connectors["GC1"]
 
-    # target_soc from the plan, max_power = the station rating (never target_power)
-    assert v1.battery.calls == [("load", 22.0, 0.55)]
+    # only target_soc from the plan - no max_power, no target_power: the LP holds the rating
+    assert v1.battery.calls == [("load", None, 0.55)]
     assert v1.battery.soc == pytest.approx(0.55)
     # 0.05 * 40 kWh over 15 min = 8 kW, booked at the GC and reported in the commands
     assert gc.current_loads["CS1"] == pytest.approx(8.0)
@@ -586,7 +586,7 @@ def test_step_applies_v2g_discharge():
     cs4 = strat.world_state.charging_stations["CS4"]
     gc = strat.world_state.grid_connectors["GC1"]
 
-    assert v4.battery.calls == [("unload", 22.0, 0.55)]
+    assert v4.battery.calls == [("unload", None, 0.55)]
     assert v4.battery.soc == pytest.approx(0.55)
     # booked as NEGATIVE load (feed-back) at the grid connector and in the commands
     assert gc.current_loads["CS4"] == pytest.approx(-8.0)
@@ -1120,8 +1120,9 @@ def test_no_artificial_incentives_are_left():
 def test_station_rating_holds_and_pv_is_not_capped():
     """Die Wallbox hat eine Grenze, die der Fahrplan einhalten MUSS - die PV hat keine.
 
-    Die Wallbox: step() steuert mit ``Battery.load(max_power=cs.max_power)``. Ein Plan, der
-    mehr verlangt, wuerde stillschweigend gekappt und der simulierte SOC bliebe zurueck.
+    Die Wallbox: step() gibt spice_ev nur den Ziel-SOC, ohne max_power. Die Stationsleistung
+    haelt allein der Plan ein - ein Plan, der mehr verlangt, liesse die Simulation die
+    Station ueberschreiten.
     Die PV: ihre Zeitreihe ist schon die Leistung am Netzanschluss, und spice_ev bucht sie
     dort vollstaendig. Der Wechselrichter darf davon nichts zurueckhalten - bei 30 kW PV
     deckt sie die 15 kW Hauslast in jedem Schritt, das Netz liefert nichts. (Die fruehere
