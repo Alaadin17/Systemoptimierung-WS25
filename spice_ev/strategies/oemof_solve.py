@@ -487,6 +487,12 @@ class OemofSolve(Strategy):
                     if seg["desired_soc"] is not None and not pd.isna(seg["desired_soc"]):
                         df.loc[ts_slice, "desired_soc"] = float(seg["desired_soc"])
 
+            # "Not plugged in" is None by contract. pandas >= 3 infers a string dtype for
+            # the segment table and hands a missing value back as NaN - put None back.
+            df["connected_charging_station"] = pd.Series(
+                [c if isinstance(c, str) else None for c in df["connected_charging_station"]],
+                index=df.index, dtype=object)
+
             # Convenience boolean columns for quick filtering/plotting.
             df["is_driving"] = df["state"].eq("driving")
             df["is_parked"] = df["state"].eq("parked")
@@ -727,7 +733,8 @@ class OemofSolve(Strategy):
             np.ndarray of length len(ts) with the SOC floor (0..1) per step.
         """
         base = float(config.bev_min_soc)
-        connected = np.array([c is not None for c in ts["connected_charging_station"]])
+        # notna, not "is not None": a missing station is NaN as soon as pandas owns the dtype
+        connected = ts["connected_charging_station"].notna().to_numpy()
         n = len(connected)
         floor = np.full(n, base, dtype=float)
         if n == 0:

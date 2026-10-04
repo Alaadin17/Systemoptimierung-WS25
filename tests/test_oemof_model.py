@@ -715,6 +715,50 @@ def test_a_vehicle_on_the_road_at_scenario_start():
 
 
 # ---------------------------------------------------------------------------
+# Test 3d — "not plugged in" reaches the model as None, whatever pandas does (no solver)
+# ---------------------------------------------------------------------------
+def test_unplugged_steps_reach_the_model_as_none():
+    """While a vehicle is away its charging station is None - not NaN.
+
+    pandas >= 3 infers a string dtype for the segment table, where a missing value is NaN.
+    ``NaN is not None`` is true, so every step counted as plugged in, no departure was
+    found and the desired_soc floor before a trip silently vanished: the examples ran
+    through and came out wrong (02 at 37 ct instead of 687). Under pandas 2 this test
+    passes either way; it guards the pandas 3 path.
+    """
+    def t(clock):
+        return pd.Timestamp(f"2023-04-01 {clock}", tz="Europe/Berlin")
+
+    start, stop = t("00:00"), pd.Timestamp("2023-04-02 00:00", tz="Europe/Berlin")
+    interval = pd.Timedelta(minutes=15)
+    events = [
+        SimpleNamespace(vehicle_id="v1", event_type="departure", start_time=t("08:47"),
+                        update={}),
+        SimpleNamespace(vehicle_id="v1", event_type="arrival", start_time=t("17:05"),
+                        update={"connected_charging_station": "CS1", "desired_soc": 0.8}),
+    ]
+    vehicles = {"v1": SimpleNamespace(connected_charging_station="CS1", desired_soc=0.8)}
+
+    strat = OemofSolve.__new__(OemofSolve)
+    segments = strat._map_trips_to_state_segments(
+        {}, strat._build_state_segments(events, start, stop, vehicles))
+    ts = strat._map_segments_to_timeseries(
+        segments, strat._build_time_index(start, stop, interval), interval)[0]["v1"]
+
+    away = ts["state"].eq("driving").to_numpy()
+    station = ts["connected_charging_station"].tolist()
+    assert away.sum() == 33                                   # 09:00 .. 17:00
+    assert all(c is None for c, a in zip(station, away) if a)
+    assert all(c == "CS1" for c, a in zip(station, away) if not a)
+
+    # exactly one departure step - 08:45, the last one plugged in - carries desired_soc;
+    # every other step keeps the global floor, here 0
+    floor = OemofSolve._min_soc_series(ts, SystemConfig(bev_min_soc=0.0))
+    assert [f"{ts.index[i]:%H:%M}" for i in np.flatnonzero(floor > 0)] == ["08:45"]
+    assert floor[35] == pytest.approx(0.8)
+
+
+# ---------------------------------------------------------------------------
 # Test 4 — full run() extracts a per-vehicle schedule and dumps CSVs (CBC)
 # ---------------------------------------------------------------------------
 @requires_cbc
