@@ -527,8 +527,13 @@ class EnergySystemModel:
 
         - consumption is the driving demand as ``fixed_losses_absolute`` - it is taken from
           the storage even while the car is away.
-        - There is no general SOC floor - spice_ev has none (only SOC >= 0). For V2H/V2G-
-          capable vehicles the floor is ``discharge_limit``.
+        - There is no general SOC floor - spice_ev has none (only SOC >= 0).
+        - V2H follows ``v2h_mask`` (0/1 per step): only where it is 1 may the vehicle feed
+          the house, and only there ``discharge_limit`` is a floor. In spice_ev a vehicle
+          below its discharge_limit simply does not discharge - it is not forced to charge.
+          That depends on the SOC, which the LP decides itself, so the strategy decides it
+          beforehand per standing period (``OemofSolve._v2h_mask``). Without a mask every
+          plugged-in step allows V2H.
         - min_soc_series raises that floor PER STEP to the ``desired_soc`` from the scenario,
           in the step before each departure - so the car is as full as spice_ev expects.
           Capped at ``max_soc``, otherwise the storage would be infeasible.
@@ -543,8 +548,8 @@ class EnergySystemModel:
         max_soc = float(params.get("max_soc", self.config.bev_max_soc))
         v2g = bool(params.get("v2g", False))
 
-        # discharge possible only if v2g and globally enabled; then raise the SOC floor
-        # to discharge_limit so V2H/V2G cannot drain below it.
+        # discharge possible only if v2g and globally enabled - and then only in the steps
+        # v2h_mask allows, where discharge_limit is the floor. Elsewhere there is none.
         can_discharge = self.config.enable_v2h and v2g
         # V2G discharges with the discharge_curve that spice_ev derives from the charging
         # curve times v2g_power_factor - typically half. Without this limit the LP plans
@@ -552,18 +557,25 @@ class EnergySystemModel:
         p_discharge = params.get("discharge_power_kW")
         p_discharge = float(p_discharge) if p_discharge else None
         discharge_limit = float(params.get("discharge_limit", self.config.bev_discharge_limit))
-        floor = discharge_limit if can_discharge else 0.0
-
-        # per-step floor from the scenario (desired_soc at departures), else the constant one
-        series = params.get("min_soc_series")
-        if series is None:
-            storage_min = floor
-            first_min = floor
+        connected = list(params.get("connected_cs", []))
+        plugged = np.array([1.0 if i < len(connected) and connected[i] is not None else 0.0
+                            for i in range(periods)])
+        if not can_discharge:
+            v2h_mask = np.zeros(periods)
+        elif params.get("v2h_mask") is not None:
+            v2h_mask = _as_array(params["v2h_mask"], periods)
         else:
-            arr = np.minimum(np.maximum(_as_array(series, periods), floor), max_soc)
-            # oemof indexes storage_content over periods+1 points (incl. the end state)
-            storage_min = np.concatenate([arr, arr[-1:]])
-            first_min = float(arr[0])
+            v2h_mask = plugged
+        floor = discharge_limit * v2h_mask
+
+        # per-step floor: desired_soc at departures (from the scenario), discharge_limit
+        # where V2H is allowed, else 0
+        series = params.get("min_soc_series")
+        base = _as_array(series, periods) if series is not None else np.zeros(periods)
+        arr = np.minimum(np.maximum(base, floor), max_soc)
+        # oemof indexes storage_content over periods+1 points (incl. the end state)
+        storage_min = np.concatenate([arr, arr[-1:]])
+        first_min = float(arr[0])
 
         init_soc = min(max(float(params.get("initial_soc", self.config.bev_initial_soc)),
                            first_min), max_soc)
@@ -608,7 +620,8 @@ class EnergySystemModel:
             "bus": b_mobility,      # charging arrives here, V2H leaves here
             "can_discharge": can_discharge,
             "p_discharge": p_discharge,   # None = only the station power limits
-            "connected_cs": list(params.get("connected_cs", [])),
+            "connected_cs": connected,
+            "v2h_mask": v2h_mask,         # 1 = may feed the house in this step
         }
 
     def _add_wallbox(self, csid, users, gc_bus) -> None:
@@ -616,7 +629,7 @@ class EnergySystemModel:
 
         One masked converter per vehicle: ``max`` is 1 exactly in the steps in which the car
         is plugged into THIS station, 0 otherwise. For v2g vehicles with ``enable_v2h`` also
-        the way back into the house.
+        the way back into the house, masked once more by the vehicle's ``v2h_mask``.
 
         The wallbox is LOSSLESS and only limits the power - as in spice_ev. The
         charging/discharging loss sits in the vehicle battery; a loss here as well would
@@ -650,7 +663,7 @@ class EnergySystemModel:
                     # the tiny penalty also prevents simultaneous charge+discharge (a free
                     # cycle through the two lossless wallbox converters)
                     outputs={gc_bus: flows.Flow(
-                        max=mask, nominal_value=p_discharge,
+                        max=mask * node["v2h_mask"], nominal_value=p_discharge,
                         variable_costs=self.config.storage_cycle_penalty)},
                     conversion_factors={gc_bus: self.config.wallbox_efficiency_discharge},
                 )

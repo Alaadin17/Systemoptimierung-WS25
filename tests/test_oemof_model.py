@@ -771,6 +771,88 @@ def test_unplugged_steps_reach_the_model_as_none():
 
 
 # ---------------------------------------------------------------------------
+# Test 3d2 — V2H is allowed per standing period, decided from the scenario
+# ---------------------------------------------------------------------------
+@requires_cbc
+def test_v2h_is_decided_per_standing_period():
+    """The example of chapter 4.6.8: E-Golf 50 kWh, discharge_limit 0.3, desired_soc 0.8.
+
+    Mon 00:00-07:00 plugged in (starts with 0.6), trip -0.2, Mon 17:00-Tue 07:00 plugged
+    in, long trip -0.6, Tue 20:00-Wed 07:00 plugged in. Expected arrival: 0.6, 0.6 and
+    0.8 - 0.6 = 0.2. So V2H is on in the first two standing periods and off in the third.
+    spice_ev lets the car arrive with 0.2 and simply not discharge; the earlier rule (floor
+    0.3 in every step) made the LP charge it to 0.9 before the long trip instead.
+    """
+    def t(day, clock):
+        return pd.Timestamp(f"2023-04-0{day} {clock}", tz="Europe/Berlin")
+
+    def ev(kind, day, clock, **update):
+        return SimpleNamespace(vehicle_id="v1", event_type=kind, start_time=t(day, clock),
+                               signal_time=t(day, clock), update=update)
+
+    start, stop, interval = t(3, "00:00"), t(5, "08:00"), pd.Timedelta(minutes=15)
+    events = [ev("departure", 3, "07:00"),
+              ev("arrival", 3, "17:00", connected_charging_station="CS1", soc_delta=-0.2,
+                 desired_soc=0.8),
+              ev("departure", 4, "07:00"),
+              ev("arrival", 4, "20:00", connected_charging_station="CS1", soc_delta=-0.6,
+                 desired_soc=0.8),
+              ev("departure", 5, "07:00")]
+    vehicles = {"v1": SimpleNamespace(connected_charging_station="CS1", desired_soc=0.8,
+                                      battery=SimpleNamespace(capacity=50.0))}
+
+    strat = OemofSolve.__new__(OemofSolve)
+    segments = strat._build_state_segments(events, start, stop, vehicles)
+    trips = strat._build_trip_df(events, vehicles, start)
+    segments = strat._map_trips_to_state_segments(strat._group_trips_by_vehicle(trips),
+                                                  segments)
+    idx = strat._build_time_index(start, stop, interval)
+    ts = strat._map_segments_to_timeseries(segments, idx, interval)[0]["v1"]
+    mask = OemofSolve._v2h_mask(ts, 0.6, 50.0, 0.3)
+
+    def step(day, clock):
+        return int((t(day, clock) - start) / interval)
+
+    assert mask[step(3, "00:00"):step(3, "07:00")].all()          # standing period 1: on
+    assert mask[step(3, "17:00"):step(4, "07:00")].all()          # standing period 2: on
+    assert not mask[step(4, "20:00"):step(5, "07:00")].any()      # standing period 3: off
+    assert not mask[step(3, "07:00"):step(3, "17:00")].any()      # never while driving
+
+    # expensive evenings make feeding the house worthwhile - where it is allowed
+    price = np.full(len(idx), 10.0)
+    for a, b in ((step(3, "18:00"), step(3, "22:00")), (step(4, "21:00"), step(4, "23:00"))):
+        price[a:b] = 40.0
+
+    def solve(v2h_mask):
+        m = EnergySystemModel(
+            config=SystemConfig(debug=False, should_dump_results=False, enable_v2h=True),
+            time_index=idx,
+            grid_connectors={"GC1": {"max_power": 30.0, "load": [2.0] * len(idx),
+                                     "price_ct_kWh": price}},
+            charging_stations={"CS1": {"max_power": 11.0, "parent": "GC1"}},
+            vehicle_params={"v1": {
+                "capacity_kWh": 50.0, "initial_soc": 0.6, "v2g": True, "discharge_limit": 0.3,
+                "consumption": ts["energy_kwh"].fillna(0).to_numpy(dtype=float),
+                "connected_cs": ts["connected_charging_station"].to_numpy(),
+                "min_soc_series": OemofSolve._min_soc_series(ts), "v2h_mask": v2h_mask}},
+        )
+        m.run()
+        return m.get_wallbox_schedule()["v1"]
+
+    plan = solve(mask)
+    soc, ab = plan["soc_end"].to_numpy(), plan["discharge_kW"].to_numpy()
+    assert soc[step(4, "06:45")] == pytest.approx(0.8, abs=1e-6)  # leaves with desired_soc
+    assert soc[step(4, "19:45")] == pytest.approx(0.2, abs=1e-6)  # ... and arrives with 0.2
+    assert ab[step(4, "20:00"):step(5, "07:00")].max() <= 1e-9    # no V2H below the limit
+    assert ab[step(3, "17:00"):step(4, "07:00")].max() > 0.1      # V2H where it is allowed
+    assert soc[step(3, "17:00"):step(4, "07:00")].min() >= 0.3 - 1e-6
+
+    # the earlier rule - floor 0.3 in every step - had to charge it to 0.9 instead
+    old = solve(np.ones(len(idx)))["soc_end"].to_numpy()
+    assert old[step(4, "06:45")] == pytest.approx(0.9, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
 # Test 3e — a segment without a time step warns, an inverted one stops (no solver)
 # ---------------------------------------------------------------------------
 def test_segments_without_a_time_step_warn_and_inverted_ones_stop():

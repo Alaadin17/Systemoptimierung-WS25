@@ -757,6 +757,53 @@ class OemofSolve(Strategy):
         floor[departs] = np.maximum(base, desired[departs])
         return floor
 
+    @staticmethod
+    def _v2h_mask(ts, initial_soc, capacity_kwh, discharge_limit) -> np.ndarray:
+        """Per step 1 where the vehicle may feed the house (V2H), else 0.
+
+        In spice_ev a vehicle discharges into the house only down to its discharge_limit;
+        below it, it simply does not discharge - it is not forced to charge. That rule
+        depends on the SOC, which the LP decides itself, so it cannot be written into the
+        LP as a condition. It is decided beforehand, per standing period, from the
+        scenario: a vehicle arrives with at least the desired_soc it had to leave with,
+        minus the energy of the trip; in a standing period at the very start with its
+        initial SOC. If that lower bound is below discharge_limit, V2H is off for the
+        whole standing period, otherwise on - and there the model keeps the SOC at or
+        above discharge_limit. Steps away from a station are always 0.
+
+        Args:
+            ts: per-vehicle timeseries with connected_charging_station, desired_soc and
+                energy_kwh (the trip energy, booked in the last driving step).
+            initial_soc: SOC at the scenario start (0..1).
+            capacity_kwh: battery capacity, to turn trip energy into SOC.
+            discharge_limit: the vehicle type's discharge_limit (0..1).
+
+        Returns:
+            np.ndarray of length len(ts) with 0/1 per step.
+        """
+        connected = ts["connected_charging_station"].notna().to_numpy()
+        desired = ts["desired_soc"].to_numpy(dtype=float)
+        energy = ts["energy_kwh"].fillna(0).to_numpy(dtype=float)
+        n = len(connected)
+        mask = np.zeros(n)
+        soc_at_departure = float(initial_soc)   # a vehicle on the road at the start
+        trip_kwh = 0.0
+        allowed = False
+        for t in range(n):
+            if not connected[t]:
+                trip_kwh += energy[t]
+                continue
+            if t == 0 or not connected[t - 1]:          # a standing period starts here
+                arrival = (float(initial_soc) if t == 0
+                           else soc_at_departure - trip_kwh / capacity_kwh)
+                allowed = arrival >= discharge_limit - 1e-9
+                trip_kwh = 0.0
+            mask[t] = 1.0 if allowed else 0.0
+            if t + 1 < n and not connected[t + 1]:
+                # departure step: the vehicle leaves with at least its desired_soc
+                soc_at_departure = 0.0 if np.isnan(desired[t]) else float(desired[t])
+        return mask
+
     def _battery_params(self, config) -> Dict[str, Dict[str, Any]]:
         """Read ALL stationary batteries from the scenario.
 
@@ -804,8 +851,8 @@ class OemofSolve(Strategy):
         Returns a dict with: config (SystemConfig from the oemof_* cfg keys), time_index,
         grid_connectors (per GC: max_power, its own load/pv and the scenario's price
         series), charging_stations (max_power + parent GC), vehicle_params
-        (capacity/SOC/v2g/efficiency + consumption, connected_cs, min_soc_series and
-        discharge_power_kW) and battery_params.
+        (capacity/SOC/v2g/efficiency + consumption, connected_cs, min_soc_series, v2h_mask
+        and discharge_power_kW) and battery_params.
         """
         if not self._prepared:
             raise ValueError("Inputs must be prepared before building Oemof inputs")
@@ -864,6 +911,8 @@ class OemofSolve(Strategy):
                 "consumption": consumption,
                 "connected_cs": connected_cs,
                 "min_soc_series": self._min_soc_series(ts),
+                # where V2H may feed the house, decided per standing period
+                "v2h_mask": self._v2h_mask(ts, init_soc, capacity, discharge_limit),
                 "efficiency": eff,   # spice_ev Battery.efficiency -> storage in/outflow
                 "discharge_power_kW": (float(discharge_power)
                                        if discharge_power is not None else None),

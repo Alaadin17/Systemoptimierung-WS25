@@ -103,7 +103,7 @@ could run.
 
 Code: `spice_ev/strategies/oemof_solve.py` (bridge between scenario and model) and
 `spice_ev/oemof_model.py` (the model). Tests: `python -m pytest tests/test_oemof_model.py`
-(29 tests; the ones that solve are skipped without CBC).
+(30 tests; the ones that solve are skipped without CBC).
 
 **Requirements** - not installed by `pip install -e .`, which pulls nothing:
 ```sh
