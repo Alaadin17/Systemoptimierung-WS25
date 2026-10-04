@@ -171,6 +171,33 @@ def test_per_gc_load_pv_from_events():
     assert "pv_Home_2" not in labels
 
 
+def test_load_factor_is_applied_as_spice_ev_applies_it():
+    """The factor of an EnergyValuesList scales it exactly as in spice_ev - 0 included.
+
+    The model used to read ``getattr(ev_list, "factor", 1) or 1``, which turned a factor
+    of 0 into 1: a load switched off in the scenario still reached the LP in full. Built
+    from spice_ev's own class, so the defaults it guarantees are the real ones.
+    """
+    from pathlib import Path
+    from spice_ev.events import EnergyValuesList, FixedLoad
+
+    idx = pd.date_range("2023-04-01", periods=4, freq="15min", tz="Europe/Berlin")
+    strat = OemofSolve.__new__(OemofSolve)
+    for factor in (1, 0.5, 0):
+        ev_list = EnergyValuesList({"start_time": "2023-04-01T00:00:00+02:00",
+                                    "step_duration_s": 900, "grid_connector_id": "GC1",
+                                    "values": [2, 2, 2, 2], "factor": factor}, Path("."))
+        in_spice_ev = [e.value for e in ev_list.get_events("L1", FixedLoad)][:4]
+        assert strat._sample_event_list(ev_list, idx).tolist() == in_spice_ev
+        assert in_spice_ev == [2.0 * factor] * 4
+
+    # without a factor in the scenario spice_ev sets 1 - nothing to fall back on here
+    plain = EnergyValuesList({"start_time": "2023-04-01T00:00:00+02:00",
+                              "step_duration_s": 900, "grid_connector_id": "GC1",
+                              "values": [2, 2, 2, 2]}, Path("."))
+    assert strat._sample_event_list(plain, idx).tolist() == [2.0] * 4
+
+
 # ---------------------------------------------------------------------------
 # Test 3 — solve a tiny feasible model with CBC (debug mode on)
 # ---------------------------------------------------------------------------

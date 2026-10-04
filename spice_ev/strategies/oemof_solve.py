@@ -573,14 +573,15 @@ class OemofSolve(Strategy):
                 not 1.0.
         """
 
-        values = list(getattr(ev_list, "values", []) or [])
+        # spice_ev always sets values ([] by default) and factor (1 by default). A factor
+        # of 0 switches the list off and must stay 0 - spice_ev multiplies by it as given.
+        values = ev_list.values
         if not values:
             return pd.Series(0.0, index=time_index)
 
         delta = pd.Timedelta(seconds=ev_list.step_duration_s)
         raw_index = pd.date_range(start=ev_list.start_time, periods=len(values), freq=delta)
-        factor = getattr(ev_list, "factor", 1) or 1
-        raw = pd.Series(np.asarray(values, dtype=float) * factor, index=raw_index)
+        raw = pd.Series(np.asarray(values, dtype=float) * ev_list.factor, index=raw_index)
 
         # Unify time zones (tz-naive) so that reindex works
         if raw.index.tz is not None:
@@ -642,17 +643,16 @@ class OemofSolve(Strategy):
         A GC without price signals raises: the model prices energy with the scenario's
         own series and has no fallback.
         """
-        fixed = getattr(self.events, "fixed_load_lists", {})
-        gen = getattr(self.events, "local_generation_lists", {})
+        fixed = self.events.fixed_load_lists
+        gen = self.events.local_generation_lists
         result: Dict[str, Dict[str, Any]] = {}
         for gcid, gc in self.world_state.grid_connectors.items():
             info: Dict[str, Any] = {
                 "load": self._aggregate_event_lists_for_gc(fixed, gcid, time_index),
                 "pv": self._aggregate_event_lists_for_gc(gen, gcid, time_index),
             }
-            mp = getattr(gc, "max_power", None)
-            if mp:
-                info["max_power"] = float(mp)
+            if gc.max_power:
+                info["max_power"] = float(gc.max_power)
             # Purchase price: the scenario's own series, the same one spice_ev's built-in
             # strategies read. The feed-in tariff is fixed (grid_feedin_tariff) and only
             # the PV surplus can earn it - the house bus has no export path.
@@ -674,7 +674,7 @@ class OemofSolve(Strategy):
         """Sum only the EnergyValuesLists whose grid_connector_id == gcid (as np array)."""
         total = pd.Series(0.0, index=time_index)
         for ev_list in (event_lists or {}).values():
-            if getattr(ev_list, "grid_connector_id", None) == gcid:
+            if ev_list.grid_connector_id == gcid:
                 total = total.add(self._sample_event_list(ev_list, time_index), fill_value=0.0)
         return total.to_numpy()
 
@@ -706,9 +706,8 @@ class OemofSolve(Strategy):
         price they read and the price the LP optimizes against. On a series whose minimum
         is above zero it never fires.
         """
-        signals = [s for s in getattr(self.events, "grid_operator_signals", []) or []
-                   if getattr(s, "grid_connector_id", None) == gcid
-                   and getattr(s, "cost", None)]
+        signals = [s for s in self.events.grid_operator_signals
+                   if s.grid_connector_id == gcid and s.cost]
         if not signals:
             return None
         pairs = []
@@ -786,8 +785,8 @@ class OemofSolve(Strategy):
         whoever sets one has to mirror it in the model.
         """
         result: Dict[str, Dict[str, Any]] = {}
-        for bid, bat in getattr(self.world_state, "batteries", {}).items():
-            capacity = float(getattr(bat, "capacity", 0) or 0)
+        for bid, bat in self.world_state.batteries.items():
+            capacity = float(bat.capacity)
             # <=0 or unlimited (StationaryBattery sets 2**64) -> skip
             if capacity <= 0 or capacity > 1e9:
                 continue
@@ -804,8 +803,8 @@ class OemofSolve(Strategy):
                 "power_kW": power,
                 "discharge_power_kW": discharge_power,
                 "initial_soc": float(bat.soc),  # StationaryBattery always has it (default 0.0)
-                "efficiency": float(getattr(bat, "efficiency", config.battery_efficiency)),
-                "parent": getattr(bat, "parent", None),
+                "efficiency": float(bat.efficiency),   # StationaryBattery default 0.95
+                "parent": bat.parent,
             }
         return result
 
@@ -855,17 +854,16 @@ class OemofSolve(Strategy):
             # oemof model mirrors that (storage inflow/outflow_conversion_factor), so we
             # hand over the vehicle's real battery efficiency. Any mismatch here makes the
             # planned SOC drift away from the simulated one.
+            # None only for a vehicle that the events know but the scenario does not
             veh = self.world_state.vehicles.get(vid)
-            eff = float(getattr(getattr(veh, "battery", None), "efficiency", 0.95) or 0.95)
+            eff = float(veh.battery.efficiency) if veh is not None else 0.95
 
             # V2G does NOT discharge at the charging power: spice_ev scales the charging
             # curve by vehicle_type.v2g_power_factor (default 0.5) into the discharge_curve,
             # and Battery.unload clamps to it. Without this value the LP plans up to the
             # full station power, the simulation delivers half, and the planned SOC drifts
             # away - measured in 03_household_v2g as 5.27 kW per step before the value was passed.
-            discharge_power = getattr(
-                getattr(getattr(veh, "battery", None), "unloading_curve", None),
-                "max_power", None)
+            discharge_power = veh.battery.unloading_curve.max_power if veh is not None else None
 
             vehicle_params[vid] = {
                 "capacity_kWh": capacity,
@@ -884,7 +882,7 @@ class OemofSolve(Strategy):
 
         # Charging stations (one wallbox per CS in the oemof model): power + parent GC
         charging_stations = {
-            csid: {"max_power": float(cs.max_power), "parent": getattr(cs, "parent", None)}
+            csid: {"max_power": float(cs.max_power), "parent": cs.parent}
             for csid, cs in self.world_state.charging_stations.items()
         }
 
