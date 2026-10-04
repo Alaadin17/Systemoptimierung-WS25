@@ -171,6 +171,31 @@ def test_per_gc_load_pv_from_events():
     assert "pv_Home_2" not in labels
 
 
+def test_a_load_is_judged_by_absolute_values_and_never_negative():
+    """Whether a load gets a node is decided on absolute values, not on the sum.
+
+    With the sum, a load of 3 and -3 kW (or a negative one throughout) was dropped silently -
+    here even the whole grid connector, since it carried nothing else. A negative entry the
+    model cannot take at all (a fixed flow is >= 0); it used to end as "infeasible" without a
+    reason, now it stops with one.
+    """
+    from spice_ev.oemof_model import _nonzero
+    assert _nonzero([3, -3, 0, 0], 4) and _nonzero([-2, -2, -2, -2], 4)
+    assert not _nonzero([0, 0, 0, 0], 4) and not _nonzero(None, 4)
+
+    idx = pd.date_range("2025-01-01", periods=4, freq="15min")
+    for load in ([3, -3, 0, 0], [-2, -2, -2, -2], [3, -1, 0, 0]):
+        m = EnergySystemModel(config=SystemConfig(debug=False), time_index=idx,
+                              grid_connectors={"GC1": {"load": load, "price_ct_kWh": [30] * 4}})
+        with pytest.raises(ValueError, match="load of grid connector 'GC1' is negative"):
+            _build_es(m)
+    m = EnergySystemModel(config=SystemConfig(debug=False), time_index=idx,
+                          grid_connectors={"GC1": {"load": [1] * 4, "pv": [0, float("nan"), 0, 0],
+                                                   "price_ct_kWh": [30] * 4}})
+    with pytest.raises(ValueError, match="pv of grid connector 'GC1' has missing values"):
+        _build_es(m)
+
+
 def test_load_factor_is_applied_as_spice_ev_applies_it():
     """The factor of an EnergyValuesList scales it exactly as in spice_ev - 0 included.
 

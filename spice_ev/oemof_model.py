@@ -200,10 +200,26 @@ def _nonzero(values, n):
     """Does this series carry any energy at all? Decides whether a node is built.
 
     Must say the same thing at every call site: otherwise a grid connector could be admitted
-    for a load that then gets no sink. The sum (instead of ``.any()``) is deliberate - a
-    series that cancels to 0 carries nothing.
+    for a load that then gets no sink. Absolute values, not the sum: a series whose entries
+    cancel out (3 and -3) or that is negative throughout would otherwise be dropped silently.
     """
-    return values is not None and float(np.sum(_as_array(values, n))) > 0.0
+    return values is not None and bool(np.any(np.abs(_as_array(values, n)) > 0.0))
+
+
+def _check_not_negative(values, n, what):
+    """Load and PV become fixed flows, and a flow cannot be negative: a negative entry would
+    make the LP infeasible without saying why. Stop with the reason instead."""
+    if values is None:
+        return
+    arr = _as_array(values, n)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{what} has missing values (NaN) at {int(np.sum(~np.isfinite(arr)))} "
+                         "time steps")
+    if np.any(arr < 0):
+        t = int(np.argmin(arr))
+        raise ValueError(f"{what} is negative at {int(np.sum(arr < 0))} time steps (lowest "
+                         f"{arr[t]:.3f} kW at step {t}). The model takes it as a fixed flow, "
+                         "which cannot be negative.")
 
 
 _TRUE = {"true", "yes", "on", "1"}
@@ -360,6 +376,8 @@ class EnergySystemModel:
         self._gc_bus = {}
         n = 0
         for gcid, gc in self.grid_connectors.items():
+            _check_not_negative(gc.get("load"), periods, f"load of grid connector {gcid!r}")
+            _check_not_negative(gc.get("pv"), periods, f"pv of grid connector {gcid!r}")
             has_pv = _nonzero(gc.get("pv"), periods)
             has_bat = gc_has_battery(gcid)
             if not (gc_used_cs(gcid) or _nonzero(gc.get("load"), periods)
