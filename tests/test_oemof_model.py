@@ -12,6 +12,7 @@ import dataclasses
 import logging
 import math
 import shutil
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -756,6 +757,53 @@ def test_unplugged_steps_reach_the_model_as_none():
     floor = OemofSolve._min_soc_series(ts, SystemConfig(bev_min_soc=0.0))
     assert [f"{ts.index[i]:%H:%M}" for i in np.flatnonzero(floor > 0)] == ["08:45"]
     assert floor[35] == pytest.approx(0.8)
+
+
+# ---------------------------------------------------------------------------
+# Test 3e — a segment without a time step warns, an inverted one stops (no solver)
+# ---------------------------------------------------------------------------
+def test_segments_without_a_time_step_warn_and_inverted_ones_stop():
+    """A segment that no grid point falls into never reaches the model.
+
+    An 8-minute trip between 08:47 and 08:55 is such a segment: its driving demand is
+    lost while spice_ev still subtracts it at the arrival - that must not pass silently.
+    A zero-length segment (two events at the same moment) loses nothing and stays quiet.
+    A segment that ends before it starts cannot come from time-sorted events and stops.
+    """
+    def t(clock):
+        return pd.Timestamp(f"2023-04-01 {clock}", tz="Europe/Berlin")
+
+    stop = pd.Timestamp("2023-04-02 00:00", tz="Europe/Berlin")
+    interval = pd.Timedelta(minutes=15)
+    strat = OemofSolve.__new__(OemofSolve)
+    idx = strat._build_time_index(t("00:00"), stop, interval)
+
+    def table(*segments):
+        return pd.DataFrame([
+            {"vehicle_id": "v1", "start_time": a, "end_time": b, "state": state,
+             "energy_kwh": energy, "desired_soc": 0.8,
+             "connected_charging_station": None if state == "driving" else "CS1"}
+            for a, b, state, energy in segments])
+
+    short_trip = table((t("00:00"), t("08:47"), "parked", None),
+                       (t("08:47"), t("08:55"), "driving", 3.0),
+                       (t("08:55"), stop, "parked", None))
+    with pytest.warns(UserWarning, match=r"driving demand of 3\.00 kWh is lost"):
+        ts = strat._map_segments_to_timeseries(short_trip, idx, interval)[0]["v1"]
+    assert ts["energy_kwh"].fillna(0).sum() == 0          # the demand never arrived
+
+    zero_length = table((t("00:00"), t("08:47"), "parked", None),
+                        (t("08:47"), t("08:47"), "driving", None),
+                        (t("08:47"), stop, "parked", None))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")                     # any warning fails the test
+        strat._map_segments_to_timeseries(zero_length, idx, interval)
+
+    inverted = table((t("00:00"), t("09:00"), "parked", None),
+                     (t("09:00"), t("08:00"), "driving", 2.0),
+                     (t("08:00"), stop, "parked", None))
+    with pytest.raises(ValueError, match="starts after it ends"):
+        strat._map_segments_to_timeseries(inverted, idx, interval)
 
 
 # ---------------------------------------------------------------------------

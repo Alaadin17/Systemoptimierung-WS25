@@ -23,6 +23,7 @@ Flow:
 '''
 
 
+import warnings
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -476,15 +477,34 @@ class OemofSolve(Strategy):
                 left = time_index.searchsorted(start, side="left")
                 right = time_index.searchsorted(end, side="left")
 
-                if left < right:
-                    ts_slice = time_index[left:right]
-                    df.loc[ts_slice, "state"] = seg["state"]
-                    df.loc[ts_slice, "energy_kwh"] = 0
-                    df.loc[ts_slice[-1], "energy_kwh"] = seg["energy_kwh"]
-                    df.loc[ts_slice, "connected_charging_station"] = (
-                        seg["connected_charging_station"])
-                    if seg["desired_soc"] is not None and not pd.isna(seg["desired_soc"]):
-                        df.loc[ts_slice, "desired_soc"] = float(seg["desired_soc"])
+                if left > right:
+                    # The segments come from time-sorted events, so this cannot happen
+                    # with a sound scenario - stop instead of silently skipping it.
+                    raise ValueError(
+                        f"segment of vehicle {vid!r} starts after it ends "
+                        f"({seg['start_time']} > {seg['end_time']})")
+                if left == right:
+                    # No time step starts inside the segment: it is shorter than one step
+                    # and falls between two grid points, or it lies outside the horizon.
+                    # Its state never reaches the model. A zero-length segment (two events
+                    # at the same moment) loses nothing and is skipped without a word.
+                    if start < end:
+                        e = seg["energy_kwh"]
+                        lost = (f"; its driving demand of {float(e):.2f} kWh is lost"
+                                if e is not None and not pd.isna(e) and e > 0 else "")
+                        warnings.warn(
+                            f"{vid}: {seg['state']} segment {start:%Y-%m-%d %H:%M} - "
+                            f"{end:%Y-%m-%d %H:%M} covers no time step and is dropped{lost}")
+                    continue
+
+                ts_slice = time_index[left:right]
+                df.loc[ts_slice, "state"] = seg["state"]
+                df.loc[ts_slice, "energy_kwh"] = 0
+                df.loc[ts_slice[-1], "energy_kwh"] = seg["energy_kwh"]
+                df.loc[ts_slice, "connected_charging_station"] = (
+                    seg["connected_charging_station"])
+                if seg["desired_soc"] is not None and not pd.isna(seg["desired_soc"]):
+                    df.loc[ts_slice, "desired_soc"] = float(seg["desired_soc"])
 
             # "Not plugged in" is None by contract. pandas >= 3 infers a string dtype for
             # the segment table and hands a missing value back as NaN - put None back.
