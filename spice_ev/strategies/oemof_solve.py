@@ -347,7 +347,8 @@ class OemofSolve(Strategy):
         The grid starts at ``start_time`` (not start+interval), so that
         row ``k`` corresponds exactly to spice_ev step ``k`` (current_time =
         start+k*interval). Otherwise the charging commands fed back into
-        spice_ev would be shifted by one time step.
+        spice_ev would be shifted by one time step. ``stop_time`` itself is not a
+        step (``inclusive="left"``): the last row starts one interval before it.
 
         Args:
             start_time: Scenario start time (datetime).
@@ -357,8 +358,7 @@ class OemofSolve(Strategy):
         Returns:
             DatetimeIndex format: DatetimeIndex(['2024-01-01 00:00:00', '2024-01-01 00:15:00', ...])
         """
-        return pd.date_range(
-            start=start_time, end=stop_time - pd.Timedelta(interval), freq=interval)
+        return pd.date_range(start=start_time, end=stop_time, freq=interval, inclusive="left")
 
     def _map_trips_to_state_segments(self, trip_df_by_vehicle: Dict[str, pd.DataFrame],
                                      state_segments_df: pd.DataFrame) -> pd.DataFrame:
