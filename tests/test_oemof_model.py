@@ -441,6 +441,7 @@ class _FakeBattery:
     def __init__(self, parent=None, soc=0.5):
         self.parent = parent
         self.soc = soc
+        self.capacity = self.CAPACITY
         self.calls = []
 
     def _power(self, interval, delta_soc):
@@ -521,6 +522,8 @@ def _fake_step_strategy():
                       "BAT2": [(3.0, 0.0, 0.60), (3.0, 0.0, 0.70)]},
         "grid": {"GC1": [(10.0, 0.0), (0.0, 0.0)]},
     }
+    # the LP got the batteries' own capacity: no rescaling of the planned SOC
+    strat._lp_battery_capacity = {"BAT1": _FakeBattery.CAPACITY, "BAT2": _FakeBattery.CAPACITY}
     return strat
 
 
@@ -968,6 +971,77 @@ def test_full_run_extracts_schedule(tmp_path, monkeypatch):
     assert (tmp_path / "out" / "dump_wallbox_v1.csv").exists()
     assert (tmp_path / "out" / "dump_summary.csv").exists()
     assert (tmp_path / "out" / "dump_costs.csv").exists()
+
+
+@requires_cbc
+def test_a_battery_without_capacity_is_sized_not_skipped(tmp_path, monkeypatch):
+    """capacity -1 means "size unknown" in spice_ev: StationaryBattery makes it 2**64, the
+    simulation runs it unlimited and the report sizes it from the highest stored energy.
+
+    The strategy used to skip it (capacity > 1e9), so the LP planned without the battery
+    while spice_ev had it. Now the LP gets a capacity that cannot bind (5 kW * 2 h = 10 kWh)
+    and the simulation follows the plan - both on spice_ev's 2**64 scale.
+    """
+    from spice_ev import scenario
+    monkeypatch.chdir(tmp_path)
+    t0 = "2020-01-01T00:00:00+01:00"
+    s = scenario.Scenario({
+        "scenario": {"start_time": t0, "interval": 15, "n_intervals": 8},
+        "components": {
+            "grid_connectors": {"GC1": {"max_power": 50}},
+            "batteries": {"BAT1": {"parent": "GC1", "charging_curve": [[0, 5], [1, 5]]}},
+            # oemof_solve needs at least one trip; this one needs no charging
+            "charging_stations": {"CS1": {"max_power": 11, "parent": "GC1"}},
+            "vehicle_types": {"t": {"name": "t", "capacity": 50,
+                                    "charging_curve": [[0, 11], [1, 11]]}},
+            "vehicles": {"v1": {"vehicle_type": "t", "soc": 0.8, "desired_soc": 0.8,
+                                "connected_charging_station": "CS1"}},
+        },
+        "events": {
+            "vehicle_events": [
+                {"signal_time": t0, "start_time": "2020-01-01T00:30:00+01:00",
+                 "vehicle_id": "v1", "event_type": "departure",
+                 "update": {"estimated_time_of_arrival": "2020-01-01T01:00:00+01:00"}},
+                {"signal_time": t0, "start_time": "2020-01-01T01:00:00+01:00",
+                 "vehicle_id": "v1", "event_type": "arrival",
+                 "update": {"connected_charging_station": "CS1", "soc_delta": -0.02,
+                            "estimated_time_of_departure": "2020-01-02T00:00:00+01:00",
+                            "desired_soc": 0.5}}],
+            # cheap first hour, expensive second hour
+            "grid_operator_signals": [
+                {"signal_time": t0, "start_time": t0, "grid_connector_id": "GC1",
+                 "cost": {"type": "fixed", "value": 0.1}},
+                {"signal_time": t0, "start_time": "2020-01-01T01:00:00+01:00",
+                 "grid_connector_id": "GC1", "cost": {"type": "fixed", "value": 0.4}}],
+            "fixed_load": {"house": {"start_time": t0, "step_duration_s": 900,
+                                     "grid_connector_id": "GC1", "values": [4] * 8}},
+        },
+    })
+    strats = []
+    original = OemofSolve._ensure_solved
+
+    def keep(self):
+        strats.append(self)
+        original(self)
+    monkeypatch.setattr(OemofSolve, "_ensure_solved", keep)
+    s.run("oemof_solve", {"oemof_config": {"should_dump_results": False}})
+
+    strat = strats[0]
+    assert strat.world_state.batteries["BAT1"].capacity == 2 ** 64
+    assert strat._lp_battery_capacity == {"BAT1": pytest.approx(10.0)}
+
+    planned = np.array([p[2] for p in strat._plan["batteries"]["BAT1"]]) * 10.0
+    simulated = np.array(s.batteryLevels["BAT1"])    # energy at the START of each step
+    assert planned.max() > 1.0                       # the LP stores in the cheap hour ...
+    assert planned[-1] == pytest.approx(0.0, abs=1e-6)   # ... and uses it all up later
+    assert np.allclose(simulated[1:], planned[:-1], atol=1e-6)   # spice_ev follows the plan
+    # spice_ev's report sizes the battery by this value
+    assert max(simulated) == pytest.approx(planned.max(), abs=1e-6)
+
+    # a battery of unknown size with a soc > 0 would hold soc * 2**64 kWh
+    strat.world_state.batteries["BAT1"].soc = 0.5
+    with pytest.raises(ValueError, match="no capacity"):
+        strat._battery_params(strat._model.config)
 
 
 # ---------------------------------------------------------------------------

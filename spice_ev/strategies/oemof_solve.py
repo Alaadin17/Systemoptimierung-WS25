@@ -71,6 +71,8 @@ class OemofSolve(Strategy):
         # Index of the CURRENT simulation step = position in the lists above; step() reads
         # self._plan[<type>][<id>][self._oemof_step] and increments it afterwards.
         self._oemof_step = 0
+        # capacity each stationary battery got in the LP, by id - filled by _ensure_solved()
+        self._lp_battery_capacity: Dict[str, float] = {}
 
     def prepare_inputs(self) -> Dict[str, Any]:
         """Run the full preprocessing pipeline and store the result frames.
@@ -820,17 +822,30 @@ class OemofSolve(Strategy):
         after every step (strategy.py: ``apply_battery_losses``), the LP assumes
         ``loss_rate=0.0``. As long as no scenario sets a loss rate this goes unnoticed;
         whoever sets one has to mirror it in the model.
+
+        A battery of unknown size (``capacity`` -1 in the scenario) is no error in spice_ev:
+        ``StationaryBattery`` makes it 2**64, the simulation runs it unlimited and the
+        report sizes it afterwards from the highest stored energy (report.py). The LP gets
+        it as well, with a capacity that can never bind - everything the battery can take
+        in over the horizon - and ``unlimited`` set. Its size then follows from the plan.
         """
         result: Dict[str, Dict[str, Any]] = {}
+        horizon_h = len(self.time_index) * (pd.Timedelta(self.interval) / pd.Timedelta(hours=1))
         for bid, bat in self.world_state.batteries.items():
             capacity = float(bat.capacity)
-            # <=0 or unlimited (StationaryBattery sets 2**64) -> skip
-            if capacity <= 0 or capacity > 1e9:
+            if capacity <= 0:
                 continue
             try:
                 power = float(bat.loading_curve.max_power)
             except Exception:
                 power = config.battery_max_power_kW
+            # the same test as spice_ev's report
+            unlimited = capacity > 2 ** 63
+            if unlimited:
+                if bat.soc > 0:
+                    raise ValueError(f"battery {bid!r} has no capacity but a soc of {bat.soc}: "
+                                     "its stored energy would be soc * 2**64 kWh")
+                capacity = max(power * horizon_h, 1.0)
             try:
                 discharge_power = float(bat.unloading_curve.max_power)
             except Exception:
@@ -842,6 +857,7 @@ class OemofSolve(Strategy):
                 "initial_soc": float(bat.soc),  # StationaryBattery always has it (default 0.0)
                 "efficiency": float(bat.efficiency),   # StationaryBattery default 0.95
                 "parent": bat.parent,
+                "unlimited": unlimited,
             }
         return result
 
@@ -1004,6 +1020,9 @@ class OemofSolve(Strategy):
         oemof_inputs = self.build_oemof_inputs()
         results = self.run_oemof_model(oemof_inputs)
         self._plan = self.commands_from_oemof(results)
+        # the plan's battery SOC is relative to the capacity the LP got (see step())
+        self._lp_battery_capacity = {bid: bp["capacity_kWh"]
+                                     for bid, bp in oemof_inputs["battery_params"].items()}
         self._solved = True
         self._oemof_step = 0
 
@@ -1093,12 +1112,18 @@ class OemofSolve(Strategy):
             target_soc = plan[idx][2]
             if target_soc is None or target_soc != target_soc:
                 continue
+            # The plan's SOC is relative to the LP capacity. For a battery of unknown size
+            # that is not spice_ev's 2**64, so rescale - the threshold as well, or SOC steps
+            # of ~1e-18 would never pass it. For every other battery the factor is 1.
+            scale = self._lp_battery_capacity[bid] / battery.capacity
+            target_soc *= scale
+            eps = self.EPS * scale
             soc_now = battery.soc
 
-            if target_soc > soc_now + self.EPS:
+            if target_soc > soc_now + eps:
                 avg_power = battery.load(self.interval, target_soc=target_soc)["avg_power"]
                 gc.add_load(bid, avg_power)
-            elif target_soc < soc_now - self.EPS:
+            elif target_soc < soc_now - eps:
                 avg_power = battery.unload(self.interval, target_soc=target_soc)["avg_power"]
                 gc.add_load(bid, -avg_power)
 

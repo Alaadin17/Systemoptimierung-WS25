@@ -472,8 +472,14 @@ class EnergySystemModel:
         capacity = float(bp.get("capacity_kWh", self.config.battery_capacity_kWh))
         power = float(bp.get("power_kW", self.config.battery_max_power_kW))
         discharge_power = float(bp.get("discharge_power_kW", power))
+        # A battery of unknown size comes with a capacity that never binds (see
+        # OemofSolve._battery_params); a SOC band relative to it would mean nothing.
+        if bp.get("unlimited", False):
+            min_soc, max_soc = 0.0, 1.0
+        else:
+            min_soc, max_soc = self.config.battery_min_soc, self.config.battery_max_soc
         init = float(bp.get("initial_soc", self.config.battery_initial_soc))
-        init = min(max(init, self.config.battery_min_soc), self.config.battery_max_soc)
+        init = min(max(init, min_soc), max_soc)
         efficiency = float(bp.get("efficiency", self.config.battery_efficiency))
 
         # ONE bus carries both directions; the link from the house bus is the only way in.
@@ -507,8 +513,8 @@ class EnergySystemModel:
             outputs={b_battery: flows.Flow(nominal_value=discharge_power,
                                            variable_costs=self.config.storage_cycle_penalty)},
             nominal_storage_capacity=capacity,
-            min_storage_level=self.config.battery_min_soc,
-            max_storage_level=self.config.battery_max_soc,
+            min_storage_level=min_soc,
+            max_storage_level=max_soc,
             initial_storage_level=init,
             inflow_conversion_factor=efficiency,    # AC in  -> stored   (x eff)
             outflow_conversion_factor=efficiency,   # stored -> AC out   (x eff)
