@@ -1024,7 +1024,6 @@ class OemofSolve(Strategy):
         self._lp_battery_capacity = {bid: bp["capacity_kWh"]
                                      for bid, bp in oemof_inputs["battery_params"].items()}
         self._solved = True
-        self._oemof_step = 0
 
     def step(self):
         """Apply the optimized plan for the current simulation step.
