@@ -651,6 +651,70 @@ def test_min_soc_series_forces_desired_soc_before_departure():
 
 
 # ---------------------------------------------------------------------------
+# Test 3c — a vehicle that is on the road when the scenario starts (no solver)
+# ---------------------------------------------------------------------------
+def test_a_vehicle_on_the_road_at_scenario_start():
+    """A first event that is an ARRIVAL means the vehicle starts the scenario driving.
+
+    generate_from_csv creates every vehicle like that: not connected, first event an
+    arrival carrying the soc_delta of the trip under way. spice_ev subtracts that
+    soc_delta at the arrival, so the model has to see the same energy - it used to be
+    dropped, because the trip had no departure to pair with.
+    """
+    def t(clock):
+        return pd.Timestamp(f"2023-04-01 {clock}", tz="Europe/Berlin")
+
+    def ev(vid, kind, clock, **update):
+        return SimpleNamespace(vehicle_id=vid, event_type=kind, start_time=t(clock),
+                               signal_time=t(clock), update=update)
+
+    def vehicle(cs):
+        return SimpleNamespace(connected_charging_station=cs, desired_soc=0.8,
+                               battery=SimpleNamespace(capacity=50.0))
+
+    start, stop = t("00:00"), pd.Timestamp("2023-04-02 00:00", tz="Europe/Berlin")
+    interval = pd.Timedelta(minutes=15)
+    events = [
+        # a: on the road at the start, arrives 06:10, makes a second trip later
+        ev("a", "arrival", "06:10", connected_charging_station="CS_a", soc_delta=-0.30),
+        ev("a", "departure", "08:47"),
+        ev("a", "arrival", "17:05", connected_charging_station="CS_a", soc_delta=-0.20),
+        # b: the ordinary case - plugged in at the start, leaves first
+        ev("b", "departure", "07:00"),
+        ev("b", "arrival", "16:00", connected_charging_station="CS_b", soc_delta=-0.10),
+    ]
+    vehicles = {"a": vehicle(None), "b": vehicle("CS_b"), "c": vehicle("CS_c")}  # c: no events
+
+    strat = OemofSolve.__new__(OemofSolve)
+    segments = strat._build_state_segments(events, start, stop, vehicles)
+    # first ROW per vehicle (groupby().first() would skip the None of an unplugged start)
+    first = segments.drop_duplicates("vehicle_id").set_index("vehicle_id")
+    assert first.loc["a", "state"] == "driving"
+    # isna, not "is None": pandas 3 stores a missing string as NaN
+    assert pd.isna(first.loc["a", "connected_charging_station"])
+    assert first.loc["b", "state"] == "parked"
+    assert first.loc["b", "connected_charging_station"] == "CS_b"
+    assert first.loc["c", "state"] == "parked"
+
+    trips = strat._build_trip_df(events, vehicles, start)
+    assert trips.loc[trips.vehicle_id == "a", "departure_time"].tolist() == [start, t("08:47")]
+
+    segments = strat._map_trips_to_state_segments(
+        strat._group_trips_by_vehicle(trips), segments)
+    per_vehicle, _ = strat._map_segments_to_timeseries(
+        segments, strat._build_time_index(start, stop, interval), interval)
+
+    def booked(vid):
+        e = per_vehicle[vid]["energy_kwh"].fillna(0).astype(float)
+        return {f"{ts:%H:%M}": kwh for ts, kwh in e[e > 0].items()}
+
+    # the trip under way lands in the last step before the arrival, like every other trip
+    assert booked("a") == {"06:00": pytest.approx(15.0), "17:00": pytest.approx(10.0)}
+    assert booked("b") == {"15:45": pytest.approx(5.0)}
+    assert booked("c") == {}
+
+
+# ---------------------------------------------------------------------------
 # Test 4 — full run() extracts a per-vehicle schedule and dumps CSVs (CBC)
 # ---------------------------------------------------------------------------
 @requires_cbc

@@ -92,7 +92,7 @@ class OemofSolve(Strategy):
         df_vehicles = self._build_world_state_vehicles_df(vehicles)
 
         # 2) Trips (departure/arrival pairs) per vehicle
-        trip_df = self._build_trip_df(vehicle_events, vehicles)
+        trip_df = self._build_trip_df(vehicle_events, vehicles, self.start_time)
         trip_df_by_vehicle = self._group_trips_by_vehicle(trip_df)
 
         # 3) State segments (parked/driving) + energy from trips
@@ -195,15 +195,23 @@ class OemofSolve(Strategy):
         )
         return df_vehicles
 
-    def _build_trip_df(self, vehicle_events, vehicles) -> pd.DataFrame:
+    def _build_trip_df(self, vehicle_events, vehicles, start_time=None) -> pd.DataFrame:
         """Build a trip table from departure/arrival events.
 
         Each trip pairs the last departure with the next arrival for a vehicle and
         computes energy_kwh from soc_delta * battery capacity.
 
+        An arrival with no departure before it belongs to a trip that is already under
+        way when the scenario starts (generate_from_csv creates every vehicle like that).
+        Its departure time is ``start_time``, so the trip covers the vehicle's first
+        segment and its energy reaches the model - spice_ev subtracts that soc_delta at
+        the arrival either way.
+
         Args:
             vehicle_events: List of VehicleEvent objects.
             vehicles: Dict[vehicle_id, Vehicle] to access battery capacity.
+            start_time: Scenario start time (datetime), the departure time of a trip
+                that is under way at the start.
 
         Returns:
             DataFrame with columns:
@@ -227,8 +235,9 @@ class OemofSolve(Strategy):
                 # Remember the latest departure time for this vehicle.
                 last_departure[ev.vehicle_id] = ev.start_time
             elif ev.event_type == "arrival":
-                # Pair arrival with the last departure and compute energy usage.
-                dep_time = last_departure.get(ev.vehicle_id)
+                # Pair arrival with the last departure and compute energy usage. Without
+                # one the vehicle was on the road from the scenario start.
+                dep_time = last_departure.get(ev.vehicle_id, start_time)
                 soc_delta = ev.update.get("soc_delta")
                 cap = vehicles[ev.vehicle_id].battery.capacity
                 # soc_delta is negative for driving; convert to positive energy in kWh.
@@ -262,7 +271,10 @@ class OemofSolve(Strategy):
         """Build contiguous state segments (driving/parked) per vehicle.
 
         For each vehicle, departure and arrival events define state changes.
-        The first segment starts at start_time; the last ends at stop_time.
+        The first segment starts at start_time; the last ends at stop_time. The state of
+        the first segment follows the vehicle's first event: an arrival means the vehicle
+        is on the road when the scenario starts ("driving"), anything else that it stands
+        ("parked").
         Each parked segment also carries the connected_charging_station it is plugged
         into (from the arrival event that starts it; the first segment uses the
         vehicle's initial connected_charging_station). Driving segments -> None.
@@ -294,7 +306,9 @@ class OemofSolve(Strategy):
                 if ev.vehicle_id == vid and ev.event_type in ("departure", "arrival")
             ]
             v_events = sorted(v_events, key=lambda e: e.start_time)
-            state = "parked"  # Assume parked at the start until we see a departure
+            # A vehicle whose first event is an arrival is already on the road at
+            # scenario start; with a departure first, or no events at all, it stands.
+            state = "driving" if v_events and v_events[0].event_type == "arrival" else "parked"
             cs = getattr(vehicles.get(vid), "connected_charging_station", None)
             # SOC the vehicle must reach before it leaves again (spice_ev: desired_soc).
             # Set on the vehicle initially and updated by every arrival event.
