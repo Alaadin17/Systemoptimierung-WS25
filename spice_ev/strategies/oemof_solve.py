@@ -437,12 +437,11 @@ class OemofSolve(Strategy):
                 is_driving, is_parked, energy_kwh, connected_charging_station,
                 desired_soc.
         """
-        # Normalize the time index and interval to comparable types.
+        # Normalize the time index to a comparable type.
         time_index = pd.DatetimeIndex(time_index)
         if time_index.tz is not None:
             # Remove timezone to avoid tz-aware vs tz-naive comparisons.
             time_index = time_index.tz_localize(None)
-        interval = pd.Timedelta(interval)
 
         per_vehicle = {}
         long_rows = []
